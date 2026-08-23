@@ -82,6 +82,36 @@ one idempotent CEO Skill user turn, so existing #6 sessions gain the same role
 and negative-capability instructions without changing their system prompt or
 toolset.
 
+After the chairman-approved delivery authorization has been consumed and the
+Map is `authorized`, explicitly commission its one root Hermes PM:
+
+```bash
+hermes maps commission \
+  --map ISSUE_NODE_ID \
+  --profile CEO_PROFILE \
+  --session CANONICAL_CEO_SESSION_ID
+
+hermes maps resume \
+  --map ISSUE_NODE_ID \
+  --profile CEO_PROFILE \
+  --session CANONICAL_CEO_SESSION_ID
+
+hermes maps runtime status \
+  --map ISSUE_NODE_ID \
+  --profile CEO_PROFILE \
+  --session CANONICAL_CEO_SESSION_ID
+```
+
+Commissioning fails before Herdr mutation unless the request-scoped CEO
+identity, consumed authorization, Project/repository binding, PM profile,
+Skills, routing policy, and selected Herdr integrations all pass. The plugin
+creates or resumes only its deterministic owned namespace; a same-name resource
+without durable ownership proof is reported as `repair_required` and is never
+attached, renamed, killed, or deleted. A started PM does not make the Map active:
+the expected structured ready checkpoint must first be confirmed in GitHub Issue
+history, followed by the existing tracker-confirmed `authorized → delivery`
+transition. Retrying resumes the same workspace and PM.
+
 The plugin registers the explicit `map-governance:ceo` Skill and the narrow
 `map-governance-ceo` toolset. New canonical CEO conversations persist a stable
 system prompt and the required toolset identity; Map-specific bootstrap data
@@ -123,5 +153,5 @@ terminal failures do not change governance stage, acceptance outcome evidence ma
 request `acceptance`, and non-blocking questions remain in `delivery`. A confirmed
 report or coordinator-confirmed dispatch ends the PM turn idle; failed reporting
 stays in the active turn for identical-payload retry. The PM contract fixes
-`dispatch_runtime: herdr`, while actual Herdr commissioning and worker-lane routing
-remain outside this phase.
+`dispatch_runtime: herdr`. This plugin commissions the single root PM runtime;
+implementation worker-lane routing remains outside this phase.

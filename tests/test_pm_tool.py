@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import map_governance.pm_tool as pm_tool
+import map_governance.runtime as runtime
 from map_governance import GovernanceRequestIdentity, StaleProjectionError
+from map_governance.storage import PluginStorage
 
 
 def test_pm_skill_and_named_toolset_are_separate_and_hide_authority_coordinates(
@@ -23,8 +26,10 @@ def test_pm_skill_and_named_toolset_are_separate_and_hide_authority_coordinates(
 
     monkeypatch.setattr(
         pm_tool,
-        "application_for_profile",
-        lambda profile: calls.append({"profile": profile}) or ApplicationProbe(),
+        "application_for_pm_request",
+        lambda profile, **identity: (
+            calls.append({"profile": profile, **identity}) or ApplicationProbe()
+        ),
     )
     monkeypatch.setenv("HERMES_SESSION_PROFILE", "ceo")
     monkeypatch.setenv("HERMES_SESSION_ID", "environment-forgery")
@@ -75,7 +80,7 @@ def test_pm_skill_and_named_toolset_are_separate_and_hide_authority_coordinates(
 
     assert result == {"operation": "inspect"}
     assert calls[:2] == [
-        {"profile": "pm"},
+        {"profile": "pm", "session_id": "pm-session-atlas"},
         {
             "request_identity": GovernanceRequestIdentity(
                 profile_name="pm",
@@ -108,8 +113,8 @@ def test_pm_report_handler_injects_request_identity_and_cannot_select_a_map(
 
     monkeypatch.setattr(
         pm_tool,
-        "application_for_profile",
-        lambda _profile: ApplicationProbe(),
+        "application_for_pm_request",
+        lambda _profile, **_identity: ApplicationProbe(),
     )
     tools = []
     hooks = []
@@ -179,8 +184,8 @@ def test_pm_tool_returns_structured_stale_interlock(monkeypatch):
 
     monkeypatch.setattr(
         pm_tool,
-        "application_for_profile",
-        lambda _profile: ApplicationProbe(),
+        "application_for_pm_request",
+        lambda _profile, **_identity: ApplicationProbe(),
     )
     tools = []
     context = SimpleNamespace(
@@ -208,3 +213,57 @@ def test_pm_tool_returns_structured_stale_interlock(monkeypatch):
 
     assert result["error"]["type"] == "stale_projection"
     assert "authoritative reconcile" in result["error"]["recovery"]
+
+
+def test_pm_request_resolves_profile_local_handoff_to_ceo_control_plane(
+    tmp_path: Path, monkeypatch, hermes_host_root
+):
+    from hermes_cli import profiles
+    from hermes_cli.plugins import PluginState
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_homes = {
+        "pm": tmp_path / "profiles" / "pm",
+        "ceo": tmp_path / "profiles" / "ceo",
+    }
+    for home in profile_homes.values():
+        home.mkdir(parents=True)
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in profile_homes)
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda name: profile_homes[name])
+    token = set_hermes_home_override(profile_homes["pm"])
+    try:
+        pm_storage_root = PluginState("map-governance").data_dir
+    finally:
+        reset_hermes_home_override(token)
+    PluginStorage(pm_storage_root).save_pm_control_plane_binding(
+        profile_name="pm",
+        session_id="pm-session-atlas",
+        map_id="I_atlas_41",
+        control_profile="ceo",
+        coordinator_id="lifecycle-atlas",
+        registered_at="2026-08-24T00:00:00Z",
+    )
+    calls = []
+
+    class ControlPlaneProbe:
+        def accepts_pm_control_binding(self, **arguments):
+            calls.append(arguments)
+            return True
+
+    control_plane = ControlPlaneProbe()
+    monkeypatch.setattr(
+        runtime,
+        "application_for_profile",
+        lambda profile: control_plane if profile == "ceo" else None,
+    )
+
+    resolved = runtime.application_for_pm_request("pm", session_id="pm-session-atlas")
+
+    assert resolved is control_plane
+    assert calls == [
+        {
+            "request_identity": GovernanceRequestIdentity("pm", "pm-session-atlas"),
+            "map_id": "I_atlas_41",
+            "coordinator_id": "lifecycle-atlas",
+        }
+    ]

@@ -24,6 +24,7 @@ ask to select, replace, or widen it.
 - Do not implement product code or inspect and control delivery lanes directly from the governance tool. The only dispatch bridge is the bounded coordinator runtime; it is not a terminal or worker-control tool.
 - Do not expose implementation tickets, panes, worktrees, commits, or worker logs as executive board cards.
 - Do not change the assigned Map, impersonate another profile or conversation, or invoke the CEO governance toolset.
+- Do not commission or replace your own root runtime. Only the request-authorized CEO commission/resume seam may establish it.
 - Do not grant or claim chairman approval, accept your own evidence, close the Map, publish code, create a release, or widen delivery authority.
 - Do not treat an unconfirmed tracker write or a conversational assertion as an executive record.
 

@@ -34,10 +34,14 @@ from map_governance import (  # noqa: E402
     CEOSessionRepairRequired,
     GovernanceActorIdentity,
     GovernanceAuthorizationError,
+    GovernanceRequestIdentity,
     MapBindingError,
     MapTransitionError,
     StaleProjectionError,
     SetupApplyError,
+    CommissioningAuthorizationError,
+    CommissioningPrerequisiteError,
+    CoordinatorRuntimeError,
 )
 from map_governance.tracker import TrackerError  # noqa: E402
 
@@ -98,6 +102,10 @@ class SetupApplyRequest(BaseModel):
     selected_action_ids: list[str] = Field(min_length=1)
 
 
+class CommissionMapRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+
+
 def _application(profile: str):
     try:
         return application_for_profile(profile)
@@ -117,6 +125,13 @@ def _operation(profile: str, method: str, **arguments):
         raise HTTPException(status_code=409, detail=error.as_dict()) from error
     except GovernanceAuthorizationError as error:
         raise HTTPException(status_code=403, detail=error.as_dict()) from error
+    except CommissioningAuthorizationError as error:
+        raise HTTPException(status_code=409, detail=error.as_dict()) from error
+    except CommissioningPrerequisiteError as error:
+        raise HTTPException(status_code=503, detail=error.as_dict()) from error
+    except CoordinatorRuntimeError as error:
+        status_code = 409 if error.repair_required else 503
+        raise HTTPException(status_code=status_code, detail=error.as_dict()) from error
     except CEOSessionRepairRequired as error:
         raise HTTPException(status_code=409, detail=error.as_dict()) from error
     except MapBindingError as error:
@@ -323,6 +338,45 @@ async def open_map_session(map_id: str, profile: str = Query(min_length=1)):
         profile,
         "open_map",
         map_id=map_id,
+    )
+
+
+@router.post("/maps/{map_id}/commission")
+async def commission_map(
+    map_id: str,
+    request: CommissionMapRequest,
+    profile: str = Query(min_length=1),
+):
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "commission_map",
+        map_id=map_id,
+        request_identity=GovernanceRequestIdentity(profile, request.session_id),
+    )
+
+
+@router.post("/maps/{map_id}/resume")
+async def resume_map_runtime(
+    map_id: str,
+    request: CommissionMapRequest,
+    profile: str = Query(min_length=1),
+):
+    return await commission_map(map_id, request, profile)
+
+
+@router.get("/maps/{map_id}/runtime")
+async def map_runtime_status(
+    map_id: str,
+    profile: str = Query(min_length=1),
+    session_id: str = Query(min_length=1),
+):
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "runtime_status",
+        map_id=map_id,
+        request_identity=GovernanceRequestIdentity(profile, session_id),
     )
 
 

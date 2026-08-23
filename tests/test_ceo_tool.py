@@ -52,6 +52,9 @@ def test_ceo_skill_and_named_toolset_register_with_request_scoped_identity(
         "inspect",
         "record_decision",
         "request_approval",
+        "commission",
+        "resume",
+        "runtime_status",
     ]
     decision_schema = registered["schema"]["parameters"]["properties"]["decision"]
     assert decision_schema["properties"]["authority"] == {
@@ -82,6 +85,60 @@ def test_ceo_skill_and_named_toolset_register_with_request_scoped_identity(
             ),
         },
     ]
+
+
+def test_ceo_tool_exposes_explicit_commission_resume_and_status(monkeypatch):
+    calls = []
+
+    class ApplicationProbe:
+        def commission_map(self, **arguments):
+            calls.append(("commission_map", arguments))
+            return {"state": "active"}
+
+        def runtime_status(self, **arguments):
+            calls.append(("runtime_status", arguments))
+            return {"state": "active", "idempotent": True}
+
+    monkeypatch.setattr(
+        ceo_tool,
+        "application_for_profile",
+        lambda _profile: ApplicationProbe(),
+    )
+    tools = []
+    context = SimpleNamespace(
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: tools.append(kwargs),
+        register_hook=lambda *args: None,
+    )
+    ceo_tool.register_ceo_capabilities(context)
+    handler = tools[0]["handler"]
+
+    results = [
+        json.loads(
+            handler(
+                {"action": action, "map_id": "I_atlas_41"},
+                session_id="canonical-live-session",
+            )
+        )
+        for action in ("commission", "resume", "runtime_status")
+    ]
+
+    assert results == [
+        {"state": "active"},
+        {"state": "active"},
+        {"idempotent": True, "state": "active"},
+    ]
+    assert [name for name, _ in calls] == [
+        "commission_map",
+        "commission_map",
+        "runtime_status",
+    ]
+    assert all(
+        arguments["request_identity"]
+        == GovernanceRequestIdentity("ceo", "canonical-live-session")
+        for _, arguments in calls
+    )
 
 
 def test_ceo_tool_delegates_structured_decision_without_identity_arguments(

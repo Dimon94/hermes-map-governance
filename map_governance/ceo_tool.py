@@ -18,6 +18,11 @@ from .application import (
     TrackerApprovalConfirmationError,
 )
 from .approvals import ApprovalPacket
+from .coordinator import (
+    CommissioningAuthorizationError,
+    CommissioningPrerequisiteError,
+    CoordinatorRuntimeError,
+)
 from .runtime import application_for_profile
 from .tracker import StructuredDecision, TrackerError
 
@@ -30,15 +35,22 @@ CEO_SKILL = Path(__file__).resolve().parents[1] / "skills" / "ceo" / "SKILL.md"
 CEO_TOOL_SCHEMA = {
     "name": CEO_TOOL_NAME,
     "description": (
-        "Inspect one governed Map, record an autonomous CEO decision, or submit "
-        "a content-bound chairman approval request."
+        "Inspect one governed Map, record an autonomous CEO decision, submit "
+        "a content-bound chairman approval request, or explicitly commission its PM."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["inspect", "record_decision", "request_approval"],
+                "enum": [
+                    "inspect",
+                    "record_decision",
+                    "request_approval",
+                    "commission",
+                    "resume",
+                    "runtime_status",
+                ],
             },
             "map_id": {
                 "type": "string",
@@ -162,9 +174,20 @@ def register_ceo_capabilities(ctx) -> None:
                     request_identity=identity,
                     packet=ApprovalPacket(**raw_packet),
                 )
+            elif action in {"commission", "resume"}:
+                result = application.commission_map(
+                    map_id=map_id,
+                    request_identity=identity,
+                )
+            elif action == "runtime_status":
+                result = application.runtime_status(
+                    map_id=map_id,
+                    request_identity=identity,
+                )
             else:
                 raise ValueError(
-                    "action must be inspect, record_decision, or request_approval"
+                    "action must be inspect, record_decision, request_approval, "
+                    "commission, resume, or runtime_status"
                 )
             return json.dumps(result, ensure_ascii=False, sort_keys=True)
         except (
@@ -173,6 +196,9 @@ def register_ceo_capabilities(ctx) -> None:
             ApprovalRequestConflict,
             StructuredDecisionConflict,
             StaleProjectionError,
+            CommissioningAuthorizationError,
+            CommissioningPrerequisiteError,
+            CoordinatorRuntimeError,
         ) as error:
             return json.dumps({"error": error.as_dict()}, sort_keys=True)
         except TrackerDecisionConfirmationError as error:

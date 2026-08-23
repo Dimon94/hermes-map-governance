@@ -10,9 +10,16 @@ from .application import (
     ApprovalEnforcementError,
     ApprovalRequestConflict,
     CEOSessionRepairRequired,
+    GovernanceRequestIdentity,
+    GovernanceAuthorizationError,
     MapBindingError,
     MapTransitionError,
     StaleProjectionError,
+)
+from .coordinator import (
+    CommissioningAuthorizationError,
+    CommissioningPrerequisiteError,
+    CoordinatorRuntimeError,
 )
 from .ceo_tool import register_ceo_capabilities
 from .pm_tool import register_pm_capabilities
@@ -61,6 +68,34 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
     open_session.add_argument("--map", required=True, help="Bound Map Issue node id")
     open_session.add_argument(
         "--profile", required=True, help="Explicit Hermes CEO profile"
+    )
+    commission = commands.add_parser(
+        "commission", help="Commission or resume the Map's one Hermes PM"
+    )
+    commission.add_argument("--map", required=True, help="Bound Map Issue node id")
+    commission.add_argument("--profile", required=True, help="Explicit CEO profile")
+    commission.add_argument(
+        "--session", required=True, help="Request-scoped canonical CEO session id"
+    )
+    resume = commands.add_parser(
+        "resume", help="Resume the Map's verified plugin-owned Hermes PM"
+    )
+    resume.add_argument("--map", required=True, help="Bound Map Issue node id")
+    resume.add_argument("--profile", required=True, help="Explicit CEO profile")
+    resume.add_argument(
+        "--session", required=True, help="Request-scoped canonical CEO session id"
+    )
+    runtime = commands.add_parser(
+        "runtime", help="Inspect plugin-owned PM runtime state"
+    )
+    runtime_commands = runtime.add_subparsers(dest="runtime_command", required=True)
+    runtime_status = runtime_commands.add_parser(
+        "status", help="Read commission/resume and repair evidence"
+    )
+    runtime_status.add_argument("--map", required=True, help="Bound Map Issue node id")
+    runtime_status.add_argument("--profile", required=True, help="Explicit CEO profile")
+    runtime_status.add_argument(
+        "--session", required=True, help="Request-scoped canonical CEO session id"
     )
 
     project = commands.add_parser("project", help="Manage CEO projects")
@@ -211,6 +246,37 @@ def register(ctx) -> None:
             try:
                 report = application_for_profile(args.profile).open_map(map_id=args.map)
             except CEOSessionRepairRequired as error:
+                print(
+                    json.dumps({"error": error.as_dict()}, sort_keys=True),
+                    file=sys.stderr,
+                )
+                return 1
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        if args.maps_command in {"commission", "resume", "runtime"}:
+            identity = GovernanceRequestIdentity(
+                profile_name=args.profile,
+                session_id=args.session,
+            )
+            try:
+                selected = application_for_profile(args.profile)
+                report = (
+                    selected.commission_map(
+                        map_id=args.map,
+                        request_identity=identity,
+                    )
+                    if args.maps_command in {"commission", "resume"}
+                    else selected.runtime_status(
+                        map_id=args.map,
+                        request_identity=identity,
+                    )
+                )
+            except (
+                CommissioningAuthorizationError,
+                CommissioningPrerequisiteError,
+                CoordinatorRuntimeError,
+                GovernanceAuthorizationError,
+            ) as error:
                 print(
                     json.dumps({"error": error.as_dict()}, sort_keys=True),
                     file=sys.stderr,

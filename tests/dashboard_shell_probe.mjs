@@ -58,6 +58,28 @@ function fetchJSON(path, options) {
       },
     });
   }
+  if (path.includes("/maps/I_atlas_41/commission?profile=")) {
+    return Promise.resolve({
+      map_id: "I_atlas_41",
+      state: "active",
+      checkpoint: {
+        state: "tracker_confirmed",
+        record_id: "commission-ready-I_atlas_41",
+      },
+    });
+  }
+  if (path.includes("/maps/I_atlas_41/runtime?profile=")) {
+    return Promise.resolve({
+      map_id: "I_atlas_41",
+      state: "repair_required",
+      failure: {
+        reason: "pane_ownership_mismatch",
+        retryable: false,
+        repair_required: true,
+        resource_disposition: "no_cleanup_without_verified_ownership",
+      },
+    });
+  }
   if (path.includes("/maps/I_atlas_41?profile=")) {
     const approval = mode === "approval" ? {
       request_id: "approval-delivery-001",
@@ -148,11 +170,15 @@ function fetchJSON(path, options) {
           ? "awaiting-approval"
           : mode === "pm-report"
             ? "delivery"
+            : mode === "transition-failure"
+              ? "delivery"
             : "authorized",
         available_transitions: mode === "approval"
           ? ["authorized", "discovery", "parked"]
           : mode === "pm-report"
             ? ["decision", "acceptance", "parked"]
+            : mode === "transition-failure"
+              ? ["decision", "acceptance", "parked"]
           : ["delivery", "parked"],
         decision_summary: {
           count: 1,
@@ -389,7 +415,11 @@ if (mode !== "empty") {
   assert.match(renderedText, /acme\/atlas#41/);
   assert.match(
     renderedText,
-    mode === "approval" ? /awaiting-approval/ : mode === "pm-report" ? /delivery/ : /authorized/,
+    mode === "approval"
+      ? /awaiting-approval/
+      : mode === "pm-report" || mode === "transition-failure"
+        ? /delivery/
+        : /authorized/,
   );
   assert.match(renderedText, /1 confirmed decision/);
   assert.match(renderedText, /product/);
@@ -535,15 +565,58 @@ if (mode !== "empty") {
   } else {
     assert.match(renderedText, /CEO session: unbound/);
   }
+  if (mode === "commission") {
+    const commissionButton = findNode(
+      readyTree,
+      (node) => node.type === "Button" && /Commission Hermes PM/.test(textContent(node)),
+    );
+    assert.ok(commissionButton, "authorized Map exposes explicit PM commission");
+    commissionButton.props.onClick();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    const commissionIndex = requestedPaths.findIndex(
+      (path) => path.includes("/maps/I_atlas_41/commission?profile="),
+    );
+    assert.notEqual(commissionIndex, -1);
+    assert.deepEqual(JSON.parse(requestedOptions[commissionIndex].body), {
+      session_id: "canonical-tip",
+    });
+    hookIndex = 0;
+    assert.match(
+      textContent(registeredPage()),
+      /PM runtime: active.*Revalidate \/ resume Hermes PM/s,
+    );
+  }
+  if (mode === "runtime-status") {
+    const statusButton = findNode(
+      readyTree,
+      (node) => node.type === "Button" && /Check PM runtime/.test(textContent(node)),
+    );
+    assert.ok(statusButton, "Map exposes an explicit PM runtime status action");
+    statusButton.props.onClick();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    const statusIndex = requestedPaths.findIndex(
+      (path) => path.includes("/maps/I_atlas_41/runtime?profile="),
+    );
+    assert.notEqual(statusIndex, -1);
+    assert.match(requestedPaths[statusIndex], /session_id=canonical-tip/);
+    hookIndex = 0;
+    const statusTree = registeredPage();
+    assert.match(
+      textContent(statusTree),
+      /PM runtime: repair_required.*pane_ownership_mismatch.*no_cleanup_without_verified_ownership.*Revalidate \/ resume Hermes PM/s,
+    );
+  }
   assert.match(renderedText, /2026-08-23T07:30:00Z/);
   const transitionButton = findNode(
     readyTree,
     (node) => node.type === "Button" && new RegExp(
       mode === "approval"
         ? "Move to authorized"
-        : mode === "pm-report"
+        : mode === "pm-report" || mode === "transition-failure"
           ? "Move to decision"
-          : "Move to delivery",
+          : "Move to parked",
     ).test(textContent(node)),
   );
   assert.ok(transitionButton, "Map card exposes an explicit governed transition control");
@@ -553,7 +626,10 @@ if (mode !== "empty") {
 
   hookIndex = 0;
   const pendingTree = registeredPage();
-  assert.match(textContent(pendingTree), mode === "pm-report" ? /delivery/ : /authorized/);
+  assert.match(
+    textContent(pendingTree),
+    mode === "pm-report" || mode === "transition-failure" ? /delivery/ : /authorized/,
+  );
 
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
@@ -567,15 +643,19 @@ if (mode !== "empty") {
     assert.equal(requestedOptions[transitionIndex].method, "POST");
     assert.deepEqual(JSON.parse(requestedOptions[transitionIndex].body), {
       map_id: "I_atlas_41",
-      expected_stage: mode === "pm-report" ? "delivery" : "authorized",
-      requested_stage: mode === "pm-report" ? "decision" : "delivery",
+      expected_stage: mode === "pm-report" || mode === "transition-failure"
+        ? "delivery"
+        : "authorized",
+      requested_stage: mode === "pm-report" || mode === "transition-failure"
+        ? "decision"
+        : "parked",
     });
   }
   if (mode === "transition-failure") {
     hookIndex = 0;
     const failedTree = registeredPage();
     const failedText = textContent(failedTree);
-    assert.match(failedText, /authorized/);
+    assert.match(failedText, /delivery/);
     assert.match(failedText, /GitHub denied the stage label update/);
   }
 } else {
@@ -680,5 +760,7 @@ process.stdout.write(
       ? "dashboard PM reporting ready\n"
     : mode === "outbox-terminal"
       ? "dashboard Outbox repair ready\n"
+    : mode === "commission"
+      ? "dashboard PM commission ready\n"
       : "dashboard board ready\n",
 );

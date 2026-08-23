@@ -449,7 +449,7 @@ if (mode === "live-update") {
   assert.match(text, /Octocat CEO portfolio/);
   const transitionButtons = nodes(
     tree,
-    (node) => node.type === "Button" && /Move to delivery/.test(textContent(node)),
+    (node) => node.type === "Button" && /Commission Hermes PM/.test(textContent(node)),
   );
   assert.equal(transitionButtons.length, 2);
   assert.deepEqual(transitionButtons.map((node) => Boolean(node.props.disabled)), [true, false]);

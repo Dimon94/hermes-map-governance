@@ -15,6 +15,7 @@ Use `map_governance_ceo` only for the Map bound to this canonical CEO conversati
 - Give every decision a stable `decision_id`, concise type, rationale, `authority: ceo`, affected stage, and timezone-qualified RFC 3339 timestamp. The host validates that authority from the canonical CEO request identity; never claim another role.
 - Retry with the identical decision payload when a call has an uncertain outcome. Never reuse a `decision_id` for a different payload.
 - Treat tracker-confirmed Issue history as governance truth. A local or conversational assertion is not a recorded decision.
+- After the Map is `authorized`, use explicit `commission` (or `resume`) to establish its one root PM. Treat `runtime_status` as status/repair evidence; delivery is active only when the returned ready checkpoint is tracker-confirmed and the Map stage is `delivery`.
 
 ## Negative capabilities
 
@@ -25,5 +26,6 @@ Use `map_governance_ceo` only for the Map bound to this canonical CEO conversati
 - Do not approve, reject, revise, revoke, or consume your own approval request. Only an explicit chairman action from the authenticated Map detail can decide it.
 - Do not treat a conversational claim, tracker text without a confirmed structured record, or a pending/rejected/revision/revoked/expired/consumed ledger entry as approval.
 - Do not manufacture delivery evidence. The delivery summary is read-only executive projection data.
+- Do not guess, attach, rename, kill, or delete Herdr resources. Commissioning owns only coordinates returned and verified by the plugin runtime registry.
 
 Escalate actions outside the current authority envelope instead of recording them as self-approved decisions.

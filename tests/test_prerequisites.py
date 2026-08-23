@@ -18,6 +18,7 @@ from map_governance.prerequisites import (
     SetupApplyError,
     YamlConfigRepository,
 )
+from map_governance.coordinator import CommissioningPrerequisiteError
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -153,6 +154,139 @@ class FakeRunner:
                 stderr="unexpected command",
             ),
         )
+
+
+class ReadConfig:
+    def __init__(self, value):
+        self.value = value
+
+    def read(self):
+        return copy.deepcopy(self.value)
+
+    def revision(self):
+        return "revision"
+
+    def commit(self, **_arguments):
+        raise AssertionError("commissioning context is read-only")
+
+
+def test_commissioning_context_consumes_selected_doctor_confirmed_coordinates(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    skills = tmp_path / "skills"
+    desired = _desired(
+        delivery_skill=_skill(skills, "delivery-pipeline"),
+        implement_skill=_skill(skills, "implement"),
+        repository=repository,
+        routing_policy="codex",
+    )
+    application = PrerequisiteApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data",
+        config_repository=ReadConfig({"prerequisites": desired}),
+        profile_resolver=lambda profile: tmp_path / "profiles" / profile,
+    )
+    monkeypatch.setattr(
+        application,
+        "doctor",
+        lambda: {"status": "pass", "checks": []},
+    )
+
+    context = application.commissioning_context(
+        project_id="PVT_acme_7",
+        repository="acme/atlas",
+    )
+
+    assert context.project_url == "https://github.com/orgs/acme/projects/7"
+    assert context.repository_path == str(repository)
+    assert context.pm_profile == "pm"
+    assert context.ceo_profile == "ceo"
+    assert context.pm_storage_root == str(
+        tmp_path / "profiles" / "pm" / "plugin-data" / "plugin-data"
+    )
+    assert context.routing_policy == "codex"
+    assert context.skills == (
+        "map-governance:pm",
+        "delivery-pipeline",
+        "herdr",
+    )
+
+
+def test_commissioning_context_rejects_failed_doctor_evidence(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    skills = tmp_path / "skills"
+    desired = _desired(
+        delivery_skill=_skill(skills, "delivery-pipeline"),
+        implement_skill=_skill(skills, "implement"),
+        repository=repository,
+    )
+    application = PrerequisiteApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data",
+        config_repository=ReadConfig({"prerequisites": desired}),
+        profile_resolver=lambda profile: tmp_path / "profiles" / profile,
+    )
+    monkeypatch.setattr(
+        application,
+        "doctor",
+        lambda: {
+            "status": "fail",
+            "checks": [
+                {"id": "herdr.integration.codex", "status": "fail"},
+                {"id": "authority.publisher", "status": "warning"},
+            ],
+        },
+    )
+
+    with pytest.raises(CommissioningPrerequisiteError) as raised:
+        application.commissioning_context(
+            project_id="PVT_acme_7",
+            repository="acme/atlas",
+        )
+
+    assert raised.value.failed_checks == ("herdr.integration.codex",)
+
+
+def test_commissioning_context_ignores_unrelated_project_doctor_failure(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    skills = tmp_path / "skills"
+    desired = _desired(
+        delivery_skill=_skill(skills, "delivery-pipeline"),
+        implement_skill=_skill(skills, "implement"),
+        repository=repository,
+        routing_policy="codex",
+    )
+    application = PrerequisiteApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data",
+        config_repository=ReadConfig({"prerequisites": desired}),
+        profile_resolver=lambda profile: tmp_path / "profiles" / profile,
+    )
+    monkeypatch.setattr(
+        application,
+        "doctor",
+        lambda: {
+            "status": "fail",
+            "checks": [
+                {"id": "github.project.PVT_unrelated_9.read", "status": "fail"},
+                {"id": "repository.other/repository.worker", "status": "fail"},
+            ],
+        },
+    )
+
+    context = application.commissioning_context(
+        project_id="PVT_acme_7",
+        repository="acme/atlas",
+    )
+
+    assert context.project_id == "PVT_acme_7"
+    assert context.repository == "acme/atlas"
 
 
 def _command_results(repository: Path) -> dict[tuple[str, ...], CommandResult]:

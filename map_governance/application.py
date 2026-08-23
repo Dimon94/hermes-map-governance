@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -63,6 +64,12 @@ from .sessions import (
     canonical_session_title,
 )
 from .reports import PMReport, PMReportDraft, TrackerPMReportRecord
+from .coordinator import (
+    CommissioningAuthorizationError,
+    CommissioningPrerequisiteResolver,
+    CoordinatorRuntimeBoundary,
+    RootRuntimeRequest,
+)
 from .tracker import (
     GitHubTrackerAdapter,
     TrackerAdapter,
@@ -303,6 +310,8 @@ class MapGovernanceApplication:
         outbox_crash_injector: Callable[[str, OutboxIntent], None] | None = None,
         coordinator_resume: CoordinatorResumeBoundary | None = None,
         event_settings: BoardEventSettings | None = None,
+        commissioning_prerequisites: CommissioningPrerequisiteResolver | None = None,
+        coordinator_runtime: CoordinatorRuntimeBoundary | None = None,
     ) -> None:
         self._plugin_root = plugin_root.resolve()
         self._storage = PluginStorage(storage_root)
@@ -353,6 +362,8 @@ class MapGovernanceApplication:
                 cast(SessionResumeBoundary, self._session_runner)
             )
         self._coordinator_resume = coordinator_resume
+        self._commissioning_prerequisites = commissioning_prerequisites
+        self._coordinator_runtime = coordinator_runtime
         if coordinator_resume is not None:
             effect_adapters[COORDINATOR_RESUME] = CoordinatorResumeEffectAdapter(
                 coordinator_resume
@@ -653,6 +664,549 @@ class MapGovernanceApplication:
             "authority_envelope": self._authority_policy.projection(),
             "delivery_summary": detail["delivery_summary"],
         }
+
+    def commission_map(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+    ) -> dict[str, Any]:
+        """Commission or resume the Map's one plugin-owned Hermes PM root."""
+        self._authorize_ceo_request(
+            map_id=map_id,
+            action="commission",
+            request_identity=request_identity,
+        )
+        binding = self._ensure_map_writable(map_id=map_id)
+        if (
+            self._commissioning_prerequisites is None
+            or self._coordinator_runtime is None
+        ):
+            raise RuntimeError("PM commissioning runtime is not configured")
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("commission", lock_key):
+            with self._storage.commission_lease(map_id):
+                return self._commission_map(
+                    map_id=map_id,
+                    binding=binding,
+                )
+
+    def _commission_map(
+        self,
+        *,
+        map_id: str,
+        binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        prerequisites = self._commissioning_prerequisites
+        coordinator_runtime = self._coordinator_runtime
+        if prerequisites is None or coordinator_runtime is None:
+            raise RuntimeError("PM commissioning runtime is not configured")
+        issue = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.get_issue(str(binding["issue_url"])),
+        )
+        if issue.id != map_id:
+            raise MapBindingError("Bound GitHub Issue identity changed")
+        authorization = self._commissioning_authorization(map_id=map_id)
+        current_stage = self._executive_stage(issue)
+        current_runtime = coordinator_runtime.status(map_id=map_id)
+        if current_stage == "delivery" and current_runtime.get("ready_record_id"):
+            context = prerequisites.commissioning_context(
+                project_id=str(binding["project_id"]),
+                repository=issue.repository,
+            )
+            runtime = coordinator_runtime.ensure_root(
+                RootRuntimeRequest(
+                    map_id=map_id,
+                    map_url=issue.url,
+                    context=context,
+                )
+            )
+            try:
+                self._bind_pm_runtime_identity(
+                    map_id=map_id,
+                    runtime=runtime,
+                    context=context,
+                )
+            except (
+                GovernanceAuthorizationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                sqlite3.Error,
+            ):
+                return self._pm_handoff_failure(
+                    coordinator_runtime=coordinator_runtime,
+                    map_id=map_id,
+                )
+            record_id = str(runtime.get("ready_record_id") or "")
+            if not record_id:
+                runtime = coordinator_runtime.record_failure(
+                    map_id=map_id,
+                    reason="delivery_runtime_checkpoint_missing",
+                    retryable=False,
+                    repair_required=True,
+                )
+                return {
+                    **self._runtime_projection(runtime),
+                    "checkpoint": {"state": "runtime_verification_failed"},
+                    "idempotent": False,
+                }
+            if runtime.get("state") != "active":
+                runtime = coordinator_runtime.activate(
+                    map_id=map_id,
+                    record_id=record_id,
+                )
+            return {
+                **self._runtime_projection(runtime),
+                "checkpoint": {
+                    "state": "tracker_confirmed",
+                    "record_id": record_id,
+                },
+                "idempotent": True,
+            }
+        if current_stage == "delivery":
+            runtime = (
+                coordinator_runtime.record_failure(
+                    map_id=map_id,
+                    reason="delivery_runtime_inconsistent",
+                    retryable=False,
+                    repair_required=True,
+                )
+                if current_runtime.get("state") != "not_commissioned"
+                else {
+                    "map_id": map_id,
+                    "state": "repair_required",
+                    "failure": {
+                        "reason": "delivery_runtime_inconsistent",
+                        "retryable": False,
+                        "repair_required": True,
+                        "resource_disposition": (
+                            "no_cleanup_without_verified_ownership"
+                        ),
+                    },
+                }
+            )
+            return {
+                **self._runtime_projection(runtime),
+                "checkpoint": {"state": "runtime_verification_failed"},
+                "idempotent": False,
+            }
+        if current_stage != "authorized":
+            raise CommissioningAuthorizationError(
+                map_id=map_id,
+                reason="map_not_authorized",
+            )
+        context = prerequisites.commissioning_context(
+            project_id=str(binding["project_id"]),
+            repository=issue.repository,
+        )
+        project = self._storage.project_binding(str(binding["project_id"]))
+        if project is None:
+            raise MapBindingError(
+                f"CEO project is not configured: {binding['project_id']}"
+            )
+        if (
+            context.project_id != binding["project_id"]
+            or context.project_url != str(project["project_url"])
+            or context.repository.casefold() != issue.repository.casefold()
+        ):
+            raise CommissioningAuthorizationError(
+                map_id=map_id,
+                reason="commissioning_coordinate_mismatch",
+            )
+        runtime = coordinator_runtime.ensure_root(
+            RootRuntimeRequest(
+                map_id=map_id,
+                map_url=issue.url,
+                context=context,
+            )
+        )
+        try:
+            pm_identity, coordinator_id = self._bind_pm_runtime_identity(
+                map_id=map_id,
+                runtime=runtime,
+                context=context,
+            )
+        except (
+            GovernanceAuthorizationError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            sqlite3.Error,
+        ):
+            return self._pm_handoff_failure(
+                coordinator_runtime=coordinator_runtime,
+                map_id=map_id,
+            )
+        ready_draft = self._commissioning_ready_draft(
+            map_id=map_id,
+            timestamp=str(runtime["commissioned_at"]),
+        )
+        try:
+            ready_record = self._tracker_ready_record(
+                binding=binding,
+                report=ready_draft,
+            )
+        except TrackerError:
+            return self._commissioning_tracker_failure(
+                coordinator_runtime=coordinator_runtime,
+                map_id=map_id,
+                record_id=ready_draft.record_id,
+            )
+        if ready_record is None:
+            try:
+                self.begin_pm_turn(
+                    map_id=map_id,
+                    request_identity=pm_identity,
+                    coordinator_id=coordinator_id,
+                    turn_id=f"commission-ready:{map_id}",
+                )
+            except (
+                GovernanceAuthorizationError,
+                RuntimeError,
+                ValueError,
+                sqlite3.Error,
+            ):
+                runtime = coordinator_runtime.record_failure(
+                    map_id=map_id,
+                    reason="pm_ready_turn_conflict",
+                    retryable=False,
+                    repair_required=True,
+                )
+                return {
+                    **self._runtime_projection(runtime),
+                    "checkpoint": {"state": "runtime_verification_failed"},
+                    "idempotent": False,
+                }
+            runtime = coordinator_runtime.prompt_ready(
+                map_id=map_id,
+                payload=self._commissioning_payload(
+                    issue=issue,
+                    context=context,
+                    report=ready_draft,
+                    authorization=authorization,
+                ),
+            )
+            if runtime.get("state") == "repair_required":
+                return {
+                    **self._runtime_projection(runtime),
+                    "checkpoint": {
+                        "state": "runtime_verification_failed",
+                        "record_id": ready_draft.record_id,
+                    },
+                    "idempotent": False,
+                }
+            try:
+                ready_record = self._tracker_ready_record(
+                    binding=binding,
+                    report=ready_draft,
+                )
+            except TrackerError:
+                return self._commissioning_tracker_failure(
+                    coordinator_runtime=coordinator_runtime,
+                    map_id=map_id,
+                    record_id=ready_draft.record_id,
+                )
+        if ready_record is None:
+            return {
+                **self._runtime_projection(runtime),
+                "checkpoint": {
+                    "state": "tracker_unconfirmed",
+                    "record_id": ready_draft.record_id,
+                },
+                "idempotent": False,
+            }
+        self._storage.save_pm_report_projection(
+            map_id=map_id,
+            report=self._pm_report_projection(
+                ready_record,
+                confirmed_at=self._synchronized_at(),
+            ),
+        )
+        runtime = coordinator_runtime.confirm_ready(
+            map_id=map_id,
+            record_id=ready_draft.record_id,
+        )
+        try:
+            self._transition_commissioned_delivery(
+                map_id=map_id,
+                ready_record_id=ready_draft.record_id,
+                mutation_id=self._commissioning_transition_id(map_id),
+            )
+        except (MapTransitionError, TrackerError):
+            runtime = coordinator_runtime.record_failure(
+                map_id=map_id,
+                reason="tracker_delivery_transition_pending",
+                retryable=True,
+            )
+            return {
+                **self._runtime_projection(runtime),
+                "checkpoint": {
+                    "state": "tracker_confirmed",
+                    "record_id": ready_draft.record_id,
+                },
+                "idempotent": False,
+            }
+        runtime = coordinator_runtime.activate(
+            map_id=map_id,
+            record_id=ready_draft.record_id,
+        )
+        return {
+            **self._runtime_projection(runtime),
+            "checkpoint": {
+                "state": "tracker_confirmed",
+                "record_id": ready_draft.record_id,
+            },
+            "idempotent": False,
+        }
+
+    def runtime_status(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+    ) -> dict[str, Any]:
+        """Return executive-safe commission/resume and repair evidence."""
+        self._authorize_ceo_request(
+            map_id=map_id,
+            action="runtime_status",
+            request_identity=request_identity,
+        )
+        if self._coordinator_runtime is None:
+            return {"map_id": map_id, "state": "not_commissioned"}
+        return self._runtime_projection(self._coordinator_runtime.status(map_id=map_id))
+
+    def accepts_pm_control_binding(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+        map_id: str,
+        coordinator_id: str,
+    ) -> bool:
+        """Confirm a PM-profile handoff against the authoritative CEO registry."""
+        assignment = self._storage.pm_assignment_for_request(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+        )
+        return bool(
+            assignment is not None
+            and assignment["map_id"] == map_id
+            and assignment["coordinator_id"] == coordinator_id
+        )
+
+    def _register_pm_control_plane(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        coordinator_id: str,
+        context: Any,
+    ) -> None:
+        control_profile = str(context.ceo_profile or "")
+        pm_storage_root = str(context.pm_storage_root or "")
+        if (
+            not self._profile_name
+            or control_profile != self._profile_name
+            or not pm_storage_root
+            or not Path(pm_storage_root).is_absolute()
+        ):
+            raise ValueError("PM profile handoff coordinates are unavailable")
+        PluginStorage(Path(pm_storage_root)).save_pm_control_plane_binding(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+            map_id=map_id,
+            control_profile=control_profile,
+            coordinator_id=coordinator_id,
+            registered_at=self._synchronized_at(),
+        )
+
+    def _bind_pm_runtime_identity(
+        self,
+        *,
+        map_id: str,
+        runtime: dict[str, Any],
+        context: Any,
+    ) -> tuple[GovernanceRequestIdentity, str]:
+        identity = GovernanceRequestIdentity(
+            profile_name=context.pm_profile,
+            session_id=str(runtime["agent_session_id"]),
+        )
+        coordinator_id = str(runtime["lifecycle_id"])
+        self.assign_pm(
+            map_id=map_id,
+            request_identity=identity,
+            coordinator_id=coordinator_id,
+        )
+        self._register_pm_control_plane(
+            map_id=map_id,
+            request_identity=identity,
+            coordinator_id=coordinator_id,
+            context=context,
+        )
+        return identity, coordinator_id
+
+    def _pm_handoff_failure(
+        self,
+        *,
+        coordinator_runtime: CoordinatorRuntimeBoundary,
+        map_id: str,
+    ) -> dict[str, Any]:
+        runtime = coordinator_runtime.record_failure(
+            map_id=map_id,
+            reason="pm_profile_handoff_unavailable",
+            retryable=False,
+            repair_required=True,
+        )
+        return {
+            **self._runtime_projection(runtime),
+            "checkpoint": {"state": "runtime_verification_failed"},
+            "idempotent": False,
+        }
+
+    def _commissioning_authorization(self, *, map_id: str) -> dict[str, Any]:
+        expected_scope = normalized_json({"map_id": map_id})
+        expected_payload = normalized_json(
+            {
+                "expected_stage": "awaiting-approval",
+                "requested_stage": "authorized",
+            }
+        )
+        for approval in reversed(self._storage.approvals(map_id=map_id)):
+            mutation_id = approval.get("consumed_by_mutation_id")
+            if (
+                approval["status"] != "consumed"
+                or approval["decision_class"] != "delivery_authorization"
+                or approval["proposed_action"] != "transition_map"
+                or normalized_json(approval["requested_scope"]) != expected_scope
+                or normalized_json(approval["decision_payload"]) != expected_payload
+                or not mutation_id
+            ):
+                continue
+            mutation = self._storage.protected_mutation(str(mutation_id))
+            if mutation is not None and mutation["status"] == "confirmed":
+                if self._approval_revocation_unfinished(
+                    map_id=map_id,
+                    request_id=str(approval["request_id"]),
+                ):
+                    break
+                return {
+                    "request_id": str(approval["request_id"]),
+                    "mutation_id": str(mutation_id),
+                    "decision_class": "delivery_authorization",
+                }
+        raise CommissioningAuthorizationError(
+            map_id=map_id,
+            reason="delivery_authorization_missing",
+        )
+
+    @staticmethod
+    def _commissioning_ready_draft(*, map_id: str, timestamp: str) -> PMReportDraft:
+        record_id = f"commission-ready-{map_id}"
+        if len(record_id) > 128:
+            record_id = (
+                "commission-ready-" + hashlib.sha256(map_id.encode()).hexdigest()
+            )
+        return PMReportDraft(
+            record_id=record_id,
+            report_type="checkpoint",
+            summary="Hermes PM runtime is ready for governed delivery.",
+            timestamp=timestamp,
+        )
+
+    def _tracker_ready_record(
+        self,
+        *,
+        binding: dict[str, Any],
+        report: PMReportDraft,
+    ) -> TrackerPMReportRecord | None:
+        list_reports = getattr(self._tracker, "list_pm_reports", None)
+        if not callable(list_reports):
+            return None
+        records = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: list_reports(str(binding["issue_url"])),
+        )
+        expected = report.assign_to(str(binding["map_id"]))
+        return next((record for record in records if record.report == expected), None)
+
+    @staticmethod
+    def _commissioning_tracker_failure(
+        *,
+        coordinator_runtime: CoordinatorRuntimeBoundary,
+        map_id: str,
+        record_id: str,
+    ) -> dict[str, Any]:
+        runtime = coordinator_runtime.record_failure(
+            map_id=map_id,
+            reason="tracker_ready_confirmation_unavailable",
+            retryable=True,
+        )
+        return {
+            **MapGovernanceApplication._runtime_projection(runtime),
+            "checkpoint": {
+                "state": "tracker_confirmation_unavailable",
+                "record_id": record_id,
+            },
+            "idempotent": False,
+        }
+
+    @staticmethod
+    def _commissioning_payload(
+        *,
+        issue: TrackerIssue,
+        context: Any,
+        report: PMReportDraft,
+        authorization: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "protocol": "map-governance/pm-commission-v1",
+            "action": "submit_ready_checkpoint_and_wait",
+            "map": {"id": issue.id, "url": issue.url},
+            "project": {"id": context.project_id, "url": context.project_url},
+            "repository": {
+                "coordinate": context.repository,
+                "path": context.repository_path,
+            },
+            "profile": context.pm_profile,
+            "skills": list(context.skills),
+            "routing_policy": context.routing_policy,
+            "governance": {
+                "stage": "authorized",
+                "authority": {
+                    "decision_class": authorization["decision_class"],
+                    "request_id": authorization["request_id"],
+                },
+                "constraints": [
+                    "Do not dispatch implementation work yet.",
+                    "Do not publish remote changes.",
+                    "Submit exactly the ready checkpoint, then wait.",
+                ],
+            },
+            "ready_checkpoint": report.payload(),
+        }
+
+    @staticmethod
+    def _commissioning_transition_id(map_id: str) -> str:
+        return "commission-delivery:" + hashlib.sha256(map_id.encode()).hexdigest()[:32]
+
+    @staticmethod
+    def _runtime_projection(record: dict[str, Any]) -> dict[str, Any]:
+        projection = {
+            "map_id": record.get("map_id"),
+            "state": record.get("state", "not_commissioned"),
+            "profile": record.get("pm_profile"),
+            "repository": record.get("repository"),
+            "session_id": record.get("session_namespace"),
+            "workspace_id": record.get("workspace_id"),
+            "window_id": record.get("window_id"),
+            "pane_id": record.get("pane_id"),
+            "agent_id": record.get("agent_id"),
+            "lifecycle_id": record.get("lifecycle_id"),
+            "ready_record_id": record.get("ready_record_id"),
+            "failure": record.get("failure"),
+        }
+        return {key: value for key, value in projection.items() if value is not None}
 
     def assign_pm(
         self,
@@ -2909,6 +3463,7 @@ class MapGovernanceApplication:
                         approval_request_id=approval_request_id,
                         mutation_id=mutation_id,
                         actor_identity=actor_identity,
+                        commissioning_ready_record_id=None,
                     )
             return self._transition_map(
                 map_id=map_id,
@@ -2917,6 +3472,27 @@ class MapGovernanceApplication:
                 approval_request_id=approval_request_id,
                 mutation_id=mutation_id,
                 actor_identity=actor_identity,
+                commissioning_ready_record_id=None,
+            )
+
+    def _transition_commissioned_delivery(
+        self,
+        *,
+        map_id: str,
+        ready_record_id: str,
+        mutation_id: str | None,
+    ) -> dict[str, Any]:
+        """Commit the one internal tracker transition unlocked by PM readiness."""
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("transition", lock_key):
+            return self._transition_map(
+                map_id=map_id,
+                expected_stage="authorized",
+                requested_stage="delivery",
+                approval_request_id=None,
+                mutation_id=mutation_id,
+                actor_identity=None,
+                commissioning_ready_record_id=ready_record_id,
             )
 
     def _transition_map(
@@ -2928,6 +3504,7 @@ class MapGovernanceApplication:
         approval_request_id: str | None,
         mutation_id: str | None,
         actor_identity: GovernanceActorIdentity | None,
+        commissioning_ready_record_id: str | None,
     ) -> dict[str, Any]:
         binding = self._storage.map_binding(map_id)
         if binding is None:
@@ -3037,6 +3614,30 @@ class MapGovernanceApplication:
         replaying_committed_transition = current_stage == requested_stage and (
             existing_mutation is not None or mutation_id is not None
         )
+        if (
+            not replaying_committed_transition
+            and current_stage == "authorized"
+            and requested_stage == "delivery"
+        ):
+            runtime = (
+                self._coordinator_runtime.status(map_id=map_id)
+                if self._coordinator_runtime is not None
+                else {"state": "not_commissioned"}
+            )
+            if (
+                not commissioning_ready_record_id
+                or runtime.get("state") != "ready_confirmed"
+                or runtime.get("ready_record_id") != commissioning_ready_record_id
+                or runtime.get("failure") is not None
+            ):
+                raise MapTransitionError(
+                    current_stage=current_stage,
+                    requested_stage=requested_stage,
+                    reason=(
+                        "Hermes PM ready checkpoint is not tracker-confirmed; "
+                        "use the explicit commission/resume seam"
+                    ),
+                )
         if current_stage != expected_stage and not replaying_committed_transition:
             raise MapTransitionConflict(
                 current_stage=current_stage,

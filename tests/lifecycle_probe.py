@@ -122,6 +122,9 @@ def main() -> int:
         "inspect",
         "record_decision",
         "request_approval",
+        "commission",
+        "resume",
+        "runtime_status",
     }
     ceo_definitions = get_tool_definitions(
         enabled_toolsets=["map-governance-ceo"],

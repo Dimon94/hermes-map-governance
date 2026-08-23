@@ -36,6 +36,7 @@ from .prerequisites_setup import (
     _redact,
     _timestamp,
 )
+from .coordinator import CommissioningContext, CommissioningPrerequisiteError
 
 __all__ = [
     "CommandResult",
@@ -197,6 +198,113 @@ class PrerequisiteApplication:
     ) -> dict[str, Any]:
         return self._setup.setup_apply(
             plan=plan, selected_action_ids=selected_action_ids
+        )
+
+    def commissioning_context(
+        self,
+        *,
+        project_id: str,
+        repository: str,
+    ) -> CommissioningContext:
+        """Resolve one doctor-confirmed, secret-free PM runtime context."""
+        try:
+            config = self._config.read()
+            settings = _prerequisite_settings(config)
+            raw = settings.get("prerequisites") if settings is not None else None
+            desired = _normalize_desired(raw) if isinstance(raw, Mapping) else None
+        except (ConfigCommitError, OSError, ValueError) as error:
+            raise CommissioningPrerequisiteError(
+                reason="configuration_invalid",
+                failed_checks=("configuration",),
+            ) from error
+        if desired is None:
+            raise CommissioningPrerequisiteError(
+                reason="configuration_missing",
+                failed_checks=("configuration",),
+            )
+        project = next(
+            (
+                item
+                for item in desired["github"]["projects"]
+                if item["id"] == project_id
+            ),
+            None,
+        )
+        selected_repository = next(
+            (
+                item
+                for item in desired["github"]["repositories"]
+                if str(item["coordinate"]).casefold() == repository.casefold()
+            ),
+            None,
+        )
+        if project is None:
+            raise CommissioningPrerequisiteError(
+                reason="project_not_selected",
+                failed_checks=(f"github.project.{project_id}",),
+            )
+        if selected_repository is None:
+            raise CommissioningPrerequisiteError(
+                reason="repository_not_selected",
+                failed_checks=(f"repository.{repository}",),
+            )
+        report = self.doctor()
+        policy = str(desired["routing"]["policy"])
+        required_integrations = ROUTING_INTEGRATIONS[policy]
+        required_check_ids = {
+            "configuration",
+            "profiles.separation",
+            "profiles.ceo",
+            "profiles.pm",
+            "skills.plugin.pm",
+            "skills.external.delivery-pipeline",
+            "storage.path",
+            "storage.ownership",
+            "storage.permissions",
+            "storage.database",
+            "github.auth",
+            "authority.separation",
+            "authority.worker",
+            f"github.project.{project_id}.read",
+            f"github.project.{project_id}.write",
+            f"repository.{selected_repository['coordinate']}.read",
+            f"repository.{selected_repository['coordinate']}.governance",
+            f"repository.{selected_repository['coordinate']}.worker",
+            "herdr.binary",
+            *(f"herdr.integration.{name}" for name in required_integrations),
+        }
+        failed = tuple(
+            str(check["id"])
+            for check in report["checks"]
+            if check.get("status") == "fail"
+            and str(check.get("id")) in required_check_ids
+        )
+        if failed:
+            raise CommissioningPrerequisiteError(
+                reason="doctor_failed",
+                failed_checks=failed,
+            )
+        repository_path = Path(str(selected_repository["path"]))
+        if not repository_path.is_absolute() or not repository_path.is_dir():
+            raise CommissioningPrerequisiteError(
+                reason="repository_path_unavailable",
+                failed_checks=(f"repository.{repository}.read",),
+            )
+        return CommissioningContext(
+            project_id=project_id,
+            project_url=str(project["url"]),
+            repository=str(selected_repository["coordinate"]),
+            repository_path=str(repository_path),
+            pm_profile=str(desired["profiles"]["pm"]),
+            routing_policy=str(desired["routing"]["policy"]),
+            herdr_executable=str(desired["herdr"]["executable"]),
+            skills=("map-governance:pm", "delivery-pipeline", "herdr"),
+            ceo_profile=str(desired["profiles"]["ceo"]),
+            pm_storage_root=str(
+                self._profile_resolver(str(desired["profiles"]["pm"]))
+                / "plugin-data"
+                / self._storage_root.name
+            ),
         )
 
     def doctor(self) -> dict[str, Any]:

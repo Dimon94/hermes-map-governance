@@ -377,7 +377,7 @@ def test_production_state_writers_physically_prune_configured_history(tmp_path):
     app.transition_map(
         map_id=card["id"],
         expected_stage="authorized",
-        requested_stage="delivery",
+        requested_stage="parked",
     )
 
     with sqlite3.connect(storage_root / "registry.db") as connection:
@@ -477,15 +477,15 @@ def test_one_project_stales_independently_and_only_reconcile_clears_it(tmp_path)
         app.transition_map(
             map_id=acme_map["id"],
             expected_stage="authorized",
-            requested_stage="delivery",
+            requested_stage="parked",
         )
     assert (
         app.transition_map(
             map_id=octocat_map["id"],
             expected_stage="authorized",
-            requested_stage="delivery",
+            requested_stage="parked",
         )["stage"]
-        == "delivery"
+        == "parked"
     )
 
     tracker.unavailable_projects.remove(acme["id"])
@@ -516,7 +516,7 @@ def test_stage_and_outbox_events_follow_their_committed_state_changes(tmp_path):
     app.transition_map(
         map_id=card["id"],
         expected_stage="authorized",
-        requested_stage="delivery",
+        requested_stage="parked",
     )
     committed = app.board_events(cursor=cursor, limit=100)["events"]
 
@@ -535,7 +535,7 @@ def test_stage_and_outbox_events_follow_their_committed_state_changes(tmp_path):
         next(event for event in committed if event["type"] == "map.upserted")[
             "payload"
         ]["card"]["stage"]
-        == "delivery"
+        == "parked"
     )
 
 
@@ -553,7 +553,7 @@ def test_populated_schema_v7_migrates_without_losing_governance_state(tmp_path):
     app.transition_map(
         map_id=card["id"],
         expected_stage="authorized",
-        requested_stage="delivery",
+        requested_stage="parked",
     )
     database = storage_root / "registry.db"
     with sqlite3.connect(database) as connection:
@@ -665,7 +665,7 @@ def test_populated_schema_v7_migrates_without_losing_governance_state(tmp_path):
     )
 
     migrated_card = restarted.map_detail(map_id=card["id"])
-    assert migrated_card["stage"] == "delivery"
+    assert migrated_card["stage"] == "parked"
     assert migrated_card["external_effects"]["succeeded_count"] == 1
     with sqlite3.connect(database) as connection:
         assert (

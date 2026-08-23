@@ -14,6 +14,7 @@ from map_governance import (
     CEOSessionRepairRequired,
     MapTransitionError,
     StaleProjectionError,
+    GovernanceRequestIdentity,
 )
 from map_governance.tracker import TrackerError
 
@@ -566,6 +567,68 @@ def test_rest_session_open_preserves_repair_required_detail(
         "candidate_count": 2,
         "retryable": False,
     }
+
+
+def test_rest_commission_resume_and_status_keep_request_scoped_identity(
+    tmp_path, monkeypatch, hermes_host_root
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    adapter = _load_dashboard_adapter()
+    api = FastAPI()
+    api.include_router(adapter.router, prefix="/api/plugins/map-governance")
+    calls = []
+
+    class ApplicationProbe:
+        def commission_map(self, **arguments):
+            calls.append(("commission_map", arguments))
+            return {"state": "active"}
+
+        def runtime_status(self, **arguments):
+            calls.append(("runtime_status", arguments))
+            return {"state": "active"}
+
+    monkeypatch.setattr(
+        adapter,
+        "application_for_profile",
+        lambda _profile: ApplicationProbe(),
+    )
+
+    async def exercise_routes():
+        transport = httpx.ASGITransport(app=api)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            commission = await client.post(
+                "/api/plugins/map-governance/maps/I_atlas_41/commission?profile=ceo",
+                json={"session_id": "ceo-live"},
+            )
+            resume = await client.post(
+                "/api/plugins/map-governance/maps/I_atlas_41/resume?profile=ceo",
+                json={"session_id": "ceo-live"},
+            )
+            status = await client.get(
+                "/api/plugins/map-governance/maps/I_atlas_41/runtime"
+                "?profile=ceo&session_id=ceo-live"
+            )
+            forged = await client.post(
+                "/api/plugins/map-governance/maps/I_atlas_41/commission?profile=ceo",
+                json={},
+            )
+        return commission, resume, status, forged
+
+    commission, resume, status, forged = asyncio.run(exercise_routes())
+
+    assert commission.status_code == resume.status_code == status.status_code == 200
+    assert forged.status_code == 422
+    assert [name for name, _ in calls] == [
+        "commission_map",
+        "commission_map",
+        "runtime_status",
+    ]
+    assert all(
+        arguments["request_identity"] == GovernanceRequestIdentity("ceo", "ceo-live")
+        for _, arguments in calls
+    )
 
 
 def test_rest_chairman_decision_uses_authenticated_request_identity(

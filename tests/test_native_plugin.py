@@ -82,6 +82,14 @@ def test_native_maps_commands_delegate_to_the_application(
             calls.append(("open_map", arguments))
             return {"operation": "open_map"}
 
+        def commission_map(self, **arguments):
+            calls.append(("commission_map", arguments))
+            return {"operation": "commission_map"}
+
+        def runtime_status(self, **arguments):
+            calls.append(("runtime_status", arguments))
+            return {"operation": "runtime_status"}
+
         def outbox_status(self, **arguments):
             calls.append(("outbox_status", arguments))
             return {"operation": "outbox_status"}
@@ -146,6 +154,40 @@ def test_native_maps_commands_delegate_to_the_application(
         parser.parse_args(["board"]),
         parser.parse_args(["detail", "--map", "I_atlas_41"]),
         parser.parse_args(["open", "--map", "I_atlas_41", "--profile", "ceo"]),
+        parser.parse_args(
+            [
+                "commission",
+                "--map",
+                "I_atlas_41",
+                "--profile",
+                "ceo",
+                "--session",
+                "ceo-live",
+            ]
+        ),
+        parser.parse_args(
+            [
+                "runtime",
+                "status",
+                "--map",
+                "I_atlas_41",
+                "--profile",
+                "ceo",
+                "--session",
+                "ceo-live",
+            ]
+        ),
+        parser.parse_args(
+            [
+                "resume",
+                "--map",
+                "I_atlas_41",
+                "--profile",
+                "ceo",
+                "--session",
+                "ceo-live",
+            ]
+        ),
         parser.parse_args(["outbox", "status", "--effect", "effect-001"]),
         parser.parse_args(["outbox", "recover", "--limit", "12"]),
         parser.parse_args(
@@ -173,6 +215,9 @@ def test_native_maps_commands_delegate_to_the_application(
         0,
         0,
         0,
+        0,
+        0,
+        0,
     ]
     reports = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert reports == [
@@ -183,6 +228,9 @@ def test_native_maps_commands_delegate_to_the_application(
         {"operation": "board"},
         {"operation": "map_detail"},
         {"operation": "open_map"},
+        {"operation": "commission_map"},
+        {"operation": "runtime_status"},
+        {"operation": "commission_map"},
         {"operation": "outbox_status"},
         {"operation": "recover_outbox"},
         {"operation": "repair_outbox"},
@@ -212,6 +260,30 @@ def test_native_maps_commands_delegate_to_the_application(
         ("map_detail", {"map_id": "I_atlas_41"}),
         ("profile", {"profile": "ceo"}),
         ("open_map", {"map_id": "I_atlas_41"}),
+        ("profile", {"profile": "ceo"}),
+        (
+            "commission_map",
+            {
+                "map_id": "I_atlas_41",
+                "request_identity": native.GovernanceRequestIdentity("ceo", "ceo-live"),
+            },
+        ),
+        ("profile", {"profile": "ceo"}),
+        (
+            "runtime_status",
+            {
+                "map_id": "I_atlas_41",
+                "request_identity": native.GovernanceRequestIdentity("ceo", "ceo-live"),
+            },
+        ),
+        ("profile", {"profile": "ceo"}),
+        (
+            "commission_map",
+            {
+                "map_id": "I_atlas_41",
+                "request_identity": native.GovernanceRequestIdentity("ceo", "ceo-live"),
+            },
+        ),
         ("outbox_status", {"effect_id": "effect-001"}),
         ("recover_outbox", {"limit": 12}),
         (

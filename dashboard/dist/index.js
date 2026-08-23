@@ -588,6 +588,7 @@
     const [state, setState] = useState({ status: "loading" });
     const [transitionState, setTransitionState] = useState({ status: "idle" });
     const [sessionState, setSessionState] = useState({ status: "idle" });
+    const [commissionState, setCommissionState] = useState({ status: "idle" });
     const [detailState, setDetailState] = useState({ status: "idle" });
     const [approvalState, setApprovalState] = useState({ status: "idle" });
     const [doctorState, setDoctorState] = useState({ status: "idle" });
@@ -964,6 +965,84 @@
         },
       );
     }, [applyEvent]);
+
+    const commissionPM = useCallback(function (mapId) {
+      if (!window.confirm(
+        "Commission or resume this Map's single plugin-owned Hermes PM?",
+      )) {
+        return;
+      }
+      setCommissionState({ status: "pending", mapId: mapId });
+      requestProfile().then(function (profile) {
+        const encodedProfile = encodeURIComponent(profile);
+        return fetchJSON(
+          "/api/plugins/map-governance/maps/" + encodeURIComponent(mapId)
+            + "/session?profile=" + encodedProfile,
+          { method: "POST" },
+        ).then(function (opened) {
+          return fetchJSON(
+            "/api/plugins/map-governance/maps/" + encodeURIComponent(mapId)
+              + "/commission?profile=" + encodedProfile,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                session_id: opened.ceo_session.live_session_id,
+              }),
+            },
+          );
+        });
+      }).then(
+        function (runtime) {
+          setCommissionState({
+            status: "ready",
+            mapId: mapId,
+            runtime: runtime,
+          });
+        },
+        function (error) {
+          setCommissionState({
+            status: "error",
+            mapId: mapId,
+            message: error && error.message
+              ? error.message
+              : "Unable to commission the Hermes PM",
+          });
+        },
+      );
+    }, []);
+
+    const loadRuntimeStatus = useCallback(function (mapId) {
+      setCommissionState({ status: "pending", mapId: mapId });
+      requestProfile().then(function (profile) {
+        const encodedProfile = encodeURIComponent(profile);
+        return fetchJSON(
+          "/api/plugins/map-governance/maps/" + encodeURIComponent(mapId)
+            + "/session?profile=" + encodedProfile,
+          { method: "POST" },
+        ).then(function (opened) {
+          return fetchJSON(
+            "/api/plugins/map-governance/maps/" + encodeURIComponent(mapId)
+              + "/runtime?profile=" + encodedProfile
+              + "&session_id="
+              + encodeURIComponent(opened.ceo_session.live_session_id),
+          );
+        });
+      }).then(
+        function (runtime) {
+          setCommissionState({ status: "ready", mapId: mapId, runtime: runtime });
+        },
+        function (error) {
+          setCommissionState({
+            status: "error",
+            mapId: mapId,
+            message: error && error.message
+              ? error.message
+              : "Unable to read the Hermes PM runtime",
+          });
+        },
+      );
+    }, []);
 
     const loadMapDetail = useCallback(function (mapId) {
       setDetailState({ status: "loading", mapId: mapId });
@@ -1694,6 +1773,35 @@
                         sessionState.message,
                       )
                     : null,
+                  commissionState.mapId === card.id && commissionState.status === "ready"
+                    ? React.createElement(
+                        "div",
+                        { role: "status", className: "space-y-1 text-sm text-muted-foreground" },
+                        React.createElement(
+                          "p",
+                          null,
+                          "PM runtime: " + commissionState.runtime.state,
+                        ),
+                        commissionState.runtime.failure
+                          ? React.createElement(
+                              "p",
+                              { role: "alert", className: "text-destructive" },
+                              "Runtime repair evidence: "
+                                + commissionState.runtime.failure.reason
+                                + " ("
+                                + commissionState.runtime.failure.resource_disposition
+                                + ")",
+                            )
+                          : null,
+                      )
+                    : null,
+                  commissionState.mapId === card.id && commissionState.status === "error"
+                    ? React.createElement(
+                        "p",
+                        { role: "alert", className: "text-sm text-destructive" },
+                        commissionState.message,
+                      )
+                    : null,
                   approvalState.status === "error" && approvalState.mapId === card.id
                     ? React.createElement(
                         "p",
@@ -1729,7 +1837,52 @@
                         ? "Loading Map detail…"
                         : "View Map detail",
                     ),
-                    (card.available_transitions || []).map(function (stage) {
+                    card.stage === "authorized"
+                      ? React.createElement(
+                          Button,
+                          {
+                            type: "button",
+                            variant: "outline",
+                            disabled: stale || card.ceo_session.state === "repair_required"
+                              || (commissionState.status === "pending"
+                                && commissionState.mapId === card.id),
+                            onClick: function () { commissionPM(card.id); },
+                          },
+                          commissionState.status === "pending"
+                            && commissionState.mapId === card.id
+                            ? "Commissioning Hermes PM…"
+                            : "Commission Hermes PM",
+                        )
+                      : null,
+                    card.stage === "authorized" || card.stage === "delivery"
+                      ? React.createElement(
+                          Button,
+                          {
+                            type: "button",
+                            variant: "outline",
+                            disabled: commissionState.status === "pending"
+                              && commissionState.mapId === card.id,
+                            onClick: function () { loadRuntimeStatus(card.id); },
+                          },
+                          "Check PM runtime",
+                        )
+                      : null,
+                    commissionState.status === "ready"
+                      && commissionState.mapId === card.id
+                      && commissionState.runtime.state !== "not_commissioned"
+                      ? React.createElement(
+                          Button,
+                          {
+                            type: "button",
+                            variant: "outline",
+                            onClick: function () { commissionPM(card.id); },
+                          },
+                          "Revalidate / resume Hermes PM",
+                        )
+                      : null,
+                    (card.available_transitions || []).filter(function (stage) {
+                      return !(card.stage === "authorized" && stage === "delivery");
+                    }).map(function (stage) {
                       const pending = transitionState.status === "pending" && transitionState.mapId === card.id;
                       return React.createElement(
                         Button,

@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -15,7 +16,7 @@ from .events import append_board_event, content_event_id
 
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class PluginStorage:
@@ -311,6 +312,300 @@ class PluginStorage:
                 (profile_name, session_id),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def save_pm_control_plane_binding(
+        self,
+        *,
+        profile_name: str,
+        session_id: str,
+        map_id: str,
+        control_profile: str,
+        coordinator_id: str,
+        registered_at: str,
+    ) -> bool:
+        """Bind one PM request identity to its profile-scoped CEO control plane."""
+        values = tuple(
+            str(value).strip()
+            for value in (
+                profile_name,
+                session_id,
+                map_id,
+                control_profile,
+                coordinator_id,
+                registered_at,
+            )
+        )
+        if any(not value or len(value) > 512 for value in values):
+            raise ValueError("PM control-plane binding has an invalid identity")
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM pm_control_plane_bindings
+                WHERE profile_name = ? AND session_id = ?
+                """,
+                (values[0], values[1]),
+            ).fetchone()
+            if existing is not None:
+                same = all(
+                    existing[name] == value
+                    for name, value in {
+                        "map_id": values[2],
+                        "control_profile": values[3],
+                        "coordinator_id": values[4],
+                    }.items()
+                )
+                if not same:
+                    raise ValueError("PM control-plane identity already has a binding")
+                return True
+            connection.execute(
+                """
+                INSERT INTO pm_control_plane_bindings(
+                    profile_name, session_id, map_id, control_profile,
+                    coordinator_id, registered_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+        return False
+
+    def pm_control_plane_for_request(
+        self, *, profile_name: str, session_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT profile_name, session_id, map_id, control_profile,
+                       coordinator_id, registered_at
+                FROM pm_control_plane_bindings
+                WHERE profile_name = ? AND session_id = ?
+                """,
+                (profile_name, session_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def coordinator_lifecycle(self, *, created_at: str) -> str:
+        """Return the stable identity for this plugin-owned runtime lifecycle."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO coordinator_lifecycle(
+                    singleton, lifecycle_id, created_at
+                ) VALUES (1, ?, ?)
+                """,
+                (str(uuid.uuid4()), created_at),
+            )
+            row = connection.execute(
+                """
+                SELECT lifecycle_id FROM coordinator_lifecycle
+                WHERE singleton = 1
+                """
+            ).fetchone()
+        if row is None:  # pragma: no cover - guarded by the insert above
+            raise RuntimeError("Coordinator lifecycle identity was not persisted")
+        return str(row["lifecycle_id"])
+
+    def coordinator_session(self, namespace: str) -> dict[str, Any] | None:
+        """Read proof that one deterministic Herdr namespace is plugin-owned."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT session_namespace, lifecycle_id, ownership_marker,
+                       state, updated_at
+                FROM coordinator_sessions
+                WHERE session_namespace = ?
+                """,
+                (namespace,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    @contextmanager
+    def pm_runtime_lease(self, map_id: str) -> Iterator[None]:
+        """Serialize commission/resume across processes for one Map."""
+        with self._map_lease(namespace="pm-runtime", map_id=map_id):
+            yield
+
+    @contextmanager
+    def commission_lease(self, map_id: str) -> Iterator[None]:
+        """Serialize the complete authorization-to-delivery state machine."""
+        with self._map_lease(namespace="commission", map_id=map_id):
+            yield
+
+    @contextmanager
+    def coordinator_session_lease(self) -> Iterator[None]:
+        """Serialize discovery/start of the one shared plugin Herdr session."""
+        with self._map_lease(namespace="coordinator-session", map_id="singleton"):
+            yield
+
+    def reserve_pm_runtime(
+        self,
+        *,
+        map_id: str,
+        session_namespace: str,
+        workspace_label: str,
+        agent_id: str,
+        ownership_marker: str,
+        lifecycle_id: str,
+        context: Any,
+        updated_at: str,
+        session_ownership_marker: str | None = None,
+    ) -> bool:
+        """Atomically reserve stable identities before any Herdr mutation."""
+        session_marker = session_ownership_marker or ownership_marker
+        values = {
+            "project_id": str(getattr(context, "project_id")),
+            "project_url": str(getattr(context, "project_url")),
+            "repository": str(getattr(context, "repository")),
+            "repository_path": str(getattr(context, "repository_path")),
+            "pm_profile": str(getattr(context, "pm_profile")),
+            "routing_policy": str(getattr(context, "routing_policy")),
+            "herdr_executable": str(getattr(context, "herdr_executable")),
+        }
+        with self._connect() as connection:
+            session = connection.execute(
+                """
+                SELECT lifecycle_id, ownership_marker
+                FROM coordinator_sessions WHERE session_namespace = ?
+                """,
+                (session_namespace,),
+            ).fetchone()
+            if session is not None and (
+                session["lifecycle_id"] != lifecycle_id
+                or session["ownership_marker"] != session_marker
+            ):
+                raise ValueError("Coordinator session ownership proof changed")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO coordinator_sessions(
+                    session_namespace, lifecycle_id, ownership_marker,
+                    state, updated_at
+                ) VALUES (?, ?, ?, 'reserved', ?)
+                """,
+                (
+                    session_namespace,
+                    lifecycle_id,
+                    session_marker,
+                    updated_at,
+                ),
+            )
+            existing = connection.execute(
+                "SELECT * FROM pm_runtime_bindings WHERE map_id = ?",
+                (map_id,),
+            ).fetchone()
+            if existing is not None:
+                same = all(
+                    str(existing[name]) == value
+                    for name, value in {
+                        "session_namespace": session_namespace,
+                        "workspace_label": workspace_label,
+                        "agent_id": agent_id,
+                        "ownership_marker": ownership_marker,
+                        "lifecycle_id": lifecycle_id,
+                        **values,
+                    }.items()
+                )
+                if not same:
+                    raise ValueError("Map runtime reservation changed identity")
+                return True
+            connection.execute(
+                """
+                INSERT INTO pm_runtime_bindings(
+                    map_id, project_id, project_url, repository,
+                    repository_path, pm_profile, routing_policy,
+                    herdr_executable, session_namespace, workspace_label, agent_id,
+                    ownership_marker, lifecycle_id, state, commissioned_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+                """,
+                (
+                    map_id,
+                    values["project_id"],
+                    values["project_url"],
+                    values["repository"],
+                    values["repository_path"],
+                    values["pm_profile"],
+                    values["routing_policy"],
+                    values["herdr_executable"],
+                    session_namespace,
+                    workspace_label,
+                    agent_id,
+                    ownership_marker,
+                    lifecycle_id,
+                    updated_at,
+                    updated_at,
+                ),
+            )
+        return False
+
+    def update_pm_runtime(
+        self,
+        *,
+        map_id: str,
+        state: str,
+        workspace_id: str | None = None,
+        window_id: str | None = None,
+        pane_id: str | None = None,
+        agent_session_id: str | None = None,
+        ready_record_id: str | None = None,
+        failure: dict[str, Any] | None = None,
+        updated_at: str,
+    ) -> None:
+        """Advance one runtime record with safe, opaque resume coordinates."""
+        failure_json = normalized_json(failure) if failure is not None else None
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE pm_runtime_bindings
+                SET state = ?,
+                    workspace_id = COALESCE(?, workspace_id),
+                    window_id = COALESCE(?, window_id),
+                    pane_id = COALESCE(?, pane_id),
+                    agent_session_id = COALESCE(?, agent_session_id),
+                    ready_record_id = COALESCE(?, ready_record_id),
+                    failure_json = ?, updated_at = ?
+                WHERE map_id = ?
+                """,
+                (
+                    state,
+                    workspace_id,
+                    window_id,
+                    pane_id,
+                    agent_session_id,
+                    ready_record_id,
+                    failure_json,
+                    updated_at,
+                    map_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Map runtime has not been reserved")
+            connection.execute(
+                """
+                UPDATE coordinator_sessions
+                SET state = CASE
+                    WHEN ? = 'repair_required' THEN state
+                    ELSE 'owned'
+                END, updated_at = ?
+                WHERE session_namespace = (
+                    SELECT session_namespace FROM pm_runtime_bindings
+                    WHERE map_id = ?
+                )
+                """,
+                (state, updated_at, map_id),
+            )
+
+    def pm_runtime(self, map_id: str) -> dict[str, Any] | None:
+        """Return an executive-safe runtime registry projection."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pm_runtime_bindings WHERE map_id = ?",
+                (map_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        failure_json = result.pop("failure_json")
+        result["failure"] = json.loads(failure_json) if failure_json else None
+        return result
 
     def begin_pm_turn(
         self,
@@ -2396,6 +2691,20 @@ class PluginStorage:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS pm_control_plane_bindings (
+                profile_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                map_id TEXT NOT NULL,
+                control_profile TEXT NOT NULL,
+                coordinator_id TEXT NOT NULL,
+                registered_at TEXT NOT NULL,
+                PRIMARY KEY(profile_name, session_id),
+                UNIQUE(map_id, coordinator_id)
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS pm_report_projections (
                 map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
                 record_id TEXT NOT NULL,
@@ -2410,6 +2719,59 @@ class PluginStorage:
                 tracker_record_url TEXT NOT NULL,
                 confirmed_at TEXT NOT NULL,
                 PRIMARY KEY(map_id, record_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coordinator_lifecycle (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                lifecycle_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coordinator_sessions (
+                session_namespace TEXT PRIMARY KEY,
+                lifecycle_id TEXT NOT NULL,
+                ownership_marker TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK(state IN ('reserved', 'owned')),
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pm_runtime_bindings (
+                map_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                project_url TEXT NOT NULL,
+                repository TEXT NOT NULL,
+                repository_path TEXT NOT NULL,
+                pm_profile TEXT NOT NULL,
+                routing_policy TEXT NOT NULL,
+                herdr_executable TEXT NOT NULL,
+                session_namespace TEXT NOT NULL
+                    REFERENCES coordinator_sessions(session_namespace),
+                workspace_label TEXT NOT NULL UNIQUE,
+                workspace_id TEXT UNIQUE,
+                window_id TEXT UNIQUE,
+                pane_id TEXT UNIQUE,
+                agent_id TEXT NOT NULL UNIQUE,
+                agent_session_id TEXT UNIQUE,
+                ownership_marker TEXT NOT NULL,
+                lifecycle_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'reserved', 'workspace_ready', 'pm_ready',
+                    'awaiting_ready', 'ready_confirmed', 'active',
+                    'repair_required'
+                )),
+                ready_record_id TEXT,
+                failure_json TEXT,
+                commissioned_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
             """
         )

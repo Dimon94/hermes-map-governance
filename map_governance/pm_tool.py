@@ -15,7 +15,7 @@ from .application import (
     TrackerPMReportConfirmationError,
 )
 from .reports import PMReportDraft
-from .runtime import application_for_profile
+from .runtime import application_for_pm_request
 from .tracker import TrackerError
 
 
@@ -83,12 +83,14 @@ def register_pm_capabilities(ctx) -> None:
         session_id: str | None = None,
         **_kwargs: Any,
     ) -> str:
-        application = application_for_profile(registered_profile)
         identity = GovernanceRequestIdentity(
             profile_name=registered_profile,
             session_id=str(session_id or ""),
         )
         try:
+            application = application_for_pm_request(
+                registered_profile, session_id=str(session_id or "")
+            )
             action = arguments.get("action")
             if action == "inspect":
                 result = application.pm_state(request_identity=identity)
@@ -151,8 +153,10 @@ def register_pm_capabilities(ctx) -> None:
         session_id: str = "",
         **_kwargs: Any,
     ) -> dict[str, str] | None:
-        application = application_for_profile(registered_profile)
         try:
+            application = application_for_pm_request(
+                registered_profile, session_id=str(session_id or "")
+            )
             application.enforce_assigned_pm_toolset(
                 request_identity=GovernanceRequestIdentity(
                     profile_name=registered_profile,
@@ -165,7 +169,7 @@ def register_pm_capabilities(ctx) -> None:
                     | PM_COORDINATOR_RUNTIME_BRIDGES
                 ),
             )
-        except GovernanceAuthorizationError:
+        except (GovernanceAuthorizationError, ValueError):
             return {
                 "action": "block",
                 "message": (

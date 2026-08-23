@@ -21,8 +21,9 @@ executive state，并把带稳定 `decision_id`、type、rationale、authority�
 timestamp 的结构化决策写入 Map Issue comment。插件还独立注册 `map-governance:pm`
 Skill 与 `map-governance-pm` toolset。PM request 只能使用持久 assignment 解析其 Map，
 并可提交 checkpoint、question、blocker、acceptance evidence 和 terminal failure；真实
-PM contract 固定 `dispatch_runtime: herdr`，但 Herdr commissioning 与 worker dispatch
-transport 仍由后续票交付；本票只预留 bounded coordinator bridge。
+PM contract 固定 `dispatch_runtime: herdr`。显式 commission 会在 plugin-owned Herdr
+session 中创建或恢复该 Map 唯一的 workspace 与 root Hermes PM；worker dispatch 仍由
+后续交付阶段负责。
 新建或既有 canonical lineage 都会在当前 live continuation 幂等加载完整 CEO Skill user
 turn，因此从 #6 升级和 context compression 后仍保留同一 negative-capability 边界。
 CEO 还可提交内容绑定的 chairman approval packet；Dashboard Map detail 只提供显式
@@ -133,6 +134,23 @@ hermes maps transition \
 
 # 解析/初始化 canonical 会话；Dashboard 卡片使用同一 application seam。
 hermes maps open --map ISSUE_NODE_ID --profile CEO_PROFILE
+
+# 显式 commission/resume 与状态检查都要求 canonical CEO request identity。
+hermes maps commission \
+  --map ISSUE_NODE_ID \
+  --profile CEO_PROFILE \
+  --session CANONICAL_CEO_SESSION_ID
+
+# 显式 resume 是同一幂等 seam 的命令别名。
+hermes maps resume \
+  --map ISSUE_NODE_ID \
+  --profile CEO_PROFILE \
+  --session CANONICAL_CEO_SESSION_ID
+
+hermes maps runtime status \
+  --map ISSUE_NODE_ID \
+  --profile CEO_PROFILE \
+  --session CANONICAL_CEO_SESSION_ID
 ```
 
 重复执行同一条 bind 命令是幂等的。`refresh` 从 GitHub tracker truth 与最小 binding
@@ -152,7 +170,8 @@ adopt；零匹配只创建和 bootstrap 一次；多个 exact 匹配会把卡片
 backend restart 与 context compression 都继续同一段历史。Map 内容只写入首个 user
 turn；board refresh 不更新已有会话的 system prompt 或 toolset。
 
-CEO Tool 只提供 `inspect`、`record_decision` 与 `request_approval`。Profile、session 与
+CEO Tool 提供 `inspect`、`record_decision`、`request_approval`、显式 `commission` / `resume`
+与 `runtime_status`。Profile、session 与
 chairman identity 不属于模型参数；
 handler 使用 Hermes request-scoped identity 回查 canonical binding。跨 profile、session 或
 Map 请求会 fail closed，并写入 plugin-owned denial audit，不会产生 tracker governance write。
@@ -186,6 +205,15 @@ PM assignment 固定绑定 request-scoped profile/session 与一个 Map，不读
 重启后可安全 resume。acceptance outcome evidence 可出现在 Map detail，但 worker checks、
 commands 与 lane activity 仍只属于 delivery artifacts。该 seam 不创建 implementation card，也不保存 pane、
 worktree、lane 或 worker log。
+
+Commissioning 使用稳定、冲突安全的 plugin lifecycle namespace。任何同名但缺少本地
+ownership proof 的 Herdr session 或 workspace 都会返回 `repair_required`，不会 attach、删除
+或猜 opaque ID。Registry 只保存恢复所需的 session/workspace/window/pane/agent、Map、profile、
+repository coordinate 与 lifecycle identity，不保存 terminal 内容、argv、secret 或执行日志。
+重复和并发 commission 会恢复同一 root PM。只有 PM 提交预期的 structured ready checkpoint，
+且 GitHub Issue history 读回确认同一 payload 后，application 才用既有 Outbox transition 把
+Map 从 `authorized` 移到 `delivery`；tracker 未确认或 transition 失败时 runtime 可重试，但
+不会宣告 active delivery。
 
 Tracker governance writes、canonical session resume 与可控 coordinator resume 会先写入
 plugin-owned SQLite Outbox，再领取有期限的 durable lease 后调用外部边界。稳定 effect id

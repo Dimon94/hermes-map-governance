@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, Mapping
 
-from .application import MapGovernanceApplication
+from .application import GovernanceRequestIdentity, MapGovernanceApplication
+from .coordinator import CoordinatorRuntime
 from .approvals import AuthorityEnvelopePolicy
 from .outbox import OutboxSettings
 from .events import BoardEventSettings
 from .prerequisites import PrerequisiteApplication, YamlConfigRepository
 from .sessions import HermesSessionAdapter, HermesSessionDatabaseBackend
+from .storage import PluginStorage
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +37,8 @@ def application_for_storage(
     outbox_settings: Mapping[str, Any] | None = None,
     recover_pending: bool = True,
     event_settings: Mapping[str, Any] | None = None,
+    commissioning_prerequisites: PrerequisiteApplication | None = None,
+    coordinator_runtime: CoordinatorRuntime | None = None,
 ) -> MapGovernanceApplication:
     """Build the application for an explicitly selected storage directory."""
     session_runner = (
@@ -49,6 +54,8 @@ def application_for_storage(
         authority_policy=AuthorityEnvelopePolicy.from_settings(authority_settings),
         outbox_settings=OutboxSettings(**dict(outbox_settings or {})),
         event_settings=BoardEventSettings(**dict(event_settings or {})),
+        commissioning_prerequisites=commissioning_prerequisites,
+        coordinator_runtime=coordinator_runtime,
     )
     if recover_pending:
         application.recover_outbox()
@@ -99,6 +106,23 @@ def application_for_profile(profile: str) -> MapGovernanceApplication:
         existing = _PROFILE_APPLICATIONS.get(cache_key)
         if existing is not None:
             return existing
+        prerequisites = PrerequisiteApplication(
+            plugin_root=PLUGIN_ROOT,
+            storage_root=storage_root,
+            config_repository=YamlConfigRepository(
+                storage_root / "prerequisites.yaml", storage_root=storage_root
+            ),
+            profile_resolver=get_profile_dir,
+        )
+        coordinator = CoordinatorRuntime(
+            storage=PluginStorage(storage_root),
+            clock=lambda: (
+                datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            ),
+        )
         application = application_for_storage(
             storage_root,
             profile_name=canonical_profile,
@@ -112,10 +136,56 @@ def application_for_profile(profile: str) -> MapGovernanceApplication:
             event_settings=(
                 event_settings if isinstance(event_settings, dict) else None
             ),
+            commissioning_prerequisites=prerequisites,
+            coordinator_runtime=coordinator,
         )
         application.start_outbox_runtime()
         _PROFILE_APPLICATIONS[cache_key] = application
         return application
+
+
+def application_for_pm_request(
+    profile: str, *, session_id: str
+) -> MapGovernanceApplication:
+    """Resolve a PM request to its request-scoped CEO control-plane registry."""
+    from hermes_cli.plugins import PluginState
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+        validate_profile_name,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    try:
+        canonical_profile = normalize_profile_name(profile)
+        validate_profile_name(canonical_profile)
+    except ValueError as error:
+        raise ProfileResolutionError(str(error)) from error
+    if not profile_exists(canonical_profile) or not session_id:
+        raise ProfileResolutionError("PM request identity is unavailable")
+    profile_home = get_profile_dir(canonical_profile)
+    token = set_hermes_home_override(profile_home)
+    try:
+        storage_root = PluginState(PLUGIN_ID).data_dir
+    finally:
+        reset_hermes_home_override(token)
+    binding = PluginStorage(storage_root).pm_control_plane_for_request(
+        profile_name=canonical_profile,
+        session_id=session_id,
+    )
+    if binding is None:
+        return application_for_profile(canonical_profile)
+    control_profile = str(binding["control_profile"])
+    application = application_for_profile(control_profile)
+    identity = GovernanceRequestIdentity(canonical_profile, session_id)
+    if not application.accepts_pm_control_binding(
+        request_identity=identity,
+        map_id=str(binding["map_id"]),
+        coordinator_id=str(binding["coordinator_id"]),
+    ):
+        raise ProfileResolutionError("PM control-plane binding is inconsistent")
+    return application
 
 
 def prerequisite_application_for_profile(profile: str) -> PrerequisiteApplication:

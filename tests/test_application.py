@@ -363,19 +363,19 @@ def test_valid_transition_commits_tracker_before_visible_projection(tmp_path):
     transitioned = application.transition_map(
         map_id=bound["id"],
         expected_stage="authorized",
-        requested_stage="delivery",
+        requested_stage="parked",
     )
 
     assert tracker.transition_calls == [
         {
             "url": "https://github.com/acme/atlas/issues/41",
             "expected_stage": "authorized",
-            "requested_stage": "delivery",
+            "requested_stage": "parked",
             "observed_projection": "authorized",
         }
     ]
-    assert transitioned["stage"] == "delivery"
-    assert application.board()["maps"][0]["stage"] == "delivery"
+    assert transitioned["stage"] == "parked"
+    assert application.board()["maps"][0]["stage"] == "parked"
 
 
 def test_repeated_stage_cycle_uses_a_fresh_effect_occurrence(tmp_path):
@@ -390,10 +390,10 @@ def test_repeated_stage_cycle_uses_a_fresh_effect_occurrence(tmp_path):
     )
 
     for expected_stage, requested_stage in (
-        ("authorized", "delivery"),
-        ("delivery", "decision"),
-        ("decision", "delivery"),
-        ("delivery", "decision"),
+        ("authorized", "parked"),
+        ("parked", "discovery"),
+        ("discovery", "parked"),
+        ("parked", "discovery"),
     ):
         transitioned = application.transition_map(
             map_id=bound["id"],
@@ -406,12 +406,12 @@ def test_repeated_stage_cycle_uses_a_fresh_effect_occurrence(tmp_path):
         (call["expected_stage"], call["requested_stage"])
         for call in tracker.transition_calls
     ] == [
-        ("authorized", "delivery"),
-        ("delivery", "decision"),
-        ("decision", "delivery"),
-        ("delivery", "decision"),
+        ("authorized", "parked"),
+        ("parked", "discovery"),
+        ("discovery", "parked"),
+        ("parked", "discovery"),
     ]
-    assert application.board()["maps"][0]["stage"] == "decision"
+    assert application.board()["maps"][0]["stage"] == "discovery"
 
 
 def test_synchronous_transition_uses_a_durable_outbox_execution_record(tmp_path):
@@ -432,12 +432,12 @@ def test_synchronous_transition_uses_a_durable_outbox_execution_record(tmp_path)
     transitioned = application.transition_map(
         map_id=bound["id"],
         expected_stage="authorized",
-        requested_stage="delivery",
+        requested_stage="parked",
         mutation_id="stage-sync-001",
     )
 
     assert tracker.transition_calls[0]["observed_projection"] == "leased"
-    assert transitioned["stage"] == "delivery"
+    assert transitioned["stage"] == "parked"
     assert transitioned["external_effect"] == {
         "effect_id": effect_id,
         "state": "succeeded",
@@ -461,7 +461,7 @@ def test_synchronous_transition_uses_a_durable_outbox_execution_record(tmp_path)
 
 def test_terminal_effect_reason_and_repair_action_are_visible_on_the_map(tmp_path):
     tracker = ControllableTracker()
-    tracker.after_transition_stage = "parked"
+    tracker.after_transition_stage = "delivery"
     application = _application(tmp_path, tracker)
     project = application.configure_project(
         project_url="https://github.com/orgs/acme/projects/7"
@@ -476,7 +476,7 @@ def test_terminal_effect_reason_and_repair_action_are_visible_on_the_map(tmp_pat
         application.transition_map(
             map_id=bound["id"],
             expected_stage="authorized",
-            requested_stage="delivery",
+            requested_stage="parked",
             mutation_id="stage-terminal-001",
         )
 
@@ -484,7 +484,7 @@ def test_terminal_effect_reason_and_repair_action_are_visible_on_the_map(tmp_pat
     assert effects["state"] == "needs_repair"
     assert effects["terminal_count"] == 1
     assert effects["latest_terminal"]["terminal_outcome"]["message"] == (
-        "tracker stage is 'parked', not 'delivery'"
+        "tracker stage is 'delivery', not 'parked'"
     )
     assert effects["latest_terminal"]["repair_action"] == {
         "action": "repair_outbox",
@@ -539,11 +539,11 @@ def test_populated_schema_v6_migrates_to_outbox_without_losing_the_map(tmp_path)
     transitioned = migrated.transition_map(
         map_id=bound["id"],
         expected_stage="authorized",
-        requested_stage="delivery",
+        requested_stage="parked",
         mutation_id="post-v6-migration",
     )
 
-    assert transitioned["stage"] == "delivery"
+    assert transitioned["stage"] == "parked"
     assert migrated.board()["maps"][0]["id"] == bound["id"]
     assert (
         migrated.outbox_status(effect_id="stage-transition:post-v6-migration")["state"]
@@ -581,7 +581,7 @@ def test_restart_recovery_dispatches_a_pre_call_crash_through_public_seam(tmp_pa
         application.transition_map(
             map_id=bound["id"],
             expected_stage="authorized",
-            requested_stage="delivery",
+            requested_stage="parked",
             mutation_id="restart-before-call",
         )
 
@@ -606,7 +606,7 @@ def test_restart_recovery_dispatches_a_pre_call_crash_through_public_seam(tmp_pa
         }
     ]
     assert len(tracker.transition_calls) == 1
-    assert restarted.board()["maps"][0]["stage"] == "delivery"
+    assert restarted.board()["maps"][0]["stage"] == "parked"
 
 
 def test_tracker_readback_converges_after_call_before_ack_without_duplicate(tmp_path):
@@ -635,7 +635,7 @@ def test_tracker_readback_converges_after_call_before_ack_without_duplicate(tmp_
         application.transition_map(
             map_id=bound["id"],
             expected_stage="authorized",
-            requested_stage="delivery",
+            requested_stage="parked",
             mutation_id="restart-after-call",
         )
 
@@ -651,7 +651,7 @@ def test_tracker_readback_converges_after_call_before_ack_without_duplicate(tmp_
 
     assert recovered["outcomes"][0]["reconciled_by_readback"] is True
     assert len(tracker.transition_calls) == 1
-    assert restarted.board()["maps"][0]["stage"] == "delivery"
+    assert restarted.board()["maps"][0]["stage"] == "parked"
 
 
 def test_invalid_transition_reports_policy_context_without_tracker_write(tmp_path):
@@ -697,7 +697,7 @@ def test_tracker_write_failure_keeps_prior_projection_and_surfaces_cause(tmp_pat
         application.transition_map(
             map_id=bound["id"],
             expected_stage="authorized",
-            requested_stage="delivery",
+            requested_stage="parked",
         )
 
     assert len(tracker.transition_calls) == 1
@@ -706,6 +706,11 @@ def test_tracker_write_failure_keeps_prior_projection_and_surfaces_cause(tmp_pat
 
 def test_concurrent_transition_surfaces_refreshable_conflict_and_one_stage(tmp_path):
     tracker = ControllableTracker()
+    issue_url = "https://github.com/acme/atlas/issues/41"
+    tracker.issues[issue_url] = replace(
+        tracker.issues[issue_url],
+        labels=("map", "map-stage/delivery"),
+    )
     application = _application(tmp_path, tracker)
     project = application.configure_project(
         project_url="https://github.com/orgs/acme/projects/7"
@@ -719,7 +724,7 @@ def test_concurrent_transition_surfaces_refreshable_conflict_and_one_stage(tmp_p
         tracker.before_transition = None
         return application.transition_map(
             map_id=bound["id"],
-            expected_stage="authorized",
+            expected_stage="delivery",
             requested_stage="parked",
         )["stage"]
 
@@ -728,12 +733,12 @@ def test_concurrent_transition_surfaces_refreshable_conflict_and_one_stage(tmp_p
     with pytest.raises(MapTransitionConflict) as raised:
         application.transition_map(
             map_id=bound["id"],
-            expected_stage="authorized",
-            requested_stage="delivery",
+            expected_stage="delivery",
+            requested_stage="decision",
         )
 
     assert raised.value.current_stage == "parked"
-    assert raised.value.requested_stage == "delivery"
+    assert raised.value.requested_stage == "decision"
     assert raised.value.reason == "tracker stage changed; refresh and retry"
     assert raised.value.as_dict()["retryable"] is True
     assert application.board()["maps"][0]["stage"] == "parked"
@@ -748,6 +753,11 @@ def test_competing_tracker_write_after_mutation_never_commits_false_projection(
     tmp_path,
 ):
     tracker = ControllableTracker()
+    issue_url = "https://github.com/acme/atlas/issues/41"
+    tracker.issues[issue_url] = replace(
+        tracker.issues[issue_url],
+        labels=("map", "map-stage/delivery"),
+    )
     application = _application(tmp_path, tracker)
     project = application.configure_project(
         project_url="https://github.com/orgs/acme/projects/7"
@@ -761,13 +771,13 @@ def test_competing_tracker_write_after_mutation_never_commits_false_projection(
     with pytest.raises(MapTransitionConflict) as raised:
         application.transition_map(
             map_id=bound["id"],
-            expected_stage="authorized",
-            requested_stage="delivery",
+            expected_stage="delivery",
+            requested_stage="decision",
         )
 
     assert raised.value.current_stage == "parked"
-    assert raised.value.requested_stage == "delivery"
-    assert application.board()["maps"][0]["stage"] == "authorized"
+    assert raised.value.requested_stage == "decision"
+    assert application.board()["maps"][0]["stage"] == "delivery"
     assert tracker.issues[bound["tracker"]["url"]].labels[-1] == "map-stage/parked"
 
 
@@ -807,7 +817,6 @@ def test_stale_requested_stage_conflicts_before_tracker_mutation(tmp_path):
         ("discovery", "parked"),
         ("awaiting-approval", "discovery"),
         ("awaiting-approval", "parked"),
-        ("authorized", "delivery"),
         ("authorized", "parked"),
         ("delivery", "decision"),
         ("delivery", "acceptance"),

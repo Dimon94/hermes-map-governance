@@ -25,6 +25,11 @@ from .approvals import (
 )
 from .tracker import StructuredDecision
 from .reports import PMReport, PMReportDraft
+from .coordinator import (
+    CommissioningAuthorizationError,
+    CommissioningPrerequisiteError,
+    CoordinatorRuntimeError,
+)
 from .prerequisites import (
     PrerequisiteApplication,
     SetupApplyError,
@@ -38,6 +43,9 @@ __all__ = [
     "AuthorityEnvelopePolicy",
     "CEOSessionAmbiguityError",
     "CEOSessionRepairRequired",
+    "CommissioningAuthorizationError",
+    "CommissioningPrerequisiteError",
+    "CoordinatorRuntimeError",
     "GovernanceAuthorizationError",
     "GovernanceActorIdentity",
     "GovernanceRequestIdentity",
