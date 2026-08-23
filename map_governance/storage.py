@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class PluginStorage:
@@ -166,10 +166,36 @@ class PluginStorage:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def ceo_session_bindings(self, *, profile_name: str) -> list[dict[str, Any]]:
+        """Return canonical session coordinates for one explicit profile."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    map_id, profile_name, root_session_id, live_session_id, state
+                FROM ceo_session_bindings
+                WHERE profile_name = ? AND state = 'ready'
+                ORDER BY map_id
+                """,
+                (profile_name,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     @contextmanager
     def ceo_session_lease(self, map_id: str) -> Iterator[None]:
         """Serialize one Map's adopt-or-mint flow across plugin processes."""
-        lease_root = self.root / ".session-leases"
+        with self._map_lease(namespace="session", map_id=map_id):
+            yield
+
+    @contextmanager
+    def decision_lease(self, map_id: str) -> Iterator[None]:
+        """Serialize one Map's tracker idempotency check and decision write."""
+        with self._map_lease(namespace="decision", map_id=map_id):
+            yield
+
+    @contextmanager
+    def _map_lease(self, *, namespace: str, map_id: str) -> Iterator[None]:
+        lease_root = self.root / f".{namespace}-leases"
         lease_root.mkdir(parents=True, exist_ok=True)
         lease_name = hashlib.sha256(map_id.encode()).hexdigest()
         lease_path = lease_root / f"{lease_name}.lock"
@@ -410,6 +436,161 @@ class PluginStorage:
             ]
         return projects, maps
 
+    def save_authorization_denial(
+        self,
+        *,
+        action: str,
+        map_id: str,
+        profile_name: str,
+        session_id: str,
+        reason: str,
+        denied_at: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO governance_authorization_denials(
+                    action, map_id, profile_name, session_id, reason, denied_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (action, map_id, profile_name, session_id, reason, denied_at),
+            )
+
+    def save_decision_projection(
+        self,
+        *,
+        map_id: str,
+        decision: dict[str, Any],
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO decision_projections(
+                    map_id, decision_id, decision_type, rationale, authority,
+                    affected_stage, decided_at, tracker_record_id,
+                    tracker_record_url, confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(map_id, decision_id) DO UPDATE SET
+                    decision_type = excluded.decision_type,
+                    rationale = excluded.rationale,
+                    authority = excluded.authority,
+                    affected_stage = excluded.affected_stage,
+                    decided_at = excluded.decided_at,
+                    tracker_record_id = excluded.tracker_record_id,
+                    tracker_record_url = excluded.tracker_record_url,
+                    confirmed_at = excluded.confirmed_at
+                """,
+                self._decision_projection_values(map_id, decision),
+            )
+
+    def replace_decision_projections(
+        self,
+        *,
+        map_id: str,
+        decisions: list[dict[str, Any]],
+    ) -> None:
+        """Atomically rebuild one Map's decisions from tracker truth."""
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM decision_projections WHERE map_id = ?",
+                (map_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO decision_projections(
+                    map_id, decision_id, decision_type, rationale, authority,
+                    affected_stage, decided_at, tracker_record_id,
+                    tracker_record_url, confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    self._decision_projection_values(map_id, decision)
+                    for decision in decisions
+                ],
+            )
+
+    @staticmethod
+    def _decision_projection_values(
+        map_id: str,
+        decision: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        return (
+            map_id,
+            decision["decision_id"],
+            decision["type"],
+            decision["rationale"],
+            decision["authority"],
+            decision["affected_stage"],
+            decision["timestamp"],
+            decision["tracker"]["id"],
+            decision["tracker"]["url"],
+            decision["confirmed_at"],
+        )
+
+    def recent_decisions(
+        self,
+        *,
+        map_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    decision_id, decision_type, rationale, authority,
+                    affected_stage, decided_at, tracker_record_id,
+                    tracker_record_url, confirmed_at
+                FROM decision_projections
+                WHERE map_id = ?
+                ORDER BY julianday(decided_at) DESC, decision_id DESC
+                LIMIT ?
+                """,
+                (map_id, limit),
+            )
+            return [self._decision_row(dict(row)) for row in rows]
+
+    def decision_summary(self, *, map_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) AS count FROM decision_projections WHERE map_id = ?",
+                (map_id,),
+            ).fetchone()["count"]
+        latest = self.recent_decisions(map_id=map_id, limit=1)
+        return {"count": int(count), "latest": latest[0] if latest else None}
+
+    @staticmethod
+    def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "decision_id": row["decision_id"],
+            "type": row["decision_type"],
+            "rationale": row["rationale"],
+            "authority": row["authority"],
+            "affected_stage": row["affected_stage"],
+            "timestamp": row["decided_at"],
+            "tracker": {
+                "id": row["tracker_record_id"],
+                "url": row["tracker_record_url"],
+            },
+            "confirmed_at": row["confirmed_at"],
+        }
+
+    def authorization_denials(
+        self,
+        *,
+        map_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT action, map_id, profile_name, session_id, reason, denied_at
+            FROM governance_authorization_denials
+        """
+        parameters: tuple[str, ...] = ()
+        if map_id is not None:
+            query += " WHERE map_id = ?"
+            parameters = (map_id,)
+        query += " ORDER BY denial_id"
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute(query, parameters)]
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -513,6 +694,36 @@ class PluginStorage:
                 repair_reason TEXT,
                 repair_candidate_count INTEGER,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS governance_authorization_denials (
+                denial_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                map_id TEXT NOT NULL,
+                profile_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                denied_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS decision_projections (
+                map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
+                decision_id TEXT NOT NULL,
+                decision_type TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                authority TEXT NOT NULL,
+                affected_stage TEXT NOT NULL,
+                decided_at TEXT NOT NULL,
+                tracker_record_id TEXT NOT NULL,
+                tracker_record_url TEXT NOT NULL,
+                confirmed_at TEXT NOT NULL,
+                PRIMARY KEY(map_id, decision_id)
             )
             """
         )

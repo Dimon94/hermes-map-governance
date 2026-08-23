@@ -84,6 +84,9 @@ class ControllableTracker:
     def get_issue(self, url):
         return self.issues[url]
 
+    def list_decisions(self, url):
+        return []
+
     def transition_issue_stage(self, url, *, expected_stage, requested_stage):
         observed_projection = (
             self.before_transition() if self.before_transition is not None else None
@@ -215,6 +218,7 @@ def test_operator_binds_an_existing_issue_once_as_a_complete_map_card(tmp_path):
         "title": "Map the Atlas launch",
         "stage": "authorized",
         "available_transitions": ["delivery", "parked"],
+        "decision_summary": {"count": 0, "latest": None},
         "ceo_session": {"state": "unbound"},
         "last_synchronized_at": "2026-08-23T07:30:00Z",
     }
@@ -247,9 +251,9 @@ def test_board_groups_multiple_maps_without_mixing_project_identity(tmp_path):
         "acme/atlas#41",
         "acme/atlas#42",
     ]
-    assert [
-        card["tracker"]["identity"] for card in groups[octocat["id"]]["maps"]
-    ] == ["octocat/hello-world#9"]
+    assert [card["tracker"]["identity"] for card in groups[octocat["id"]]["maps"]] == [
+        "octocat/hello-world#9"
+    ]
     assert groups[octocat["id"]]["maps"][0]["stage"] == "cancelled"
     assert groups[octocat["id"]]["maps"][0]["available_transitions"] == []
     assert all(
@@ -430,7 +434,9 @@ def test_concurrent_transition_surfaces_refreshable_conflict_and_one_stage(tmp_p
     ] == ["map-stage/parked"]
 
 
-def test_competing_tracker_write_after_mutation_never_commits_false_projection(tmp_path):
+def test_competing_tracker_write_after_mutation_never_commits_false_projection(
+    tmp_path,
+):
     tracker = ControllableTracker()
     application = _application(tmp_path, tracker)
     project = application.configure_project(
@@ -529,7 +535,9 @@ def test_governance_lifecycle_accepts_each_defined_transition(
 
     assert result["stage"] == requested_stage
     assert [
-        label for label in tracker.issues[issue_url].labels if label.startswith("map-stage/")
+        label
+        for label in tracker.issues[issue_url].labels
+        if label.startswith("map-stage/")
     ] == [f"map-stage/{requested_stage}"]
 
 

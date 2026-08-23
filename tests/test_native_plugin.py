@@ -14,6 +14,10 @@ def test_native_health_uses_context_scoped_plugin_storage(tmp_path, capsys):
     registrations = []
     context = SimpleNamespace(
         state=SimpleNamespace(data_dir=storage_root),
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
         register_cli_command=lambda **command: registrations.append(command),
     )
 
@@ -40,7 +44,9 @@ def test_native_health_uses_context_scoped_plugin_storage(tmp_path, capsys):
     assert not (tmp_path / "profile" / "kanban.db").exists()
 
 
-def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch, capsys):
+def test_native_maps_commands_delegate_to_the_application(
+    tmp_path, monkeypatch, capsys
+):
     calls = []
 
     class ApplicationProbe:
@@ -72,16 +78,23 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
             calls.append(("open_map", arguments))
             return {"operation": "open_map"}
 
-    monkeypatch.setattr(native, "application_for_storage", lambda root: ApplicationProbe())
+    monkeypatch.setattr(
+        native, "application_for_storage", lambda root: ApplicationProbe()
+    )
     monkeypatch.setattr(
         native,
         "application_for_profile",
-        lambda profile: calls.append(("profile", {"profile": profile}))
-        or ApplicationProbe(),
+        lambda profile: (
+            calls.append(("profile", {"profile": profile})) or ApplicationProbe()
+        ),
     )
     registrations = []
     context = SimpleNamespace(
         state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
         register_cli_command=lambda **command: registrations.append(command),
     )
     native.register(context)
@@ -116,9 +129,7 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
         ),
         parser.parse_args(["board"]),
         parser.parse_args(["detail", "--map", "I_atlas_41"]),
-        parser.parse_args(
-            ["open", "--map", "I_atlas_41", "--profile", "ceo"]
-        ),
+        parser.parse_args(["open", "--map", "I_atlas_41", "--profile", "ceo"]),
     ]
 
     assert [command["handler_fn"](args) for args in arguments] == [
@@ -168,7 +179,9 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
     ]
 
 
-def test_native_transition_prints_structured_policy_failure(tmp_path, monkeypatch, capsys):
+def test_native_transition_prints_structured_policy_failure(
+    tmp_path, monkeypatch, capsys
+):
     class ApplicationProbe:
         def transition_map(self, **arguments):
             raise MapTransitionError(
@@ -177,10 +190,16 @@ def test_native_transition_prints_structured_policy_failure(tmp_path, monkeypatc
                 reason="acceptance can only be entered from delivery",
             )
 
-    monkeypatch.setattr(native, "application_for_storage", lambda root: ApplicationProbe())
+    monkeypatch.setattr(
+        native, "application_for_storage", lambda root: ApplicationProbe()
+    )
     registrations = []
     context = SimpleNamespace(
         state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
         register_cli_command=lambda **command: registrations.append(command),
     )
     native.register(context)
@@ -231,6 +250,10 @@ def test_native_open_prints_structured_session_repair_failure(
     registrations = []
     context = SimpleNamespace(
         state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
         register_cli_command=lambda **command: registrations.append(command),
     )
     native.register(context)

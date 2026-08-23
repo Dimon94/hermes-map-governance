@@ -58,6 +58,10 @@ class SessionTracker:
         assert url == ISSUE_URL
         return self.issue
 
+    def list_decisions(self, url: str):
+        assert url == ISSUE_URL
+        return []
+
     def transition_issue_stage(self, *args, **kwargs):
         raise AssertionError("session tests do not transition tracker state")
 
@@ -71,6 +75,8 @@ class ControllableSessionBackend:
         self.messages: dict[str, list[str]] = {}
         self.create_calls: list[dict[str, str]] = []
         self.bootstrap_calls: list[dict[str, str]] = []
+        self.skill_calls: list[dict[str, str]] = []
+        self.message_ids: dict[str, set[str]] = {}
         self.exact_override: list[str] | None = None
         self.session_configs: dict[str, tuple[str, str]] = {}
 
@@ -129,6 +135,7 @@ class ControllableSessionBackend:
                 ),
             )
             self.messages.setdefault(session_id, [])
+            self.message_ids.setdefault(session_id, set())
             self.session_configs.setdefault(
                 session_id,
                 ("stable CEO system prompt", "map-governance-ceo-tools-v1"),
@@ -160,6 +167,7 @@ class ControllableSessionBackend:
             if record.message_count:
                 return False
             self.messages[session_id].append(content)
+            self.message_ids.setdefault(session_id, set()).add(idempotency_key)
             self.bootstrap_calls.append(
                 {
                     "session_id": session_id,
@@ -171,6 +179,37 @@ class ControllableSessionBackend:
                 record,
                 message_count=1,
                 last_activity_at="2026-08-23T08:01:00Z",
+            )
+            return True
+
+    def append_message_once(
+        self,
+        session_id: str,
+        *,
+        content: str,
+        idempotency_key: str,
+    ) -> bool:
+        with self._lock:
+            message_ids = self.message_ids.setdefault(session_id, set())
+            if idempotency_key in message_ids:
+                return False
+            message_ids.add(idempotency_key)
+            self.messages[session_id].append(content)
+            self.skill_calls.append(
+                {
+                    "session_id": session_id,
+                    "content": content,
+                    "idempotency_key": idempotency_key,
+                }
+            )
+            record = self.records[session_id]
+            self.records[session_id] = replace(
+                record,
+                message_count=record.message_count + 1,
+                last_activity_at=max(
+                    str(record.last_activity_at or ""),
+                    "2026-08-23T08:01:00Z",
+                ),
             )
             return True
 
@@ -198,6 +237,7 @@ class ControllableSessionBackend:
                 last_activity_at=last_activity_at,
             )
             self.messages[session_id] = list(messages)
+            self.message_ids[session_id] = set()
             self.session_configs[session_id] = (
                 system_prompt,
                 toolset_fingerprint,
@@ -239,14 +279,20 @@ def test_unique_exact_session_is_adopted_before_mint(tmp_path):
         "state": "ready",
         "root_session_id": "existing-root",
         "live_session_id": "existing-root",
-        "last_activity_at": "2026-08-22T14:30:00Z",
+        "last_activity_at": "2026-08-23T08:01:00Z",
     }
     assert backend.create_calls == []
     assert backend.bootstrap_calls == []
+    assert len(backend.skill_calls) == 1
+    assert "Loaded Skill: map-governance:ceo" in backend.skill_calls[0]["content"]
+    assert (
+        "Do not create, control, or inspect worker lanes"
+        in backend.skill_calls[0]["content"]
+    )
     projected = application.board()["maps"][0]["ceo_session"]
     assert projected == {
         "state": "ready",
-        "last_activity_at": "2026-08-22T14:30:00Z",
+        "last_activity_at": "2026-08-23T08:01:00Z",
     }
 
 
@@ -297,8 +343,16 @@ def test_zero_candidates_mints_once_and_persists_one_bootstrap_user_turn(tmp_pat
     assert backend.create_calls[0]["source"] == "desktop"
     assert len(backend.bootstrap_calls) == 1
     bootstrap = backend.bootstrap_calls[0]
-    assert canonical_session_identity(profile_name=PROFILE, map_id=MAP_ID) in bootstrap["content"]
+    assert (
+        canonical_session_identity(profile_name=PROFILE, map_id=MAP_ID)
+        in bootstrap["content"]
+    )
     assert "map-governance:ceo" in bootstrap["content"]
+    assert len(backend.skill_calls) == 1
+    skill = backend.skill_calls[0]
+    assert "Loaded Skill: map-governance:ceo" in skill["content"]
+    assert "Do not create, control, or inspect worker lanes" in skill["content"]
+    assert "Do not edit implementation worktrees or implement code" in skill["content"]
     assert ISSUE_URL in bootstrap["content"]
     assert "system prompt" not in bootstrap["content"].lower()
 
@@ -313,9 +367,7 @@ def test_repeated_concurrent_opens_and_reconnects_converge_on_one_session(tmp_pa
     def open_from_fresh_renderer() -> str:
         reconnect = _application(tmp_path, backend, storage_root=storage_root)
         barrier.wait()
-        return reconnect.open_map(map_id=card["id"])["ceo_session"][
-            "root_session_id"
-        ]
+        return reconnect.open_map(map_id=card["id"])["ceo_session"]["root_session_id"]
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         roots = list(pool.map(lambda _: open_from_fresh_renderer(), range(8)))
@@ -323,6 +375,7 @@ def test_repeated_concurrent_opens_and_reconnects_converge_on_one_session(tmp_pa
     assert len(set(roots)) == 1
     assert len(backend.create_calls) == 1
     assert len(backend.bootstrap_calls) == 1
+    assert len(backend.skill_calls) == 1
 
 
 def test_application_restart_and_compression_continue_the_recorded_lineage(tmp_path):
@@ -357,11 +410,17 @@ def test_application_restart_and_compression_continue_the_recorded_lineage(tmp_p
     }
     assert backend.messages[root] + backend.messages["compression-tip"] == [
         backend.bootstrap_calls[0]["content"],
+        backend.skill_calls[0]["content"],
         "compressed decision history",
         "decision after restart",
+        backend.skill_calls[1]["content"],
     ]
     assert len(backend.create_calls) == 1
     assert len(backend.bootstrap_calls) == 1
+    assert [call["session_id"] for call in backend.skill_calls] == [
+        root,
+        "compression-tip",
+    ]
 
 
 def test_board_activity_never_rewrites_existing_prompt_or_toolset(tmp_path):
@@ -386,6 +445,7 @@ def test_board_activity_never_rewrites_existing_prompt_or_toolset(tmp_path):
     assert after == before
     assert backend.records["existing-root"].title == title
     assert backend.bootstrap_calls == []
+    assert len(backend.skill_calls) == 1
 
 
 def test_missing_recorded_session_recovers_when_backend_lineage_returns(tmp_path):
@@ -429,5 +489,5 @@ def test_card_and_detail_expose_readiness_without_conversation_inventory(tmp_pat
     assert "canonical" not in visible
     assert detail["ceo_session"] == {
         "state": "ready",
-        "last_activity_at": "2026-08-22T14:30:00Z",
+        "last_activity_at": "2026-08-23T08:01:00Z",
     }

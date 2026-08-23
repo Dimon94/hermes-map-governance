@@ -15,8 +15,12 @@ Hermes Map Governance 是一个独立安装的 Hermes 治理插件。它把 Herm
 可重建董事会投影，以及 native CLI、dashboard API 和 Maps 页面。治理 transition 会先
 原子替换 GitHub 的唯一 `map-stage/*` label、读回确认，再按 expected stage 提交本地
 projection。每个 Map 现在会在显式 CEO profile 中 exact-adopt 或创建一条 canonical
-Hermes 会话，并在首次创建时以 user turn 写入 Map bootstrap；CEO 决策能力与交付编排
-仍由后续票交付。
+Hermes 会话，并在首次创建时以 user turn 写入 Map bootstrap。插件注册显式
+`map-governance:ceo` Skill 与固定 `map-governance-ceo` toolset；canonical CEO 会话可读取
+executive state，并把带稳定 `decision_id`、type、rationale、authority、affected stage 和
+timestamp 的结构化决策写入 Map Issue comment。交付编排仍由后续票交付。
+新建或既有 canonical lineage 都会在当前 live continuation 幂等加载完整 CEO Skill user
+turn，因此从 #6 升级和 context compression 后仍保留同一 negative-capability 边界。
 
 ## 安装
 
@@ -79,6 +83,24 @@ adopt；零匹配只创建和 bootstrap 一次；多个 exact 匹配会把卡片
 公开 session contract 解析当前 compression tip，因此重复点击、renderer reconnect、
 backend restart 与 context compression 都继续同一段历史。Map 内容只写入首个 user
 turn；board refresh 不更新已有会话的 system prompt 或 toolset。
+
+CEO Tool 只提供 `inspect` 与 `record_decision`。Profile 与 session identity 不属于模型参数；
+handler 使用 Hermes request-scoped identity 回查 canonical binding。跨 profile、session 或
+Map 请求会 fail closed，并写入 plugin-owned denial audit，不会产生 tracker governance write。
+canonical CEO 会话还通过 Hermes `pre_tool_call` 公共 hook 拒绝该 named toolset 之外的
+工具执行；专用 CEO profile 的可见 toolsets 仍由 Hermes 正常 profile 配置负责，后续
+setup/doctor 票负责自动校验该配置。
+当前 tracker adapter 按 parent spec 的 prototype 边界使用运行插件进程中已认证的 `gh`
+身份；GitHub collaborator 写入的结构化 Issue history 本身就是治理真相。角色 toolset、
+canonical request policy 与审计在工作流层隔离 CEO 和 worker 权限，生产级凭据拆分属于
+后续安全加固，不能把本地交付误当作远程发布授权。
+记录决策时 `authority` 必须为 `ceo`，其权限来自已认证的 canonical CEO request identity，
+不能由模型声明其他角色权限。
+决策 mutation 后必须从 Issue history 读回同一 payload 才会更新本地 projection；同一
+`decision_id` + 同一 payload 的重试只保留一条 tracker decision，不同 payload 会被拒绝。
+Maps 卡片显示 confirmed decision count 和最新摘要；页面的 Map detail 会读取并显示
+recent decisions、当前 approvals 读模型和 delivery summary。本票
+尚无 approval 或 delivery checkpoint 数据时分别明确返回空列表和 `not_reported`。
 
 ## 架构壳
 

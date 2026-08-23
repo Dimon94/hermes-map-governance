@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 from .stages import (
     ALLOWED_TRANSITIONS,
@@ -26,6 +27,9 @@ from .tracker import (
     GitHubTrackerAdapter,
     TrackerAdapter,
     TrackerConflictError,
+    StructuredDecision,
+    TrackerDecisionRecord,
+    TrackerError,
     TrackerIssue,
     TrackerProject,
 )
@@ -35,10 +39,61 @@ class MapBindingError(ValueError):
     """Raised when a requested binding violates governance identity rules."""
 
 
+@dataclass(frozen=True)
+class GovernanceRequestIdentity:
+    """Profile and session identity supplied by the active Hermes request."""
+
+    profile_name: str
+    session_id: str
+
+
+class GovernanceAuthorizationError(PermissionError):
+    """Raised after an unauthorized governance request is durably audited."""
+
+    def __init__(self, *, action: str, map_id: str, reason: str) -> None:
+        self.action = action
+        self.map_id = map_id
+        self.reason = reason
+        super().__init__(f"Governance request denied: {reason}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "authorization_denied",
+            "action": self.action,
+            "map_id": self.map_id,
+            "reason": self.reason,
+            "retryable": False,
+        }
+
+
+class StructuredDecisionConflict(ValueError):
+    """Raised when one stable decision id is reused for another payload."""
+
+    def __init__(self, *, decision_id: str) -> None:
+        self.decision_id = decision_id
+        super().__init__(
+            f"Decision idempotency identity has a different payload: {decision_id}"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "decision_conflict",
+            "decision_id": self.decision_id,
+            "reason": "stable decision identity already belongs to another payload",
+            "retryable": False,
+        }
+
+
+class TrackerDecisionConfirmationError(TrackerError):
+    """Raised when a tracker mutation is not visible in authoritative history."""
+
+
 class MapTransitionError(ValueError):
     """Raised when the governance policy rejects a requested stage change."""
 
-    def __init__(self, *, current_stage: str, requested_stage: str, reason: str) -> None:
+    def __init__(
+        self, *, current_stage: str, requested_stage: str, reason: str
+    ) -> None:
         self.current_stage = current_stage
         self.requested_stage = requested_stage
         self.reason = reason
@@ -87,20 +142,13 @@ class CEOSessionAmbiguityError(CEOSessionRepairRequired):
     """Raised when more than one exact canonical session candidate exists."""
 
 
-_TRANSITION_LOCKS: dict[str, RLock] = {}
-_TRANSITION_LOCKS_GUARD = Lock()
-_SESSION_LOCKS: dict[str, RLock] = {}
-_SESSION_LOCKS_GUARD = Lock()
+_OPERATION_LOCKS: dict[tuple[str, str], RLock] = {}
+_OPERATION_LOCKS_GUARD = Lock()
 
 
-def _transition_lock(map_id: str) -> RLock:
-    with _TRANSITION_LOCKS_GUARD:
-        return _TRANSITION_LOCKS.setdefault(map_id, RLock())
-
-
-def _session_lock(map_id: str) -> RLock:
-    with _SESSION_LOCKS_GUARD:
-        return _SESSION_LOCKS.setdefault(map_id, RLock())
+def _operation_lock(namespace: str, key: str) -> RLock:
+    with _OPERATION_LOCKS_GUARD:
+        return _OPERATION_LOCKS.setdefault((namespace, key), RLock())
 
 
 class MapGovernanceApplication:
@@ -152,7 +200,9 @@ class MapGovernanceApplication:
             self._plugin_root / "__init__.py",
         )
         return {
-            "status": "ready" if all(path.is_file() for path in required_files) else "not_ready",
+            "status": "ready"
+            if all(path.is_file() for path in required_files)
+            else "not_ready",
             "command": "maps health",
         }
 
@@ -184,7 +234,10 @@ class MapGovernanceApplication:
             project = project_by_id.get(row["project_id"])
             if project is None:
                 continue
-            card = self._card_projection(row, project_url=project["tracker"]["url"])
+            card = self._card_with_summary(
+                row,
+                project_url=project["tracker"]["url"],
+            )
             project["maps"].append(card)
             maps.append(card)
         return {
@@ -202,13 +255,252 @@ class MapGovernanceApplication:
         """Return one Map projection without session-inventory disclosure."""
         for card in self.board()["maps"]:
             if card["id"] == map_id:
+                card["recent_decisions"] = self._storage.recent_decisions(map_id=map_id)
+                card["approvals"] = {"count": 0, "items": []}
+                card["delivery_summary"] = {"state": "not_reported"}
                 return card
         raise MapBindingError(f"Map is not bound: {map_id}")
+
+    def executive_state(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+    ) -> dict[str, Any]:
+        """Return the executive read model for an authorized CEO request."""
+        self._authorize_ceo_request(
+            map_id=map_id,
+            action="inspect",
+            request_identity=request_identity,
+        )
+        return {
+            "map": (detail := self.map_detail(map_id=map_id)),
+            "recent_decisions": detail["recent_decisions"],
+            "approvals": detail["approvals"],
+            "delivery_summary": detail["delivery_summary"],
+        }
+
+    def record_decision(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        decision: StructuredDecision,
+    ) -> dict[str, Any]:
+        """Append a CEO decision to tracker truth before projecting it locally."""
+        self._authorize_ceo_request(
+            map_id=map_id,
+            action="record_decision",
+            request_identity=request_identity,
+        )
+        if decision.authority != "ceo":
+            self._deny_governance_request(
+                map_id=map_id,
+                action="record_decision",
+                request_identity=request_identity,
+                reason="decision_authority_mismatch",
+            )
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("decision", lock_key):
+            with self._storage.decision_lease(map_id):
+                return self._record_decision(map_id=map_id, decision=decision)
+
+    def _record_decision(
+        self,
+        *,
+        map_id: str,
+        decision: StructuredDecision,
+    ) -> dict[str, Any]:
+        binding = self._storage.map_binding(map_id)
+        if binding is None:
+            raise MapBindingError(f"Map is not bound: {map_id}")
+        existing = self._decision_records_by_id(
+            self._tracker.list_decisions(binding["issue_url"])
+        ).get(decision.decision_id)
+        idempotent = existing is not None
+        if existing is None:
+            self._tracker.append_decision(
+                binding["issue_url"],
+                issue_id=map_id,
+                decision=decision,
+            )
+            confirmed = self._decision_records_by_id(
+                self._tracker.list_decisions(binding["issue_url"])
+            ).get(decision.decision_id)
+            if confirmed is None:
+                raise TrackerDecisionConfirmationError(
+                    "Tracker did not confirm the structured decision in Issue history"
+                )
+        else:
+            confirmed = existing
+        if confirmed.decision != decision:
+            raise StructuredDecisionConflict(
+                decision_id=decision.decision_id,
+            )
+        projection = self._decision_projection(
+            confirmed,
+            confirmed_at=self._synchronized_at(),
+        )
+        self._storage.save_decision_projection(map_id=map_id, decision=projection)
+        return {
+            "map_id": map_id,
+            "decision": projection,
+            "idempotent": idempotent,
+        }
+
+    @staticmethod
+    def _decision_records_by_id(
+        records: list[TrackerDecisionRecord],
+    ) -> dict[str, TrackerDecisionRecord]:
+        by_id: dict[str, TrackerDecisionRecord] = {}
+        for record in records:
+            decision_id = record.decision.decision_id
+            existing = by_id.get(decision_id)
+            if existing is not None and existing.decision != record.decision:
+                raise StructuredDecisionConflict(decision_id=decision_id)
+            by_id.setdefault(decision_id, record)
+        return by_id
+
+    @staticmethod
+    def _decision_projection(
+        record: TrackerDecisionRecord,
+        *,
+        confirmed_at: str,
+    ) -> dict[str, Any]:
+        return {
+            **record.decision.payload(),
+            "tracker": {
+                "id": record.tracker_record_id,
+                "url": record.tracker_record_url,
+            },
+            "confirmed_at": confirmed_at,
+        }
+
+    def _authorize_ceo_request(
+        self,
+        *,
+        map_id: str,
+        action: str,
+        request_identity: GovernanceRequestIdentity,
+    ) -> None:
+        binding = self._storage.ceo_session_binding(map_id)
+        if binding is None:
+            self._deny_governance_request(
+                map_id=map_id,
+                action=action,
+                request_identity=request_identity,
+                reason="canonical_session_missing",
+            )
+        if request_identity.profile_name != binding["profile_name"]:
+            self._deny_governance_request(
+                map_id=map_id,
+                action=action,
+                request_identity=request_identity,
+                reason="profile_mismatch",
+            )
+        session_ids = {
+            binding.get("root_session_id"),
+            binding.get("live_session_id"),
+        }
+        if request_identity.session_id in session_ids:
+            return
+        if self._session_runner is not None and binding.get("root_session_id"):
+            resolved = self._session_runner.resolve(
+                root_session_id=binding["root_session_id"]
+            )
+            if resolved is not None and request_identity.session_id in {
+                resolved.root_session_id,
+                resolved.live_session_id,
+            }:
+                return
+        self._deny_governance_request(
+            map_id=map_id,
+            action=action,
+            request_identity=request_identity,
+            reason="session_mismatch",
+        )
+
+    def enforce_canonical_ceo_toolset(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+        tool_name: str,
+        allowed_tool_names: frozenset[str],
+    ) -> bool:
+        """Block non-governance tools only inside a canonical CEO session."""
+        map_id = self._canonical_ceo_map(request_identity=request_identity)
+        if map_id is None:
+            return False
+        if tool_name in allowed_tool_names:
+            return True
+        self._deny_governance_request(
+            map_id=map_id,
+            action=f"invoke_tool:{tool_name}",
+            request_identity=request_identity,
+            reason="tool_outside_ceo_toolset",
+        )
+
+    def _canonical_ceo_map(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+    ) -> str | None:
+        if not request_identity.session_id:
+            return None
+        for binding in self._storage.ceo_session_bindings(
+            profile_name=request_identity.profile_name
+        ):
+            if request_identity.session_id in {
+                binding.get("root_session_id"),
+                binding.get("live_session_id"),
+            }:
+                return str(binding["map_id"])
+            if self._session_runner is None or not binding.get("root_session_id"):
+                continue
+            resolved = self._session_runner.resolve(
+                root_session_id=str(binding["root_session_id"])
+            )
+            if resolved is not None and request_identity.session_id in {
+                resolved.root_session_id,
+                resolved.live_session_id,
+            }:
+                return str(binding["map_id"])
+        return None
+
+    def _deny_governance_request(
+        self,
+        *,
+        map_id: str,
+        action: str,
+        request_identity: GovernanceRequestIdentity,
+        reason: str,
+    ) -> NoReturn:
+        self._storage.save_authorization_denial(
+            action=action,
+            map_id=map_id,
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+            reason=reason,
+            denied_at=self._synchronized_at(),
+        )
+        raise GovernanceAuthorizationError(
+            action=action,
+            map_id=map_id,
+            reason=reason,
+        )
+
+    def authorization_denials(
+        self,
+        *,
+        map_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the durable security audit without exposing it to CEO tools."""
+        return self._storage.authorization_denials(map_id=map_id)
 
     def open_map(self, *, map_id: str) -> dict[str, Any]:
         """Resolve, initialize and return the Map's one canonical CEO session."""
         lock_key = f"{self._storage.database}:{map_id}"
-        with _session_lock(lock_key):
+        with _operation_lock("session", lock_key):
             with self._storage.ceo_session_lease(map_id):
                 return self._open_map(map_id=map_id)
 
@@ -357,6 +649,15 @@ class MapGovernanceApplication:
         session: CanonicalSession,
         bootstrap_hash: str,
     ) -> dict[str, Any]:
+        if self._session_runner is None:
+            raise RuntimeError("CEO session runner is unavailable")
+        skill_content = self._ceo_skill_message()
+        skill_hash = hashlib.sha256(skill_content.encode()).hexdigest()
+        session = self._session_runner.load_skill(
+            session,
+            content=skill_content,
+            idempotency_key=f"{identity}:skill:{skill_hash}",
+        )
         self._storage.save_ceo_session_ready(
             map_id=map_id,
             profile_name=self._profile_name or "",
@@ -418,7 +719,7 @@ class MapGovernanceApplication:
                 ),
                 f"Map title at binding: {context['title']}",
                 f"Executive stage at binding: {context['stage']}",
-                "Load and follow the map-governance:ceo Skill when available.",
+                "The initialization sequence loads map-governance:ceo next.",
                 (
                     "Authority envelope: govern product and operations only "
                     "within the Map's authorized bounds."
@@ -432,6 +733,23 @@ class MapGovernanceApplication:
                     "Treat this user turn as the durable Map context. Re-read "
                     "tracker truth for later board changes."
                 ),
+            )
+        )
+
+    def _ceo_skill_message(self) -> str:
+        skill_path = self._plugin_root / "skills" / "ceo" / "SKILL.md"
+        try:
+            skill = skill_path.read_text(encoding="utf-8").strip()
+        except OSError as error:
+            raise RuntimeError("Map Governance CEO Skill is unavailable") from error
+        if not skill:
+            raise RuntimeError("Map Governance CEO Skill is empty")
+        return "\n".join(
+            (
+                "Loaded Skill: map-governance:ceo",
+                "<map-governance-ceo-skill>",
+                skill,
+                "</map-governance-ceo-skill>",
             )
         )
 
@@ -468,7 +786,15 @@ class MapGovernanceApplication:
         except ValueError as error:
             raise MapBindingError(str(error)) from error
         self._storage.save_map_projection(card)
-        return self._card_projection(card, project_url=project_binding["project_url"])
+        self._rebuild_decision_projection(
+            map_id=issue.id,
+            issue_url=issue.url,
+            confirmed_at=synchronized_at,
+        )
+        return self._card_with_summary(
+            card,
+            project_url=project_binding["project_url"],
+        )
 
     def refresh(self, *, project_id: str | None = None) -> dict[str, Any]:
         """Rebuild selected board projections from tracker truth and bindings."""
@@ -495,7 +821,29 @@ class MapGovernanceApplication:
                         synchronized_at=synchronized_at,
                     )
                 )
+                self._rebuild_decision_projection(
+                    map_id=issue.id,
+                    issue_url=issue.url,
+                    confirmed_at=synchronized_at,
+                )
         return self.board()
+
+    def _rebuild_decision_projection(
+        self,
+        *,
+        map_id: str,
+        issue_url: str,
+        confirmed_at: str,
+    ) -> None:
+        records = self._decision_records_by_id(self._tracker.list_decisions(issue_url))
+        decisions = [
+            self._decision_projection(record, confirmed_at=confirmed_at)
+            for record in records.values()
+        ]
+        self._storage.replace_decision_projections(
+            map_id=map_id,
+            decisions=decisions,
+        )
 
     def transition_map(
         self,
@@ -505,7 +853,7 @@ class MapGovernanceApplication:
         requested_stage: str,
     ) -> dict[str, Any]:
         """Commit a governed stage transition to the tracker, then project it."""
-        with _transition_lock(map_id):
+        with _operation_lock("transition", map_id):
             return self._transition_map(
                 map_id=map_id,
                 expected_stage=expected_stage,
@@ -524,7 +872,9 @@ class MapGovernanceApplication:
             raise MapBindingError(f"Map is not bound: {map_id}")
         project = self._storage.project_binding(binding["project_id"])
         if project is None:
-            raise MapBindingError(f'CEO project is not configured: {binding["project_id"]}')
+            raise MapBindingError(
+                f"CEO project is not configured: {binding['project_id']}"
+            )
 
         current_issue = self._tracker.get_issue(binding["issue_url"])
         if current_issue.id != map_id:
@@ -556,7 +906,9 @@ class MapGovernanceApplication:
                 reason="tracker stage changed; refresh and retry",
             ) from error
         if committed_issue.id != map_id:
-            raise MapBindingError("Bound GitHub Issue identity changed during transition")
+            raise MapBindingError(
+                "Bound GitHub Issue identity changed during transition"
+            )
         try:
             committed_stage = self._executive_stage(committed_issue)
         except MapBindingError as error:
@@ -589,7 +941,10 @@ class MapGovernanceApplication:
                     "local projection changed after tracker commit; refresh to reconcile"
                 ),
             )
-        return self._card_projection(card, project_url=project["project_url"])
+        return self._card_with_summary(
+            card,
+            project_url=project["project_url"],
+        )
 
     def _synchronized_at(self) -> str:
         value = self._clock()
@@ -692,7 +1047,7 @@ class MapGovernanceApplication:
             "tracker": {
                 "provider": "github",
                 "id": map_id,
-                "identity": f'{row["repository"]}#{row["issue_number"]}',
+                "identity": f"{row['repository']}#{row['issue_number']}",
                 "url": row["issue_url"],
             },
             "title": row["title"],
@@ -701,6 +1056,16 @@ class MapGovernanceApplication:
             "ceo_session": MapGovernanceApplication._session_projection(row),
             "last_synchronized_at": row["synchronized_at"],
         }
+
+    def _card_with_summary(
+        self,
+        row: dict[str, Any],
+        *,
+        project_url: str,
+    ) -> dict[str, Any]:
+        card = self._card_projection(row, project_url=project_url)
+        card["decision_summary"] = self._storage.decision_summary(map_id=card["id"])
+        return card
 
     @staticmethod
     def _session_projection(row: dict[str, Any]) -> dict[str, Any]:
@@ -715,9 +1080,7 @@ class MapGovernanceApplication:
                 "state": "repair_required",
                 "repair": {
                     "reason": row.get("ceo_session_repair_reason"),
-                    "candidate_count": int(
-                        row.get("ceo_session_candidate_count") or 0
-                    ),
+                    "candidate_count": int(row.get("ceo_session_candidate_count") or 0),
                 },
             }
         return {"state": "unbound"}

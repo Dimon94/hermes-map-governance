@@ -23,10 +23,12 @@ hermes maps bind \
   --issue https://github.com/OWNER/REPOSITORY/issues/ISSUE_NUMBER
 ```
 
-The commands use authenticated, read-only `gh api graphql` requests. Repeating a
-bind is idempotent. Run `hermes maps refresh` to rebuild dashboard projections
-from GitHub and the plugin-owned binding registry. The GitHub token needs the
-`read:project` scope.
+Binding and refresh use authenticated `gh api graphql` reads. Governed stage
+transitions and CEO decision recording require Issue write access. Repeating a
+bind is idempotent. Run `hermes maps refresh` to rebuild dashboard projections,
+including confirmed decisions, from GitHub and the plugin-owned binding
+registry. The GitHub token needs the relevant Project read and Issue write
+permissions.
 
 Open the bound Map from its dashboard card, or resolve the same canonical
 conversation explicitly:
@@ -38,3 +40,24 @@ hermes maps open --map ISSUE_NODE_ID --profile CEO_PROFILE
 The first open adopts one exact prior session or creates and bootstraps one.
 `repair_required` means multiple exact candidates were found; the plugin does
 not choose or delete one automatically.
+Every adopted, newly created, or compression-resumed live lineage also receives
+one idempotent CEO Skill user turn, so existing #6 sessions gain the same role
+and negative-capability instructions without changing their system prompt or
+toolset.
+
+The plugin registers the explicit `map-governance:ceo` Skill and the narrow
+`map-governance-ceo` toolset. New canonical CEO conversations persist a stable
+system prompt and the required toolset identity; Map-specific bootstrap data
+remains in the first user turn. Configure the dedicated CEO profile to expose
+this named toolset through normal Hermes profile toolset settings. The plugin's
+request-scoped tool policy also blocks every other tool inside canonical CEO
+sessions. The CEO Tool can inspect executive state or record a structured
+decision. It cannot control worker lanes, edit implementation worktrees, or
+publish code.
+
+This phase uses the authenticated `gh` identity of the plugin process for
+tracker writes, as defined by the prototype security boundary. Structured
+comments written by GitHub collaborators are authoritative Issue history.
+Role-specific toolsets and request policy provide workflow separation here;
+production credential separation is a later hardening step, and local delivery
+never grants remote publication authority.

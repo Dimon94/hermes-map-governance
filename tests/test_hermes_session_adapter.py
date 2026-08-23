@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 from multiprocessing import get_context
 from pathlib import Path
 
 from map_governance import MapGovernanceApplication
 from map_governance.sessions import (
+    CEO_SESSION_MODEL_CONFIG,
+    CEO_SYSTEM_PROMPT,
     HermesSessionAdapter,
     HermesSessionDatabaseBackend,
     canonical_session_identity,
@@ -42,6 +45,10 @@ class _BindingTracker:
             state_reason=None,
             labels=("map", "map-stage/authorized"),
         )
+
+    def list_decisions(self, url: str):
+        assert url == ISSUE_URL
+        return []
 
     def transition_issue_stage(self, *args, **kwargs):
         raise AssertionError("session tests do not transition tracker state")
@@ -94,6 +101,9 @@ def test_real_hermes_session_contract_mints_bootstraps_and_reopens(
     assert row["title"] == title
     assert row["profile_name"] == "ceo"
     assert row["source"] == "desktop"
+    assert row["system_prompt"] == CEO_SYSTEM_PROMPT
+    assert json.loads(row["model_config"]) == CEO_SESSION_MODEL_CONFIG
+    assert ISSUE_URL not in row["system_prompt"]
     assert [(message["role"], message["content"]) for message in messages] == [
         ("user", bootstrap)
     ]
@@ -109,8 +119,23 @@ def test_real_hermes_session_contract_mints_bootstraps_and_reopens(
     assert len(adopted) == 1
     assert initialized.root_session_id == minted.root_session_id
     assert initialized.bootstrap_sent is False
+    skill_content = "Loaded Skill: map-governance:ceo\nDo not control worker lanes."
+    loaded = restarted.load_skill(
+        initialized,
+        content=skill_content,
+        idempotency_key=f"{identity}:skill:v1",
+    )
+    restarted.load_skill(
+        loaded,
+        content=skill_content,
+        idempotency_key=f"{identity}:skill:v1",
+    )
     with SessionDB(db_path=state_database) as database:
-        assert database.get_session(minted.root_session_id)["message_count"] == 1
+        messages = database.get_messages(minted.root_session_id)
+    assert [(message["role"], message["content"]) for message in messages] == [
+        ("user", bootstrap),
+        ("user", skill_content),
+    ]
 
 
 def test_real_hermes_compression_contract_preserves_lineage_and_prompt_bytes(
@@ -130,8 +155,8 @@ def test_real_hermes_compression_contract_preserves_lineage_and_prompt_bytes(
         bootstrap="bootstrap",
         idempotency_key=f"{identity}:bootstrap",
     ).root_session_id
-    stable_prompt = "byte-stable CEO system prompt\nfixed toolset"
-    stable_model_config = {"toolsets": ["map-governance-ceo"], "temperature": 0}
+    stable_prompt = CEO_SYSTEM_PROMPT
+    stable_model_config = CEO_SESSION_MODEL_CONFIG
 
     with SessionDB(db_path=state_database) as database:
         database.create_session(
@@ -188,9 +213,7 @@ def test_real_hermes_profile_databases_keep_same_map_sessions_isolated(
     roots = []
 
     for profile in ("ceo", "chairman"):
-        database = (
-            tmp_path / "hermes-home" / "profiles" / profile / "state.db"
-        )
+        database = tmp_path / "hermes-home" / "profiles" / profile / "state.db"
         adapter = HermesSessionAdapter(HermesSessionDatabaseBackend(database))
         identity = canonical_session_identity(
             profile_name=profile,
@@ -246,4 +269,7 @@ def test_real_hermes_concurrent_processes_converge_and_bootstrap_once(
     roots = [results.get(timeout=2) for _ in processes]
     assert len(set(roots)) == 1
     with SessionDB(db_path=state_database) as database:
-        assert database.get_session(roots[0])["message_count"] == 1
+        messages = database.get_messages(roots[0])
+    assert len(messages) == 2
+    assert "Canonical identity:" in messages[0]["content"]
+    assert "Loaded Skill: map-governance:ceo" in messages[1]["content"]

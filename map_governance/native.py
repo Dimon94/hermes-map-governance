@@ -11,6 +11,7 @@ from .application import (
     MapBindingError,
     MapTransitionError,
 )
+from .ceo_tool import register_ceo_capabilities
 from .runtime import application_for_profile, application_for_storage
 from .tracker import TrackerError
 
@@ -60,6 +61,7 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
 
 def register(ctx) -> None:
     """Register the native diagnostic capability with Hermes."""
+    register_ceo_capabilities(ctx)
     application = application_for_storage(ctx.state.data_dir)
 
     def handle_maps_command(args: Namespace) -> int:
@@ -107,7 +109,10 @@ def register(ctx) -> None:
                     requested_stage=args.stage,
                 )
             except MapTransitionError as error:
-                print(json.dumps({"error": error.as_dict()}, sort_keys=True), file=sys.stderr)
+                print(
+                    json.dumps({"error": error.as_dict()}, sort_keys=True),
+                    file=sys.stderr,
+                )
                 return 1
             except MapBindingError as error:
                 print(

@@ -52,6 +52,23 @@ function fetchJSON(path, options) {
       },
     });
   }
+  if (path.includes("/maps/I_atlas_41?profile=")) {
+    return Promise.resolve({
+      id: "I_atlas_41",
+      recent_decisions: [
+        {
+          decision_id: "decision-atlas-scope-002",
+          type: "operational",
+          rationale: "Hold the public beta until cohort evidence is reviewed.",
+          authority: "ceo",
+          affected_stage: "authorized",
+          timestamp: "2026-08-23T09:28:00Z",
+        },
+      ],
+      approvals: { count: 0, items: [] },
+      delivery_summary: { state: "not_reported" },
+    });
+  }
   if (path.includes("/refresh?profile=")) {
     return Promise.resolve({ refreshed: true });
   }
@@ -72,6 +89,17 @@ function fetchJSON(path, options) {
         title: "Map the Atlas launch",
         stage: "authorized",
         available_transitions: ["delivery", "parked"],
+        decision_summary: {
+          count: 1,
+          latest: {
+            decision_id: "decision-atlas-market-001",
+            type: "product",
+            rationale: "Launch to the research cohort before widening access.",
+            authority: "ceo",
+            affected_stage: "authorized",
+            timestamp: "2026-08-23T09:25:00Z",
+          },
+        },
         ceo_session: mode === "ready" || mode === "hydration-retry"
           ? { state: "ready", last_activity_at: "2026-08-23T09:05:00Z" }
           : { state: "unbound" },
@@ -200,6 +228,33 @@ if (mode !== "empty") {
   assert.match(renderedText, /Map the Atlas launch/);
   assert.match(renderedText, /acme\/atlas#41/);
   assert.match(renderedText, /authorized/);
+  assert.match(renderedText, /1 confirmed decision/);
+  assert.match(renderedText, /product/);
+  assert.match(renderedText, /Launch to the research cohort before widening access/);
+  const detailButton = findNode(
+    readyTree,
+    (node) => node.type === "Button" && /View Map detail/.test(textContent(node)),
+  );
+  assert.ok(detailButton, "Map card exposes its application detail projection");
+  detailButton.props.onClick();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const detailIndex = requestedPaths.findIndex(
+    (path) => path.includes("/maps/I_atlas_41?profile="),
+  );
+  assert.notEqual(detailIndex, -1);
+  assert.equal(
+    requestedPaths[detailIndex],
+    "/api/plugins/map-governance/maps/I_atlas_41?profile=worker",
+  );
+  hookIndex = 0;
+  const detailTree = registeredPage();
+  const detailText = textContent(detailTree);
+  assert.match(detailText, /Recent confirmed decisions/);
+  assert.match(detailText, /decision-atlas-scope-002/);
+  assert.match(detailText, /Hold the public beta until cohort evidence is reviewed/);
+  assert.match(detailText, /Approvals: 0/);
+  assert.match(detailText, /Delivery: not_reported/);
   if (mode === "ready" || mode === "hydration-retry") {
     assert.match(renderedText, /CEO session: ready/);
     assert.match(renderedText, /2026-08-23T09:05:00Z/);

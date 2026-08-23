@@ -6,6 +6,7 @@ import pytest
 
 from map_governance.tracker import (
     GitHubTrackerAdapter,
+    StructuredDecision,
     TrackerConflictError,
     TrackerError,
     TrackerIssue,
@@ -108,9 +109,7 @@ def test_github_stage_transition_replaces_labels_atomically_then_reads_back():
     assert len(runner.calls) == 3
     mutation = runner.calls[1]
     assert "mutation MapGovernanceUpdateIssueStage" in next(
-        value.removeprefix("query=")
-        for value in mutation
-        if value.startswith("query=")
+        value.removeprefix("query=") for value in mutation if value.startswith("query=")
     )
     assert [value for value in mutation if value.startswith("issue=")] == [
         "issue=I_atlas_41"
@@ -176,3 +175,150 @@ def test_github_issue_read_refuses_truncated_labels_for_single_stage_proof():
 
     with pytest.raises(TrackerError, match="cannot prove one active stage"):
         adapter.get_issue("https://github.com/acme/atlas/issues/41")
+
+
+def test_github_decision_write_builds_a_human_and_machine_readable_comment():
+    decision = StructuredDecision(
+        decision_id="decision-atlas-market-001",
+        type="product",
+        rationale="Launch to the research cohort before widening access.",
+        authority="CEO within the authorized Map envelope",
+        affected_stage="authorized",
+        timestamp="2026-08-23T09:25:00Z",
+    )
+    runner = ScriptedRunner(
+        {
+            "data": {
+                "addComment": {
+                    "commentEdge": {
+                        "node": {
+                            "id": "IC_1",
+                            "url": f"{_issue_resource()['url']}#issuecomment-1",
+                            "body": "placeholder",
+                        }
+                    }
+                }
+            }
+        }
+    )
+    adapter = GitHubTrackerAdapter(runner=runner)
+
+    # Return the body sent by the adapter as GitHub's committed comment body.
+    def echo_mutation(arguments):
+        runner.calls.append(list(arguments))
+        body = next(
+            value.removeprefix("body=")
+            for value in arguments
+            if value.startswith("body=")
+        )
+        return json.dumps(
+            {
+                "data": {
+                    "addComment": {
+                        "commentEdge": {
+                            "node": {
+                                "id": "IC_1",
+                                "url": f"{_issue_resource()['url']}#issuecomment-1",
+                                "body": body,
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+    runner.run = echo_mutation
+    committed = adapter.append_decision(
+        _issue_resource()["url"],
+        issue_id="I_atlas_41",
+        decision=decision,
+    )
+
+    assert committed.decision == decision
+    assert committed.tracker_record_id == "IC_1"
+    mutation = runner.calls[0]
+    query = next(
+        value.removeprefix("query=") for value in mutation if value.startswith("query=")
+    )
+    body = next(
+        value.removeprefix("body=") for value in mutation if value.startswith("body=")
+    )
+    assert "mutation MapGovernanceAppendDecision" in query
+    assert "<!-- map-governance:decision:v1 " in body
+    assert "## CEO decision · decision-atlas-market-001" in body
+    assert "Launch to the research cohort before widening access." in body
+    assert [value for value in mutation if value.startswith("subject=")] == [
+        "subject=I_atlas_41"
+    ]
+
+
+def test_github_decision_history_reads_all_pages_and_ignores_ordinary_comments():
+    first = StructuredDecision(
+        decision_id="decision-001",
+        type="product",
+        rationale="First rationale.",
+        authority="CEO",
+        affected_stage="authorized",
+        timestamp="2026-08-23T09:00:00Z",
+    )
+    second = StructuredDecision(
+        decision_id="decision-002",
+        type="operations",
+        rationale="Second rationale.",
+        authority="CEO",
+        affected_stage="delivery",
+        timestamp="2026-08-23T10:00:00Z",
+    )
+
+    def body(decision):
+        marker = json.dumps(
+            decision.payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"<!-- map-governance:decision:v1 {marker} -->\nHuman summary"
+
+    runner = ScriptedRunner(
+        {
+            "data": {
+                "resource": {
+                    "__typename": "Issue",
+                    "id": "I_atlas_41",
+                    "comments": {
+                        "nodes": [
+                            {"id": "IC_plain", "url": "plain", "body": "hello"},
+                            {"id": "IC_1", "url": "decision-1", "body": body(first)},
+                        ],
+                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                    },
+                }
+            }
+        },
+        {
+            "data": {
+                "resource": {
+                    "__typename": "Issue",
+                    "id": "I_atlas_41",
+                    "comments": {
+                        "nodes": [
+                            {"id": "IC_2", "url": "decision-2", "body": body(second)}
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                }
+            }
+        },
+    )
+
+    records = GitHubTrackerAdapter(runner=runner).list_decisions(
+        _issue_resource()["url"]
+    )
+
+    assert [record.decision for record in records] == [first, second]
+    assert [record.tracker_record_id for record in records] == ["IC_1", "IC_2"]
+    assert len(runner.calls) == 2
+    assert not any(value.startswith("after=") for value in runner.calls[0])
+    assert [value for value in runner.calls[1] if value.startswith("after=")] == [
+        "after=cursor-1"
+    ]

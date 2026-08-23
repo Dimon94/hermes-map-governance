@@ -87,9 +87,7 @@ def main() -> int:
     assert cli_board["maps"][0]["stage"] == "authorized"
     assert cli_board["maps"][0]["ceo_session"] == {"state": "unbound"}
 
-    registry_database = Path(
-        diagnostic_report["components"]["storage"]["database"]
-    )
+    registry_database = Path(diagnostic_report["components"]["storage"]["database"])
     with sqlite3.connect(registry_database) as connection:
         connection.execute("DELETE FROM map_projections")
         connection.execute("DELETE FROM project_projections")
@@ -100,12 +98,39 @@ def main() -> int:
     assert not (hermes_home / "kanban.db").exists()
 
     from hermes_cli import web_server
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
+    from model_tools import get_tool_definitions
     from starlette.testclient import TestClient
+    from tools.registry import registry
+
+    discover_plugins()
+    plugin_manager = get_plugin_manager()
+    assert plugin_manager.list_plugin_skills("map-governance") == ["ceo"]
+    ceo_skill = plugin_manager.find_plugin_skill("map-governance:ceo")
+    assert ceo_skill is not None and ceo_skill.is_file()
+    assert registry.snapshot_registration("map_governance_ceo", scope=None) is None
+    ceo_tool = registry.snapshot_registration(
+        "map_governance_ceo",
+        scope=plugin_manager.scope_key,
+    )
+    assert ceo_tool is not None
+    assert ceo_tool.toolset == "map-governance-ceo"
+    assert set(ceo_tool.schema["parameters"]["properties"]["action"]["enum"]) == {
+        "inspect",
+        "record_decision",
+    }
+    ceo_definitions = get_tool_definitions(
+        enabled_toolsets=["map-governance-ceo"],
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+    ceo_definition_names = {
+        definition["function"]["name"] for definition in ceo_definitions
+    }
+    assert ceo_definition_names == {"map_governance_ceo"}, ceo_definition_names
 
     client = TestClient(web_server.app)
-    auth = {
-        "X-Hermes-Session-Token": os.environ["HERMES_DASHBOARD_SESSION_TOKEN"]
-    }
+    auth = {"X-Hermes-Session-Token": os.environ["HERMES_DASHBOARD_SESSION_TOKEN"]}
     discovered = client.get("/api/dashboard/plugins", headers=auth)
     assert discovered.status_code == 200, discovered.text
     maps_plugin = next(
@@ -163,12 +188,9 @@ def main() -> int:
     assert rescanned.status_code == 200, rescanned.text
     after_remove = client.get("/api/dashboard/plugins", headers=auth)
     assert after_remove.status_code == 200, after_remove.text
-    assert not any(
-        plugin["name"] == "map-governance" for plugin in after_remove.json()
-    )
+    assert not any(plugin["name"] == "map-governance" for plugin in after_remove.json())
     assert (
-        client.get("/dashboard-plugins/map-governance/dist/index.js").status_code
-        == 404
+        client.get("/dashboard-plugins/map-governance/dist/index.js").status_code == 404
     )
     assert not (hermes_home / "kanban.db").exists()
 

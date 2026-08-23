@@ -54,6 +54,21 @@ if "projectV2" in query:
     }
     owner_field = "organization" if owner_type == "Organization" else "user"
     payload = {"data": {owner_field: {"projectV2": resource}}}
+elif "MapGovernanceDecisionHistory" in query:
+    url = next(value.removeprefix("url=") for value in arguments if value.startswith("url="))
+    payload = {
+        "data": {
+            "resource": {
+                "__typename": "Issue",
+                "id": "I_atlas_41",
+                "url": url,
+                "comments": {
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                },
+            }
+        }
+    }
 else:
     url = next(value.removeprefix("url=") for value in arguments if value.startswith("url="))
     resource = {

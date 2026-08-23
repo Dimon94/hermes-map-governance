@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol, Sequence
 from urllib.parse import urlparse
 
-from .stages import executive_stage
+from .stages import ACTIVE_STAGES, executive_stage
 
 
 class TrackerError(RuntimeError):
@@ -49,6 +50,60 @@ class TrackerIssue:
     labels: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class StructuredDecision:
+    """A CEO decision whose id is also its stable idempotency identity."""
+
+    decision_id: str
+    type: str
+    rationale: str
+    authority: str
+    affected_stage: str
+    timestamp: str
+
+    def __post_init__(self) -> None:
+        values = {
+            "decision_id": self.decision_id,
+            "type": self.type,
+            "rationale": self.rationale,
+            "authority": self.authority,
+            "affected_stage": self.affected_stage,
+            "timestamp": self.timestamp,
+        }
+        for name, value in values.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Decision {name} must be a non-empty string")
+        if len(self.decision_id) > 128:
+            raise ValueError("Decision decision_id must not exceed 128 characters")
+        if self.affected_stage not in ACTIVE_STAGES | {"done", "cancelled"}:
+            raise ValueError("Decision affected_stage is not supported")
+        try:
+            parsed = datetime.fromisoformat(self.timestamp.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("Decision timestamp must be RFC 3339") from error
+        if parsed.tzinfo is None:
+            raise ValueError("Decision timestamp must include a timezone")
+
+    def payload(self) -> dict[str, str]:
+        return {
+            "decision_id": self.decision_id,
+            "type": self.type,
+            "rationale": self.rationale,
+            "authority": self.authority,
+            "affected_stage": self.affected_stage,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass(frozen=True)
+class TrackerDecisionRecord:
+    """A structured decision confirmed in authoritative tracker history."""
+
+    decision: StructuredDecision
+    tracker_record_id: str
+    tracker_record_url: str
+
+
 class TrackerAdapter(Protocol):
     def get_project(self, url: str) -> TrackerProject: ...
 
@@ -61,6 +116,16 @@ class TrackerAdapter(Protocol):
         expected_stage: str,
         requested_stage: str,
     ) -> TrackerIssue: ...
+
+    def list_decisions(self, url: str) -> list[TrackerDecisionRecord]: ...
+
+    def append_decision(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        decision: StructuredDecision,
+    ) -> TrackerDecisionRecord: ...
 
 
 class CommandRunner(Protocol):
@@ -164,6 +229,37 @@ mutation MapGovernanceUpdateIssueStage($issue: ID!, $labels: [ID!]!) {
 """
 
 
+_APPEND_DECISION_MUTATION = """
+mutation MapGovernanceAppendDecision($subject: ID!, $body: String!) {
+  addComment(input: {subjectId: $subject, body: $body}) {
+    commentEdge {
+      node { id url body }
+    }
+  }
+}
+"""
+
+
+_DECISION_HISTORY_QUERY = """
+query MapGovernanceDecisionHistory($url: URI!, $after: String) {
+  resource(url: $url) {
+    __typename
+    ... on Issue {
+      id
+      comments(first: 100, after: $after) {
+        nodes { id url body }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+
+_DECISION_MARKER_PREFIX = "<!-- map-governance:decision:v1 "
+_DECISION_MARKER_SUFFIX = " -->"
+
+
 class GitHubTrackerAdapter:
     """Read GitHub tracker truth through the authenticated ``gh`` CLI."""
 
@@ -214,7 +310,9 @@ class GitHubTrackerAdapter:
                 url=str(resource["url"]),
             )
         except (KeyError, TypeError, ValueError) as error:
-            raise TrackerError(f"GitHub Project response is incomplete: {url}") from error
+            raise TrackerError(
+                f"GitHub Project response is incomplete: {url}"
+            ) from error
 
     def get_issue(self, url: str) -> TrackerIssue:
         resource = self._resource(_ISSUE_QUERY, url)
@@ -308,9 +406,16 @@ class GitHubTrackerAdapter:
         try:
             mutated_issue = payload["data"]["updateIssue"]["issue"]
         except (KeyError, TypeError) as error:
-            raise TrackerError("GitHub stage mutation response is incomplete") from error
-        if not isinstance(mutated_issue, dict) or str(mutated_issue.get("id")) != issue_id:
-            raise TrackerError("GitHub stage mutation did not return the requested Issue")
+            raise TrackerError(
+                "GitHub stage mutation response is incomplete"
+            ) from error
+        if (
+            not isinstance(mutated_issue, dict)
+            or str(mutated_issue.get("id")) != issue_id
+        ):
+            raise TrackerError(
+                "GitHub stage mutation did not return the requested Issue"
+            )
 
         committed = self.get_issue(url)
         if committed.id != issue_id:
@@ -326,6 +431,135 @@ class GitHubTrackerAdapter:
                 requested_stage=requested_stage,
             )
         return committed
+
+    def append_decision(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        decision: StructuredDecision,
+    ) -> TrackerDecisionRecord:
+        """Append one structured CEO decision comment to a bound Issue."""
+        body = self._decision_comment_body(decision)
+        payload = self._graphql(
+            _APPEND_DECISION_MUTATION,
+            subject=issue_id,
+            body=body,
+        )
+        try:
+            node = payload["data"]["addComment"]["commentEdge"]["node"]
+            record_id = str(node["id"])
+            record_url = str(node["url"])
+            committed_body = str(node["body"])
+        except (KeyError, TypeError) as error:
+            raise TrackerError(
+                "GitHub decision mutation response is incomplete"
+            ) from error
+        committed_decision = self._decision_from_comment(committed_body)
+        if committed_decision != decision:
+            raise TrackerError(
+                f"GitHub did not return the requested decision comment: {url}"
+            )
+        return TrackerDecisionRecord(
+            decision=committed_decision,
+            tracker_record_id=record_id,
+            tracker_record_url=record_url,
+        )
+
+    def list_decisions(self, url: str) -> list[TrackerDecisionRecord]:
+        """Read structured CEO decisions from the complete Issue history."""
+        records: list[TrackerDecisionRecord] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            variables = {"url": url}
+            if cursor is not None:
+                variables["after"] = cursor
+            resource = self._resource(_DECISION_HISTORY_QUERY, **variables)
+            if resource.get("__typename") != "Issue":
+                raise TrackerError(f"GitHub resource is not an Issue: {url}")
+            comments = resource.get("comments")
+            if not isinstance(comments, dict):
+                raise TrackerError(f"GitHub Issue comments are incomplete: {url}")
+            nodes = comments.get("nodes")
+            page_info = comments.get("pageInfo")
+            if not isinstance(nodes, list) or not isinstance(page_info, dict):
+                raise TrackerError(f"GitHub Issue comments are incomplete: {url}")
+            for node in nodes:
+                if not isinstance(node, dict):
+                    raise TrackerError(
+                        f"GitHub Issue comment response is incomplete: {url}"
+                    )
+                body = node.get("body")
+                if not isinstance(body, str) or _DECISION_MARKER_PREFIX not in body:
+                    continue
+                try:
+                    records.append(
+                        TrackerDecisionRecord(
+                            decision=self._decision_from_comment(body),
+                            tracker_record_id=str(node["id"]),
+                            tracker_record_url=str(node["url"]),
+                        )
+                    )
+                except KeyError as error:
+                    raise TrackerError(
+                        f"GitHub decision comment response is incomplete: {url}"
+                    ) from error
+            if not page_info.get("hasNextPage"):
+                return records
+            next_cursor = page_info.get("endCursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise TrackerError("GitHub decision history pagination is incomplete")
+            if next_cursor in seen_cursors:
+                raise TrackerError("GitHub decision history pagination did not advance")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+    @staticmethod
+    def _decision_comment_body(decision: StructuredDecision) -> str:
+        marker = json.dumps(
+            decision.payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return "\n".join(
+            (
+                f"{_DECISION_MARKER_PREFIX}{marker}{_DECISION_MARKER_SUFFIX}",
+                f"## CEO decision · {decision.decision_id}",
+                "",
+                f"- Type: {decision.type}",
+                f"- Authority: {decision.authority}",
+                f"- Affected stage: {decision.affected_stage}",
+                f"- Timestamp: {decision.timestamp}",
+                "",
+                decision.rationale,
+            )
+        )
+
+    @staticmethod
+    def _decision_from_comment(body: str) -> StructuredDecision:
+        marker_line = next(
+            (
+                line
+                for line in body.splitlines()
+                if line.startswith(_DECISION_MARKER_PREFIX)
+                and line.endswith(_DECISION_MARKER_SUFFIX)
+            ),
+            None,
+        )
+        if marker_line is None:
+            raise TrackerError("GitHub decision comment has no structured marker")
+        encoded = marker_line[
+            len(_DECISION_MARKER_PREFIX) : -len(_DECISION_MARKER_SUFFIX)
+        ]
+        try:
+            payload = json.loads(encoded)
+            if not isinstance(payload, dict):
+                raise TypeError("decision marker payload is not an object")
+            return StructuredDecision(**payload)
+        except (TypeError, ValueError) as error:
+            raise TrackerError("GitHub decision comment marker is invalid") from error
 
     def _resource(self, query: str, url: str, **variables: str) -> dict:
         payload = self._graphql(query, url=url, **variables)
@@ -355,9 +589,7 @@ class GitHubTrackerAdapter:
             else:
                 for item in value:
                     arguments.extend(("-F", f"{name}[]={item}"))
-        output = self._runner.run(
-            arguments
-        )
+        output = self._runner.run(arguments)
         try:
             payload = json.loads(output)
         except (TypeError, ValueError) as error:

@@ -55,18 +55,12 @@ def test_rest_health_and_board_delegate_with_explicit_profile(
             transport=transport,
             base_url="http://testserver",
         ) as client:
-            health = await client.get(
-                "/api/plugins/map-governance/health?profile=ceo"
-            )
-            board = await client.get(
-                "/api/plugins/map-governance/board?profile=ceo"
-            )
+            health = await client.get("/api/plugins/map-governance/health?profile=ceo")
+            board = await client.get("/api/plugins/map-governance/board?profile=ceo")
             unscoped = await client.get("/api/plugins/map-governance/health")
         return health, board, unscoped
 
-    health_response, board_response, unscoped_response = asyncio.run(
-        exercise_routes()
-    )
+    health_response, board_response, unscoped_response = asyncio.run(exercise_routes())
 
     assert health_response.status_code == 200
     assert health_response.json() == {"operation": "health"}
@@ -256,7 +250,9 @@ def test_rest_transition_preserves_policy_and_tracker_failure_details(
 
     async def exercise_routes():
         transport = httpx.ASGITransport(app=api)
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
             invalid = await client.post(
                 "/api/plugins/map-governance/transitions?profile=ceo",
                 json={

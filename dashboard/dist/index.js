@@ -42,10 +42,29 @@
     return Promise.resolve("default");
   }
 
+  function renderDecision(decision, key, className) {
+    return React.createElement(
+      "article",
+      { key: key, className: className },
+      React.createElement(
+        "p",
+        { className: "font-medium text-foreground" },
+        decision.type + " · " + decision.decision_id,
+      ),
+      React.createElement("p", null, decision.rationale),
+      React.createElement(
+        "time",
+        { dateTime: decision.timestamp },
+        decision.timestamp,
+      ),
+    );
+  }
+
   function MapsPage() {
     const [state, setState] = useState({ status: "loading" });
     const [transitionState, setTransitionState] = useState({ status: "idle" });
     const [sessionState, setSessionState] = useState({ status: "idle" });
+    const [detailState, setDetailState] = useState({ status: "idle" });
 
     const load = useCallback(function () {
       setState({ status: "loading" });
@@ -164,6 +183,29 @@
         },
       );
     }, [load]);
+
+    const loadMapDetail = useCallback(function (mapId) {
+      setDetailState({ status: "loading", mapId: mapId });
+      requestProfile().then(function (profile) {
+        return fetchJSON(
+          "/api/plugins/map-governance/maps/" + encodeURIComponent(mapId)
+            + "?profile=" + encodeURIComponent(profile),
+        );
+      }).then(
+        function (detail) {
+          setDetailState({ status: "ready", mapId: mapId, detail: detail });
+        },
+        function (error) {
+          setDetailState({
+            status: "error",
+            mapId: mapId,
+            message: error && error.message
+              ? error.message
+              : "Unable to load Map detail",
+          });
+        },
+      );
+    }, []);
 
     useEffect(function () {
       load();
@@ -310,6 +352,69 @@
                   CardContent,
                   { className: "space-y-3 text-xs text-muted-foreground" },
                   React.createElement(
+                    "section",
+                    { className: "space-y-1", "aria-label": "Confirmed CEO decisions" },
+                    React.createElement(
+                      "p",
+                      null,
+                      (card.decision_summary ? card.decision_summary.count : 0)
+                        + " confirmed decision"
+                        + ((card.decision_summary && card.decision_summary.count === 1) ? "" : "s"),
+                    ),
+                    card.decision_summary && card.decision_summary.latest
+                      ? renderDecision(
+                          card.decision_summary.latest,
+                          "latest",
+                          "space-y-1 rounded-md border p-2",
+                        )
+                      : null,
+                  ),
+                  detailState.mapId === card.id && detailState.status === "ready"
+                    ? React.createElement(
+                        "section",
+                        {
+                          className: "space-y-2 rounded-md border p-3",
+                          "aria-label": "Map detail",
+                        },
+                        React.createElement(
+                          "h3",
+                          { className: "font-medium text-foreground" },
+                          "Recent confirmed decisions",
+                        ),
+                        (detailState.detail.recent_decisions || []).length === 0
+                          ? React.createElement("p", null, "No confirmed decisions")
+                          : (detailState.detail.recent_decisions || []).map(
+                              function (decision) {
+                                return renderDecision(
+                                  decision,
+                                  decision.decision_id,
+                                  "space-y-1",
+                                );
+                              },
+                            ),
+                        React.createElement(
+                          "p",
+                          null,
+                          "Approvals: "
+                            + ((detailState.detail.approvals || {}).count || 0),
+                        ),
+                        React.createElement(
+                          "p",
+                          null,
+                          "Delivery: "
+                            + ((detailState.detail.delivery_summary || {}).state
+                              || "not_reported"),
+                        ),
+                      )
+                    : null,
+                  detailState.mapId === card.id && detailState.status === "error"
+                    ? React.createElement(
+                        "p",
+                        { role: "alert", className: "text-sm text-destructive" },
+                        detailState.message,
+                      )
+                    : null,
+                  React.createElement(
                     "p",
                     null,
                     "CEO session: " + card.ceo_session.state,
@@ -375,6 +480,19 @@
                       card.ceo_session.state === "repair_required"
                         ? "Repair required"
                         : "Open CEO session",
+                    ),
+                    React.createElement(
+                      Button,
+                      {
+                        type: "button",
+                        variant: "outline",
+                        disabled: detailState.status === "loading"
+                          && detailState.mapId === card.id,
+                        onClick: function () { loadMapDetail(card.id); },
+                      },
+                      detailState.status === "loading" && detailState.mapId === card.id
+                        ? "Loading Map detail…"
+                        : "View Map detail",
                     ),
                     (card.available_transitions || []).map(function (stage) {
                       const pending = transitionState.status === "pending" && transitionState.mapId === card.id;
