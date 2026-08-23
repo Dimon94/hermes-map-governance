@@ -212,6 +212,41 @@ def test_commissioning_context_consumes_selected_doctor_confirmed_coordinates(
         "delivery-pipeline",
         "herdr",
     )
+    assert context.supported_worker_kinds == ("codex",)
+    assert context.implement_skill_path == str(
+        (skills / "implement" / "SKILL.md").resolve()
+    )
+
+
+def test_claude_only_routing_has_no_supported_issue_14_worker(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    skills = tmp_path / "skills"
+    desired = _desired(
+        delivery_skill=_skill(skills, "delivery-pipeline"),
+        implement_skill=_skill(skills, "implement"),
+        repository=repository,
+        routing_policy="claude",
+    )
+    application = PrerequisiteApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data",
+        config_repository=ReadConfig({"prerequisites": desired}),
+        profile_resolver=lambda profile: tmp_path / "profiles" / profile,
+    )
+    monkeypatch.setattr(
+        application,
+        "doctor",
+        lambda: {"status": "pass", "checks": []},
+    )
+
+    context = application.commissioning_context(
+        project_id="PVT_acme_7",
+        repository="acme/atlas",
+    )
+
+    assert context.routing_policy == "claude"
+    assert context.supported_worker_kinds == ()
 
 
 def test_commissioning_context_rejects_failed_doctor_evidence(tmp_path, monkeypatch):
@@ -247,7 +282,43 @@ def test_commissioning_context_rejects_failed_doctor_evidence(tmp_path, monkeypa
             repository="acme/atlas",
         )
 
+    assert raised.value.reason == "supported_worker_integration_missing"
     assert raised.value.failed_checks == ("herdr.integration.codex",)
+
+
+def test_mixed_context_ignores_claude_failure_when_codex_is_ready(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    skills = tmp_path / "skills"
+    desired = _desired(
+        delivery_skill=_skill(skills, "delivery-pipeline"),
+        implement_skill=_skill(skills, "implement"),
+        repository=repository,
+        routing_policy="mixed",
+    )
+    application = PrerequisiteApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data",
+        config_repository=ReadConfig({"prerequisites": desired}),
+        profile_resolver=lambda profile: tmp_path / "profiles" / profile,
+    )
+    monkeypatch.setattr(
+        application,
+        "doctor",
+        lambda: {
+            "status": "fail",
+            "checks": [{"id": "herdr.integration.claude", "status": "fail"}],
+        },
+    )
+
+    context = application.commissioning_context(
+        project_id="PVT_acme_7",
+        repository="acme/atlas",
+    )
+
+    assert context.supported_worker_kinds == ("codex",)
 
 
 def test_commissioning_context_ignores_unrelated_project_doctor_failure(

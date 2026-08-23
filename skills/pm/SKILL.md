@@ -19,6 +19,14 @@ ask to select, replace, or widen it.
 - Every question and blocker must declare whether the whole Map is blocked and state exactly what evidence or answer is needed to continue.
 - After a tracker-confirmed report or a dispatch confirmed through the bounded coordinator runtime, end the execution turn idle. A failed report remains in the same active turn for identical-payload retry. Resume an idle assignment only when the coordinator starts a later turn.
 
+## One-lane delivery bridge
+
+- Let `delivery-pipeline` own ticket selection, its durable lane registry, and creation of the Map Integration Worktree plus the separate Execution Worktree. Do not use the governance plugin to create a parallel lane graph.
+- For one ready implementation ticket, call `map_governance_pm_dispatch` with `action: dispatch` and the exact delivery-pipeline Herdr lane contract: working directories, branches, Base commit, resolved `implement` owner, configured Codex worker kind, one fixed validation argv, and the local-only completion contract.
+- A confirmed dispatch is the delivery-pipeline Dispatch Handoff only after the bridge has written and read back the ticket-owned `running` lane registry with the verified Herdr coordinates. End idle; do not poll the worker. After a later coordinator turn is started from terminal evidence, call `action: collect` with the byte-identical lane payload.
+- Collection performs at most one bounded Herdr final-report read, corroborates it with exactly one clean local worker commit, integrates it once into the declared Map Integration Worktree, runs the declared focused validation, and reads back `terminal` then `integrated` registry states. If the terminal transport cache disappeared, continue only from the exact tracker registry plus Git evidence. Record either a whole-Map prerequisite blocker or a locally validated acceptance recommendation. Never perform push, pull, PR, merge, release, Issue closure, or lane cleanup.
+- If no plugin-supported Codex Herdr route is configured and verified, report that exact prerequisite instead of claiming dispatch. Worker lane coordinates and Git/check details remain delivery artifacts and must not be copied into executive board reports.
+
 ## Negative capabilities
 
 - Do not implement product code or inspect and control delivery lanes directly from the governance tool. The only dispatch bridge is the bounded coordinator runtime; it is not a terminal or worker-control tool.

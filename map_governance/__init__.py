@@ -26,9 +26,14 @@ from .approvals import (
 from .tracker import StructuredDecision
 from .reports import PMReport, PMReportDraft
 from .coordinator import (
+    CommissioningContext,
     CommissioningAuthorizationError,
     CommissioningPrerequisiteError,
     CoordinatorRuntimeError,
+    DeliveryLaneRegistry,
+    DeliveryLaneSpec,
+    DeliveryRuntimeRequest,
+    delivery_dispatch_id,
 )
 from .prerequisites import (
     PrerequisiteApplication,
@@ -44,8 +49,12 @@ __all__ = [
     "CEOSessionAmbiguityError",
     "CEOSessionRepairRequired",
     "CommissioningAuthorizationError",
+    "CommissioningContext",
     "CommissioningPrerequisiteError",
     "CoordinatorRuntimeError",
+    "DeliveryLaneRegistry",
+    "DeliveryLaneSpec",
+    "DeliveryRuntimeRequest",
     "GovernanceAuthorizationError",
     "GovernanceActorIdentity",
     "GovernanceRequestIdentity",
@@ -65,4 +74,5 @@ __all__ = [
     "TrackerPMReportConfirmationError",
     "TrackerApprovalConfirmationError",
     "YamlConfigRepository",
+    "delivery_dispatch_id",
 ]

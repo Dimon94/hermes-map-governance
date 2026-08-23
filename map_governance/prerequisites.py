@@ -250,7 +250,9 @@ class PrerequisiteApplication:
             )
         report = self.doctor()
         policy = str(desired["routing"]["policy"])
-        required_integrations = ROUTING_INTEGRATIONS[policy]
+        delivery_worker_integrations = (
+            ("codex",) if policy in {"codex", "mixed"} else ()
+        )
         required_check_ids = {
             "configuration",
             "profiles.separation",
@@ -258,6 +260,7 @@ class PrerequisiteApplication:
             "profiles.pm",
             "skills.plugin.pm",
             "skills.external.delivery-pipeline",
+            "skills.external.implement",
             "storage.path",
             "storage.ownership",
             "storage.permissions",
@@ -271,7 +274,7 @@ class PrerequisiteApplication:
             f"repository.{selected_repository['coordinate']}.governance",
             f"repository.{selected_repository['coordinate']}.worker",
             "herdr.binary",
-            *(f"herdr.integration.{name}" for name in required_integrations),
+            *(f"herdr.integration.{name}" for name in delivery_worker_integrations),
         }
         failed = tuple(
             str(check["id"])
@@ -280,8 +283,17 @@ class PrerequisiteApplication:
             and str(check.get("id")) in required_check_ids
         )
         if failed:
+            missing_worker = any(
+                check_id == f"herdr.integration.{name}"
+                for name in delivery_worker_integrations
+                for check_id in failed
+            )
             raise CommissioningPrerequisiteError(
-                reason="doctor_failed",
+                reason=(
+                    "supported_worker_integration_missing"
+                    if missing_worker
+                    else "doctor_failed"
+                ),
                 failed_checks=failed,
             )
         repository_path = Path(str(selected_repository["path"]))
@@ -290,6 +302,14 @@ class PrerequisiteApplication:
                 reason="repository_path_unavailable",
                 failed_checks=(f"repository.{repository}.read",),
             )
+        implement_skill = next(
+            item for item in desired["skills"]["external"] if item["id"] == "implement"
+        )
+        supported_worker_kinds = {
+            "codex": ("codex",),
+            "claude": (),
+            "mixed": ("codex",),
+        }[policy]
         return CommissioningContext(
             project_id=project_id,
             project_url=str(project["url"]),
@@ -305,6 +325,8 @@ class PrerequisiteApplication:
                 / "plugin-data"
                 / self._storage_root.name
             ),
+            supported_worker_kinds=supported_worker_kinds,
+            implement_skill_path=str(Path(str(implement_skill["path"])).resolve()),
         )
 
     def doctor(self) -> dict[str, Any]:

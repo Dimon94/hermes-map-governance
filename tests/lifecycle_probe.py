@@ -112,6 +112,9 @@ def main() -> int:
     assert pm_skill is not None and pm_skill.is_file()
     assert registry.snapshot_registration("map_governance_ceo", scope=None) is None
     assert registry.snapshot_registration("map_governance_pm", scope=None) is None
+    assert (
+        registry.snapshot_registration("map_governance_pm_dispatch", scope=None) is None
+    )
     ceo_tool = registry.snapshot_registration(
         "map_governance_ceo",
         scope=plugin_manager.scope_key,
@@ -154,7 +157,10 @@ def main() -> int:
     pm_definition_names = {
         definition["function"]["name"] for definition in pm_definitions
     }
-    assert pm_definition_names == {"map_governance_pm"}, pm_definition_names
+    assert pm_definition_names == {
+        "map_governance_pm",
+        "map_governance_pm_dispatch",
+    }, pm_definition_names
 
     client = TestClient(web_server.app)
     auth = {"X-Hermes-Session-Token": os.environ["HERMES_DASHBOARD_SESSION_TOKEN"]}

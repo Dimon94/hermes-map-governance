@@ -5,6 +5,7 @@ import json
 import pytest
 
 from map_governance.approvals import ApprovalHistoryEvent
+from map_governance.coordinator import DeliveryLaneRegistry
 from map_governance.reports import PMReport, PMReportDraft
 from map_governance.tracker import (
     GitHubTrackerAdapter,
@@ -578,3 +579,31 @@ def test_github_pm_report_history_reconstructs_authoritative_records():
 
     assert [record.report for record in records] == [report]
     assert records[0].tracker_record_id == "IC_pm_acceptance_1"
+
+
+def test_delivery_lane_registry_marker_round_trips_the_public_contract():
+    registry = DeliveryLaneRegistry(
+        work_item="https://github.com/acme/atlas/issues/42",
+        role="implementation",
+        lane_id="implementation-42",
+        runtime="herdr-codex-pane",
+        state="running",
+        workspace_id="workspace-1",
+        tab_id="tab-1",
+        pane_id="pane-1",
+        herdr_session_name="mapgov-session",
+        herdr_session_owned=True,
+        bootstrap_authority="none",
+        agent_permission_mode="default",
+        worktree="/tmp/atlas-map-1-issue-42",
+        branch="codex/issue-42",
+        base_commit="a" * 40,
+        head_commit=None,
+        integrated_commit=None,
+        updated_at="2026-08-24T00:00:00Z",
+    )
+
+    body = GitHubTrackerAdapter._delivery_lane_registry_body(registry)
+
+    assert body.startswith("<!-- wayfinder-lane-registry:v1 -->\n")
+    assert GitHubTrackerAdapter._delivery_lane_registry_from_comment(body) == registry

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import map_governance.pm_tool as pm_tool
 import map_governance.runtime as runtime
 from map_governance import GovernanceRequestIdentity, StaleProjectionError
+from map_governance.coordinator import DeliveryLaneSpec
 from map_governance.storage import PluginStorage
 
 
@@ -169,6 +170,106 @@ def test_pm_report_handler_injects_request_identity_and_cannot_select_a_map(
             session_id="pm-session-atlas",
         )
         is None
+    )
+
+
+def test_bounded_dispatch_bridge_injects_identity_and_accepts_one_lane_contract(
+    monkeypatch,
+):
+    calls = []
+
+    class ApplicationProbe:
+        def dispatch_pm_delivery_lane(self, **arguments):
+            calls.append(arguments)
+            return {"operation": "dispatch", "state": "dispatched"}
+
+        def collect_pm_delivery_lane(self, **arguments):
+            calls.append(arguments)
+            return {"operation": "collect", "state": "locally_validated"}
+
+        def enforce_assigned_pm_toolset(self, **_arguments):
+            return True
+
+    monkeypatch.setattr(
+        pm_tool,
+        "application_for_pm_request",
+        lambda _profile, **_identity: ApplicationProbe(),
+    )
+    tools = []
+    context = SimpleNamespace(
+        profile_name="pm",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: tools.append(kwargs),
+        register_hook=lambda *args: None,
+    )
+    pm_tool.register_pm_capabilities(context)
+
+    bridge = next(
+        tool for tool in tools if tool["name"] == "map_governance_pm_dispatch"
+    )
+    assert bridge["toolset"] == "map-governance-pm"
+    assert bridge["schema"]["parameters"]["properties"]["action"]["enum"] == [
+        "dispatch",
+        "collect",
+    ]
+    schema_text = json.dumps(bridge["schema"], sort_keys=True).lower()
+    for forbidden in ("map_id", "profile", "session", "coordinator", "chairman"):
+        assert forbidden not in schema_text
+    lane_payload = {
+        "protocol": "delivery-pipeline/herdr-implementation-v1",
+        "lane_id": "implementation-42",
+        "ticket": {
+            "id": "41",
+            "title": "Implement one local lane",
+            "url": "https://github.com/acme/atlas/issues/41",
+            "parent_spec_url": "https://github.com/acme/atlas/issues/40",
+        },
+        "integration": {
+            "worktree": "/tmp/atlas-map-1",
+            "branch": "feature/map-41",
+        },
+        "execution": {
+            "working_directory": "/tmp/atlas-map-1-issue-41",
+            "branch": "codex/issue-42",
+            "base_commit": "a" * 40,
+        },
+        "owner": {
+            "name": "implement",
+            "skill_path": "/tmp/implement/SKILL.md",
+            "invocation_label": "$implement",
+        },
+        "worker_kind": "codex",
+        "validation": {"argv": ["python3", "-m", "pytest", "-q"]},
+        "completion_contract": "one-local-commit-integrated-and-validated",
+        "known_limitations": ["Remote publication remains separately governed."],
+    }
+
+    dispatched = json.loads(
+        bridge["handler"](
+            {"action": "dispatch", "lane": lane_payload},
+            session_id="pm-session-atlas",
+        )
+    )
+    collected = json.loads(
+        bridge["handler"](
+            {"action": "collect", "lane": lane_payload},
+            session_id="pm-session-atlas",
+        )
+    )
+
+    assert dispatched == {"operation": "dispatch", "state": "dispatched"}
+    assert collected == {"operation": "collect", "state": "locally_validated"}
+    assert [call["request_identity"] for call in calls] == [
+        GovernanceRequestIdentity("pm", "pm-session-atlas"),
+        GovernanceRequestIdentity("pm", "pm-session-atlas"),
+    ]
+    assert all(isinstance(call["lane"], DeliveryLaneSpec) for call in calls)
+    assert calls[0]["lane"].execution_worktree == ("/tmp/atlas-map-1-issue-41")
+    assert calls[0]["lane"].validation_argv == (
+        "python3",
+        "-m",
+        "pytest",
+        "-q",
     )
 
 

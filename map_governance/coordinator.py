@@ -5,13 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, NoReturn, Protocol, Sequence
 
 from .storage import PluginStorage
+
+
+DELIVERY_TRANSPORT_RECOVERY_LIMITATION = (
+    "The terminal Herdr transport cache was unavailable; tracker registry and Git "
+    "evidence were used."
+)
+DELIVERY_BOOTSTRAP_AUTHORITY = "none"
 
 
 @dataclass(frozen=True)
@@ -28,6 +36,220 @@ class CommissioningContext:
     skills: tuple[str, ...]
     ceo_profile: str | None = None
     pm_storage_root: str | None = None
+    supported_worker_kinds: tuple[str, ...] = ()
+    implement_skill_path: str | None = None
+
+
+@dataclass(frozen=True)
+class DeliveryLaneSpec:
+    """One delivery-pipeline-owned implementation lane handed to Herdr."""
+
+    protocol: str
+    lane_id: str
+    ticket_id: str
+    ticket_title: str
+    ticket_url: str
+    parent_spec_url: str
+    integration_worktree: str
+    integration_branch: str
+    execution_worktree: str
+    execution_branch: str
+    base_commit: str
+    owner_skill_name: str
+    owner_skill_path: str
+    owner_invocation_label: str
+    worker_kind: str
+    validation_argv: tuple[str, ...]
+    completion_contract: str
+    known_limitations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DeliveryLaneRegistry:
+    """Tracker-authoritative delivery-pipeline lane registry readback."""
+
+    work_item: str
+    role: str
+    lane_id: str
+    runtime: str
+    state: str
+    workspace_id: str
+    tab_id: str
+    pane_id: str
+    herdr_session_name: str
+    herdr_session_owned: bool
+    bootstrap_authority: str
+    agent_permission_mode: str
+    worktree: str
+    branch: str
+    base_commit: str
+    head_commit: str | None
+    integrated_commit: str | None
+    updated_at: str
+    evidence_source: str | None = None
+    final_report_digest: str | None = None
+    blocker_summary: str | None = None
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "work_item": self.work_item,
+            "role": self.role,
+            "lane_id": self.lane_id,
+            "runtime": self.runtime,
+            "state": self.state,
+            "workspace_id": self.workspace_id,
+            "tab_id": self.tab_id,
+            "pane_id": self.pane_id,
+            "herdr_session_name": self.herdr_session_name,
+            "herdr_session_owned": self.herdr_session_owned,
+            "bootstrap_authority": self.bootstrap_authority,
+            "agent_permission_mode": self.agent_permission_mode,
+            "worktree": self.worktree,
+            "branch": self.branch,
+            "base_commit": self.base_commit,
+            "head_commit": self.head_commit,
+            "integrated_commit": self.integrated_commit,
+            "updated_at": self.updated_at,
+            "evidence_source": self.evidence_source,
+            "final_report_digest": self.final_report_digest,
+            "blocker_summary": self.blocker_summary,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "DeliveryLaneRegistry":
+        return cls(**dict(payload))
+
+
+@dataclass(frozen=True)
+class DeliveryRuntimeRequest:
+    """Request-scoped Map authority plus one declared delivery lane."""
+
+    map_id: str
+    map_url: str
+    context: CommissioningContext
+    lane: DeliveryLaneSpec
+    registry_timestamp: str = "1970-01-01T00:00:00Z"
+    registry: DeliveryLaneRegistry | None = None
+
+
+def delivery_lane_packet(request: DeliveryRuntimeRequest) -> dict[str, Any]:
+    """Build the byte-stable worker packet owned by delivery-pipeline."""
+    lane = request.lane
+    return {
+        "protocol": lane.protocol,
+        "map": {"id": request.map_id, "url": request.map_url},
+        "ticket": {
+            "id": lane.ticket_id,
+            "title": lane.ticket_title,
+            "url": lane.ticket_url,
+            "parent_spec_url": lane.parent_spec_url,
+        },
+        "lane": {"id": lane.lane_id, "runtime": f"herdr-{lane.worker_kind}-pane"},
+        "owner": {
+            "name": lane.owner_skill_name,
+            "skill_path": lane.owner_skill_path,
+            "invocation_label": lane.owner_invocation_label,
+        },
+        "integration": {
+            "worktree": lane.integration_worktree,
+            "branch": lane.integration_branch,
+            "base_commit": lane.base_commit,
+        },
+        "execution": {
+            "working_directory": lane.execution_worktree,
+            "branch": lane.execution_branch,
+        },
+        "validation": {"argv": list(lane.validation_argv)},
+        "known_limitations": list(lane.known_limitations),
+        "completion": {
+            "contract": lane.completion_contract,
+            "required_evidence": [
+                "one_local_commit",
+                "clean_execution_worktree",
+                "focused_checks",
+                "review",
+            ],
+            "integration_owner": "hermes-pm",
+            "remote_actions": "forbidden",
+        },
+        "constraints": [
+            "完整读取已声明的 implement owner Skill 后再执行。",
+            "只处理这一张 implementation ticket，不领取 sibling ticket。",
+            "只在声明的 Execution Worktree 中写入并创建一个本地 commit。",
+            "保留 tracker、cherry-pick、integration、push、PR、merge、release 与 Issue closure 给协调者。",
+            "最终输出完整的 FINAL_REPORT_BEGIN 与 FINAL_REPORT_END marker。",
+            "完成时 Checks 与 Review 字段必须分别使用精确值 passed。",
+        ],
+    }
+
+
+def delivery_worker_prompt(
+    request: DeliveryRuntimeRequest,
+    registry: DeliveryLaneRegistry,
+) -> dict[str, Any]:
+    """Augment stable lane identity with verified Herdr/runtime report context."""
+    lane = request.lane
+    return {
+        **delivery_lane_packet(request),
+        "runtime_context": {
+            "repository": {
+                "coordinate": request.context.repository,
+                "root": request.context.repository_path,
+            },
+            "herdr": {
+                "session": registry.herdr_session_name,
+                "workspace_id": registry.workspace_id,
+                "tab_id": registry.tab_id,
+                "pane_id": registry.pane_id,
+            },
+        },
+        "final_report_contract": {
+            "begin_marker": "FINAL_REPORT_BEGIN",
+            "end_marker": "FINAL_REPORT_END",
+            "required_field_order": [
+                "Ticket",
+                "状态",
+                "Pane/worktree/branch",
+                "Commit",
+                "Checks",
+                "Review",
+                "Dirty state",
+                "Touched files",
+                "Blocker",
+            ],
+            "completed_values": {
+                "Ticket": f"{lane.ticket_id} {lane.ticket_title} {lane.ticket_url}",
+                "状态": "completed",
+                "Pane/worktree/branch": (
+                    f"{registry.pane_id} {lane.execution_worktree} "
+                    f"{lane.execution_branch}"
+                ),
+                "Commit": "<exact local HEAD SHA and subject>",
+                "Checks": "passed",
+                "Review": "passed",
+                "Dirty state": "clean",
+                "Touched files": "<ticket-owned paths>",
+                "Blocker": "none",
+            },
+            "blocked_values": {
+                "状态": "blocked",
+                "Commit": "none",
+                "Checks": "blocked",
+                "Review": "blocked",
+                "Dirty state": "clean",
+                "Touched files": "none",
+                "Blocker": "<concise exact blocker>",
+            },
+        },
+    }
+
+
+def delivery_dispatch_id(request: DeliveryRuntimeRequest) -> str:
+    """Return the stable identity that binds dispatch and collection payloads."""
+    serialized = json.dumps(
+        delivery_lane_packet(request), ensure_ascii=False, sort_keys=True
+    )
+    return "delivery-dispatch:" + hashlib.sha256(serialized.encode()).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -83,6 +305,12 @@ class CoordinatorRuntimeBoundary(Protocol):
     ) -> dict[str, Any]: ...
 
     def status(self, *, map_id: str) -> dict[str, Any]: ...
+
+    def prepare_lane(self, request: DeliveryRuntimeRequest) -> dict[str, Any]: ...
+
+    def dispatch_lane(self, request: DeliveryRuntimeRequest) -> dict[str, Any]: ...
+
+    def collect_lane(self, request: DeliveryRuntimeRequest) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -223,6 +451,96 @@ _SENSITIVE_VALUE_RE = re.compile(
     r"|(?:token|secret|password|api[_ -]?key)\s*[:=]\s*\S{4,})",
     re.IGNORECASE,
 )
+
+
+def validate_delivery_lane_registry(
+    *,
+    lane: DeliveryLaneSpec,
+    registry: DeliveryLaneRegistry,
+    allowed_states: set[str],
+) -> None:
+    """Validate one tracker/runtime registry against the public lane contract."""
+    expected = {
+        "work_item": lane.ticket_url,
+        "role": "implementation",
+        "lane_id": lane.lane_id,
+        "runtime": f"herdr-{lane.worker_kind}-pane",
+        "worktree": lane.execution_worktree,
+        "branch": lane.execution_branch,
+        "base_commit": lane.base_commit,
+        "bootstrap_authority": DELIVERY_BOOTSTRAP_AUTHORITY,
+        "agent_permission_mode": (
+            "dangerously-skip-permissions"
+            if lane.worker_kind == "claude"
+            else "default"
+        ),
+    }
+    if (
+        registry.state not in allowed_states
+        or registry.herdr_session_owned is not True
+        or any(getattr(registry, name) != value for name, value in expected.items())
+        or any(
+            not isinstance(value, str) or not value
+            for value in (
+                registry.workspace_id,
+                registry.tab_id,
+                registry.pane_id,
+                registry.herdr_session_name,
+                registry.updated_at,
+            )
+        )
+    ):
+        raise ValueError("Delivery lane registry conflicts with the lane contract")
+    if registry.state in {"created", "running", "blocked"} and (
+        registry.head_commit is not None or registry.integrated_commit is not None
+    ):
+        raise ValueError("Delivery lane registry conflicts with the lane contract")
+    if registry.state in {"terminal", "integrated"} and (
+        not isinstance(registry.head_commit, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", registry.head_commit)
+    ):
+        raise ValueError("Delivery lane registry conflicts with the lane contract")
+    if registry.state == "integrated" and (
+        not isinstance(registry.integrated_commit, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", registry.integrated_commit)
+    ):
+        raise ValueError("Delivery lane registry conflicts with the lane contract")
+    if registry.state != "integrated" and registry.integrated_commit is not None:
+        raise ValueError("Delivery lane registry conflicts with the lane contract")
+    if registry.state in {"created", "running"} and (
+        registry.evidence_source is not None
+        or registry.final_report_digest is not None
+        or registry.blocker_summary is not None
+    ):
+        raise ValueError("Delivery lane registry conflicts with the lane contract")
+    if registry.state == "blocked" and (
+        registry.evidence_source != "herdr-final-report"
+        or not isinstance(registry.final_report_digest, str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", registry.final_report_digest)
+        or not isinstance(registry.blocker_summary, str)
+        or not registry.blocker_summary
+        or len(registry.blocker_summary) > 500
+        or _SENSITIVE_VALUE_RE.search(registry.blocker_summary) is not None
+    ):
+        raise ValueError("Delivery lane registry conflicts with the lane contract")
+    if registry.state in {"terminal", "integrated"} and (
+        registry.evidence_source not in {"herdr-final-report", "registry-git-recovery"}
+        or (
+            registry.evidence_source == "herdr-final-report"
+            and (
+                not isinstance(registry.final_report_digest, str)
+                or not re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", registry.final_report_digest
+                )
+            )
+        )
+        or (
+            registry.evidence_source == "registry-git-recovery"
+            and registry.final_report_digest is not None
+        )
+        or registry.blocker_summary is not None
+    ):
+        raise ValueError("Delivery lane registry conflicts with the lane contract")
 
 
 class CoordinatorRuntime:
@@ -488,6 +806,1723 @@ class CoordinatorRuntime:
         record = self._storage.pm_runtime(map_id)
         return record or {"map_id": map_id, "state": "not_commissioned"}
 
+    def prepare_lane(self, request: DeliveryRuntimeRequest) -> dict[str, Any]:
+        """Reserve and verify one pane before any coding worker is started."""
+        self._validate_delivery_request(request)
+        with self._storage.pm_runtime_lease(request.map_id):
+            record = self._delivery_runtime_record(request)
+            self._validate_owned_record(record)
+            self._validate_live_runtime(record)
+            self._validate_delivery_git(request, collecting=False)
+            prefix = [
+                request.context.herdr_executable,
+                "--session",
+                str(record["session_namespace"]),
+            ]
+            pane = self._delivery_pane(
+                prefix=prefix,
+                record=record,
+                execution_worktree=request.lane.execution_worktree,
+            )
+            occupants = self._delivery_pane_occupants(prefix=prefix, pane=pane)
+            if occupants:
+                raise CoordinatorRuntimeError(
+                    reason="overlapping_lane_ownership",
+                    retryable=False,
+                    repair_required=True,
+                )
+            registry = self._delivery_registry(
+                request=request,
+                record=record,
+                pane=pane,
+                state="created",
+            )
+            return {
+                "map_id": request.map_id,
+                "state": "prepared",
+                "dispatch_id": delivery_dispatch_id(request),
+                "worker_kind": request.lane.worker_kind,
+                "registry": registry.payload(),
+                "coordinate_receipt": self._registry_digest(registry),
+                "remote_actions": "forbidden",
+            }
+
+    def dispatch_lane(self, request: DeliveryRuntimeRequest) -> dict[str, Any]:
+        """Dispatch only after tracker readback of the prepared lane registry."""
+        self._validate_delivery_request(request)
+        registry = self._validate_delivery_registry(
+            request,
+            allowed_states={"created", "running", "blocked"},
+        )
+        with self._storage.pm_runtime_lease(request.map_id):
+            record = self._delivery_runtime_record(request)
+            self._validate_owned_record(record)
+            self._validate_live_runtime(record)
+            if (
+                registry.herdr_session_name != record.get("session_namespace")
+                or registry.workspace_id != record.get("workspace_id")
+                or registry.tab_id != record.get("window_id")
+            ):
+                raise CoordinatorRuntimeError(
+                    reason="lane_registry_readback_mismatch",
+                    retryable=False,
+                    repair_required=True,
+                )
+            self._validate_delivery_git(
+                request,
+                collecting=True,
+                allow_active_execution=True,
+            )
+            prefix = [
+                request.context.herdr_executable,
+                "--session",
+                registry.herdr_session_name,
+            ]
+            pane = self._registered_delivery_pane(
+                prefix=prefix,
+                registry=registry,
+            )
+            worker_name = self.delivery_agent_name(
+                str(record["lifecycle_id"]),
+                delivery_dispatch_id(request),
+                request.lane.worker_kind,
+            )
+            occupants = self._delivery_pane_occupants(prefix=prefix, pane=pane)
+            if len(occupants) > 1 or any(
+                agent.get("name") != worker_name for agent in occupants
+            ):
+                raise CoordinatorRuntimeError(
+                    reason="overlapping_lane_ownership",
+                    retryable=False,
+                    repair_required=True,
+                )
+            packet = delivery_worker_prompt(request, registry)
+            if registry.state == "blocked":
+                packet = {
+                    **packet,
+                    "resume": {
+                        "authority": "map-returned-to-delivery",
+                        "requirements": [
+                            "重新读取 implementation ticket 与当前 Git evidence。",
+                            "只解决已记录 blocker，保持同一 lane、worktree 与单 commit contract。",
+                            "重新运行 checks/review 并输出新的完整 final report。",
+                        ],
+                    },
+                }
+            self._validate_payload(packet)
+            worker = self._get_agent([*prefix, "agent", "get", worker_name])
+            if worker is None:
+                if registry.state in {"running", "blocked"}:
+                    raise CoordinatorRuntimeError(
+                        reason="worker_registry_readback_mismatch",
+                        retryable=False,
+                        repair_required=True,
+                    )
+                self._validate_delivery_git(request, collecting=False)
+                arguments = [
+                    *prefix,
+                    "agent",
+                    "start",
+                    worker_name,
+                    "--kind",
+                    request.lane.worker_kind,
+                    "--pane",
+                    str(pane["pane_id"]),
+                    "--timeout",
+                    "30000",
+                ]
+                if request.lane.worker_kind == "claude":
+                    arguments.extend(["--", "--dangerously-skip-permissions"])
+                payload = self._command_json(arguments)
+                if self._result(payload).get("type") != "agent_started":
+                    raise self._malformed("worker_start_unconfirmed")
+                worker = self._agent_from(payload)
+            if (
+                self._local_result(
+                    [
+                        "git",
+                        "-C",
+                        request.lane.integration_worktree,
+                        "rev-parse",
+                        "HEAD",
+                    ]
+                )
+                != request.lane.base_commit
+            ):
+                raise CoordinatorRuntimeError(
+                    reason="overlapping_integration_ownership",
+                    retryable=False,
+                    repair_required=True,
+                )
+            self._validate_worker_agent(
+                worker,
+                worker_name=worker_name,
+                worker_kind=request.lane.worker_kind,
+                workspace_id=str(record["workspace_id"]),
+                window_id=str(record["window_id"]),
+                pane_id=str(pane["pane_id"]),
+                execution_worktree=request.lane.execution_worktree,
+            )
+            worker_status = worker.get("agent_status")
+            if worker_status == "working" or (
+                worker_status == "done" and registry.state != "blocked"
+            ):
+                return self._dispatch_projection(
+                    request,
+                    record=record,
+                    pane=pane,
+                    registry=registry,
+                    idempotent=True,
+                )
+            if worker_status == "blocked":
+                raise CoordinatorRuntimeError(
+                    reason="worker_requires_input",
+                    retryable=True,
+                )
+            prompt = self._command_json(
+                [
+                    *prefix,
+                    "agent",
+                    "prompt",
+                    worker_name,
+                    json.dumps(
+                        packet,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    "--wait",
+                    "--until",
+                    "working",
+                    "--timeout",
+                    "30000",
+                ]
+            )
+            if self._result(prompt).get("type") != "agent_prompted":
+                raise self._malformed("worker_prompt_unconfirmed")
+            prompted = self._agent_from(prompt)
+            self._validate_worker_agent(
+                prompted,
+                worker_name=worker_name,
+                worker_kind=request.lane.worker_kind,
+                workspace_id=str(record["workspace_id"]),
+                window_id=str(record["window_id"]),
+                pane_id=str(pane["pane_id"]),
+                execution_worktree=request.lane.execution_worktree,
+                expected_status="working",
+            )
+            return self._dispatch_projection(
+                request,
+                record=record,
+                pane=pane,
+                registry=registry,
+                idempotent=False,
+            )
+
+    @staticmethod
+    def _dispatch_projection(
+        request: DeliveryRuntimeRequest,
+        *,
+        record: Mapping[str, Any],
+        pane: Mapping[str, Any],
+        registry: DeliveryLaneRegistry,
+        idempotent: bool,
+    ) -> dict[str, Any]:
+        running_registry = replace(
+            registry,
+            state="running",
+            head_commit=None,
+            integrated_commit=None,
+            evidence_source=None,
+            final_report_digest=None,
+            blocker_summary=None,
+            updated_at=(
+                registry.updated_at
+                if registry.state == "running"
+                else request.registry_timestamp
+            ),
+        )
+        return {
+            "map_id": request.map_id,
+            "state": "dispatched",
+            "dispatch_id": delivery_dispatch_id(request),
+            "worker_kind": request.lane.worker_kind,
+            "completion_contract": request.lane.completion_contract,
+            "checkpoint": "dispatch_handoff",
+            "registry": running_registry.payload(),
+            "coordinate_receipt": CoordinatorRuntime._registry_digest(running_registry),
+            "remote_actions": "forbidden",
+            "idempotent": idempotent,
+        }
+
+    def collect_lane(self, request: DeliveryRuntimeRequest) -> dict[str, Any]:
+        """Collect durable lane evidence, integrate once, and validate locally."""
+        self._validate_delivery_request(request)
+        registry = self._validate_delivery_registry(
+            request,
+            allowed_states={"running", "blocked", "terminal", "integrated"},
+        )
+        with self._storage.pm_runtime_lease(request.map_id):
+            record = self._delivery_runtime_record(request)
+            self._validate_owned_record(record)
+            if (
+                registry.herdr_session_name != record.get("session_namespace")
+                or registry.workspace_id != record.get("workspace_id")
+                or registry.tab_id != record.get("window_id")
+            ):
+                raise CoordinatorRuntimeError(
+                    reason="lane_registry_readback_mismatch",
+                    retryable=False,
+                    repair_required=True,
+                )
+            self._validate_delivery_git(
+                request,
+                collecting=True,
+                allow_active_execution=True,
+            )
+            lane = request.lane
+            if registry.state == "blocked":
+                return self._blocked_delivery_projection(request, registry)
+            final_report, transport_limitations = self._collect_worker_report(
+                request=request,
+                record=record,
+                registry=registry,
+            )
+            if final_report.get("status") == "blocked":
+                blocked_registry = replace(
+                    registry,
+                    state="blocked",
+                    updated_at=request.registry_timestamp,
+                    evidence_source="herdr-final-report",
+                    final_report_digest=str(final_report["digest"]),
+                    blocker_summary=str(final_report["blocker"]),
+                )
+                return self._blocked_delivery_projection(
+                    request,
+                    blocked_registry,
+                )
+            execution_commit = self._execution_commit(lane)
+            self._corroborate_worker_commit(final_report, execution_commit)
+            if registry.head_commit not in {None, execution_commit}:
+                raise CoordinatorRuntimeError(
+                    reason="worker_commit_registry_mismatch",
+                    retryable=False,
+                    repair_required=True,
+                )
+            integration_head = self._local_result(
+                ["git", "-C", lane.integration_worktree, "rev-parse", "HEAD"]
+            )
+            integration_count = self._local_result(
+                [
+                    "git",
+                    "-C",
+                    lane.integration_worktree,
+                    "rev-list",
+                    "--count",
+                    f"{lane.base_commit}..{integration_head}",
+                ]
+            )
+            already_integrated = False
+            if integration_head != lane.base_commit:
+                if integration_count != "1":
+                    raise CoordinatorRuntimeError(
+                        reason="overlapping_integration_ownership",
+                        retryable=False,
+                        repair_required=True,
+                    )
+                already_integrated = self._patch_is_integrated(
+                    lane=lane,
+                    integration_head=integration_head,
+                    execution_commit=execution_commit,
+                )
+                if not already_integrated:
+                    raise CoordinatorRuntimeError(
+                        reason="overlapping_integration_ownership",
+                        retryable=False,
+                        repair_required=True,
+                    )
+            if registry.state == "integrated" and (
+                registry.integrated_commit is None
+                or registry.integrated_commit != integration_head
+                or not already_integrated
+            ):
+                raise CoordinatorRuntimeError(
+                    reason="overlapping_integration_ownership",
+                    retryable=False,
+                    repair_required=True,
+                )
+            if not already_integrated:
+                self._require_integration_ready_for_cherry_pick(
+                    lane,
+                    expected_head=integration_head,
+                )
+                try:
+                    self._local_result(
+                        [
+                            "git",
+                            "-C",
+                            lane.integration_worktree,
+                            "cherry-pick",
+                            execution_commit,
+                        ]
+                    )
+                except CoordinatorRuntimeError as error:
+                    self._handle_failed_cherry_pick(
+                        lane=lane,
+                        expected_parent=integration_head,
+                        cause=error,
+                    )
+            integration_commit = self._local_result(
+                ["git", "-C", lane.integration_worktree, "rev-parse", "HEAD"]
+            )
+            self._require_owned_integration_patch(
+                lane=lane,
+                integration_commit=integration_commit,
+                execution_commit=execution_commit,
+            )
+            self._require_clean_integration(lane.integration_worktree)
+            try:
+                self._local_result(
+                    list(lane.validation_argv), cwd=lane.integration_worktree
+                )
+            except CoordinatorRuntimeError as error:
+                raise CoordinatorRuntimeError(
+                    reason="focused_validation_failed",
+                    retryable=False,
+                ) from error
+            self._require_integration_head(
+                lane.integration_worktree,
+                integration_commit,
+            )
+            self._require_integration_branch(lane)
+            self._require_clean_integration(lane.integration_worktree)
+            if self._execution_commit(lane) != execution_commit:
+                raise CoordinatorRuntimeError(
+                    reason="worker_completion_contract_unmet",
+                    retryable=False,
+                    repair_required=True,
+                )
+            terminal_registry = replace(
+                registry,
+                state="terminal",
+                head_commit=execution_commit,
+                integrated_commit=None,
+                updated_at=request.registry_timestamp,
+                evidence_source=(
+                    "registry-git-recovery"
+                    if final_report["status"] == "recovered_from_git"
+                    else registry.evidence_source or "herdr-final-report"
+                ),
+                final_report_digest=(
+                    None
+                    if final_report["status"] == "recovered_from_git"
+                    else final_report.get("digest") or registry.final_report_digest
+                ),
+            )
+            integrated_registry = replace(
+                terminal_registry,
+                state="integrated",
+                integrated_commit=integration_commit,
+            )
+            limitations = list(
+                dict.fromkeys([*lane.known_limitations, *transport_limitations])
+            )
+            remote_limitation = (
+                "Push, PR, merge, release, and Issue closure were not performed."
+            )
+            if remote_limitation not in limitations:
+                limitations.append(remote_limitation)
+            return {
+                "map_id": request.map_id,
+                "state": "locally_validated",
+                "dispatch_id": delivery_dispatch_id(request),
+                "worker_kind": lane.worker_kind,
+                "terminal_registry": terminal_registry.payload(),
+                "integrated_registry": integrated_registry.payload(),
+                "registry_receipt": self._registry_digest(integrated_registry),
+                "evidence": {
+                    "execution_commit": execution_commit,
+                    "integration_commit": integration_commit,
+                    "final_report": final_report,
+                    "validation": "passed",
+                    "completion_contract": "satisfied",
+                },
+                "limitations": limitations,
+                "acceptance_recommendation": "accept",
+                "remote_actions": "forbidden",
+                "idempotent": already_integrated,
+            }
+
+    @staticmethod
+    def _blocked_delivery_projection(
+        request: DeliveryRuntimeRequest,
+        registry: DeliveryLaneRegistry,
+    ) -> dict[str, Any]:
+        return {
+            "map_id": request.map_id,
+            "state": "blocked",
+            "dispatch_id": delivery_dispatch_id(request),
+            "worker_kind": request.lane.worker_kind,
+            "blocked_registry": registry.payload(),
+            "blocker": {
+                "reason": "worker_reported_blocker",
+                "retryable": True,
+                "summary": registry.blocker_summary,
+            },
+            "remote_actions": "forbidden",
+        }
+
+    @staticmethod
+    def _delivery_registry(
+        *,
+        request: DeliveryRuntimeRequest,
+        record: Mapping[str, Any],
+        pane: Mapping[str, Any],
+        state: str,
+    ) -> DeliveryLaneRegistry:
+        return DeliveryLaneRegistry(
+            work_item=request.lane.ticket_url,
+            role="implementation",
+            lane_id=request.lane.lane_id,
+            runtime=f"herdr-{request.lane.worker_kind}-pane",
+            state=state,
+            workspace_id=str(pane["workspace_id"]),
+            tab_id=str(pane["tab_id"]),
+            pane_id=str(pane["pane_id"]),
+            herdr_session_name=str(record["session_namespace"]),
+            herdr_session_owned=True,
+            bootstrap_authority=DELIVERY_BOOTSTRAP_AUTHORITY,
+            agent_permission_mode=(
+                "dangerously-skip-permissions"
+                if request.lane.worker_kind == "claude"
+                else "default"
+            ),
+            worktree=request.lane.execution_worktree,
+            branch=request.lane.execution_branch,
+            base_commit=request.lane.base_commit,
+            head_commit=None,
+            integrated_commit=None,
+            updated_at=request.registry_timestamp,
+        )
+
+    @staticmethod
+    def _registry_digest(registry: DeliveryLaneRegistry) -> str:
+        payload = json.dumps(registry.payload(), sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
+    @classmethod
+    def _validate_delivery_registry(
+        cls,
+        request: DeliveryRuntimeRequest,
+        *,
+        allowed_states: set[str],
+    ) -> DeliveryLaneRegistry:
+        registry = request.registry
+        if not isinstance(registry, DeliveryLaneRegistry):
+            raise CoordinatorRuntimeError(
+                reason="lane_registry_readback_missing",
+                retryable=True,
+            )
+        try:
+            validate_delivery_lane_registry(
+                lane=request.lane,
+                registry=registry,
+                allowed_states=allowed_states,
+            )
+        except ValueError as error:
+            raise CoordinatorRuntimeError(
+                reason="lane_registry_readback_mismatch",
+                retryable=False,
+                repair_required=True,
+            ) from error
+        return registry
+
+    @classmethod
+    def _execution_commit(cls, lane: DeliveryLaneSpec) -> str:
+        execution_commit = cls._local_result(
+            ["git", "-C", lane.execution_worktree, "rev-parse", "HEAD"]
+        )
+        if (
+            cls._local_result(
+                ["git", "-C", lane.execution_worktree, "branch", "--show-current"]
+            )
+            != lane.execution_branch
+            or cls._local_result(
+                ["git", "-C", lane.execution_worktree, "status", "--porcelain=v1"]
+            )
+            or cls._local_result(
+                [
+                    "git",
+                    "-C",
+                    lane.execution_worktree,
+                    "merge-base",
+                    lane.base_commit,
+                    execution_commit,
+                ]
+            )
+            != lane.base_commit
+            or cls._local_result(
+                [
+                    "git",
+                    "-C",
+                    lane.execution_worktree,
+                    "rev-list",
+                    "--count",
+                    f"{lane.base_commit}..{execution_commit}",
+                ]
+            )
+            != "1"
+        ):
+            raise CoordinatorRuntimeError(
+                reason="worker_completion_contract_unmet",
+                retryable=False,
+                repair_required=True,
+            )
+        return execution_commit
+
+    @classmethod
+    def _patch_is_integrated(
+        cls,
+        *,
+        lane: DeliveryLaneSpec,
+        integration_head: str,
+        execution_commit: str,
+    ) -> bool:
+        if integration_head == execution_commit:
+            return True
+        evidence = cls._local_result(
+            [
+                "git",
+                "-C",
+                lane.execution_worktree,
+                "cherry",
+                integration_head,
+                execution_commit,
+                lane.base_commit,
+            ]
+        )
+        return evidence.strip() == f"- {execution_commit}"
+
+    @classmethod
+    def _require_owned_integration_patch(
+        cls,
+        *,
+        lane: DeliveryLaneSpec,
+        integration_commit: str,
+        execution_commit: str,
+    ) -> None:
+        actual_head = cls._local_result(
+            ["git", "-C", lane.integration_worktree, "rev-parse", "HEAD"]
+        )
+        try:
+            merge_base = cls._local_result(
+                [
+                    "git",
+                    "-C",
+                    lane.integration_worktree,
+                    "merge-base",
+                    lane.base_commit,
+                    actual_head,
+                ]
+            )
+        except CoordinatorRuntimeError as error:
+            raise CoordinatorRuntimeError(
+                reason="overlapping_integration_ownership",
+                retryable=False,
+                repair_required=True,
+            ) from error
+        commit_count = cls._local_result(
+            [
+                "git",
+                "-C",
+                lane.integration_worktree,
+                "rev-list",
+                "--count",
+                f"{lane.base_commit}..{actual_head}",
+            ]
+        )
+        if (
+            cls._local_result(
+                ["git", "-C", lane.integration_worktree, "branch", "--show-current"]
+            )
+            != lane.integration_branch
+            or actual_head != integration_commit
+            or merge_base != lane.base_commit
+            or commit_count != "1"
+            or not cls._patch_is_integrated(
+                lane=lane,
+                integration_head=actual_head,
+                execution_commit=execution_commit,
+            )
+        ):
+            raise CoordinatorRuntimeError(
+                reason="overlapping_integration_ownership",
+                retryable=False,
+                repair_required=True,
+            )
+
+    @classmethod
+    def _require_clean_integration(cls, integration_worktree: str) -> None:
+        if cls._local_result(
+            ["git", "-C", integration_worktree, "status", "--porcelain=v1"]
+        ):
+            raise CoordinatorRuntimeError(
+                reason="integration_not_clean",
+                retryable=False,
+                repair_required=True,
+            )
+
+    @classmethod
+    def _require_integration_head(
+        cls,
+        integration_worktree: str,
+        expected_commit: str,
+    ) -> None:
+        if (
+            cls._local_result(["git", "-C", integration_worktree, "rev-parse", "HEAD"])
+            != expected_commit
+        ):
+            raise CoordinatorRuntimeError(
+                reason="validation_changed_integration_history",
+                retryable=False,
+                repair_required=True,
+            )
+
+    @classmethod
+    def _require_integration_branch(cls, lane: DeliveryLaneSpec) -> None:
+        if (
+            cls._local_result(
+                ["git", "-C", lane.integration_worktree, "branch", "--show-current"]
+            )
+            != lane.integration_branch
+        ):
+            raise CoordinatorRuntimeError(
+                reason="overlapping_integration_ownership",
+                retryable=False,
+                repair_required=True,
+            )
+
+    @classmethod
+    def _require_integration_ready_for_cherry_pick(
+        cls,
+        lane: DeliveryLaneSpec,
+        *,
+        expected_head: str,
+    ) -> None:
+        cls._require_integration_branch(lane)
+        if cls._local_result(
+            ["git", "-C", lane.integration_worktree, "rev-parse", "HEAD"]
+        ) != expected_head or cls._local_result(
+            [
+                "git",
+                "-C",
+                lane.integration_worktree,
+                "status",
+                "--porcelain=v1",
+            ]
+        ):
+            raise CoordinatorRuntimeError(
+                reason="overlapping_integration_ownership",
+                retryable=False,
+                repair_required=True,
+            )
+        for operation_head in ("CHERRY_PICK_HEAD", "MERGE_HEAD", "REVERT_HEAD"):
+            try:
+                cls._local_result(
+                    [
+                        "git",
+                        "-C",
+                        lane.integration_worktree,
+                        "rev-parse",
+                        "--verify",
+                        operation_head,
+                    ]
+                )
+            except CoordinatorRuntimeError:
+                continue
+            raise CoordinatorRuntimeError(
+                reason="overlapping_integration_ownership",
+                retryable=False,
+                repair_required=True,
+            )
+
+    def _collect_worker_report(
+        self,
+        *,
+        request: DeliveryRuntimeRequest,
+        record: Mapping[str, Any],
+        registry: DeliveryLaneRegistry,
+    ) -> tuple[dict[str, Any], list[str]]:
+        if registry.state in {"terminal", "integrated"}:
+            limitations = (
+                [DELIVERY_TRANSPORT_RECOVERY_LIMITATION]
+                if registry.evidence_source == "registry-git-recovery"
+                else []
+            )
+            return {
+                "status": (
+                    "recovered_from_git"
+                    if registry.evidence_source == "registry-git-recovery"
+                    else "recovered_from_terminal_registry"
+                ),
+                "digest": registry.final_report_digest,
+            }, limitations
+        try:
+            self._validate_live_runtime(record)
+        except CoordinatorRuntimeError as error:
+            if error.reason in {
+                "owned_session_unavailable",
+                "owned_workspace_unavailable",
+            }:
+                return self._git_recovery_report()
+            if error.reason not in {
+                "owned_pane_unavailable",
+                "owned_agent_unavailable",
+            }:
+                raise
+        prefix = [
+            request.context.herdr_executable,
+            "--session",
+            registry.herdr_session_name,
+        ]
+        worker_name = self.delivery_agent_name(
+            str(record["lifecycle_id"]),
+            delivery_dispatch_id(request),
+            request.lane.worker_kind,
+        )
+        pane = self._registered_delivery_pane_or_none(
+            prefix=prefix,
+            registry=registry,
+        )
+        occupants = self._delivery_pane_occupants(
+            prefix=prefix,
+            pane=pane or {"pane_id": registry.pane_id},
+        )
+        worker = self._get_agent([*prefix, "agent", "get", worker_name])
+        if pane is None or worker is None:
+            if worker is None and not occupants:
+                return self._git_recovery_report()
+            raise CoordinatorRuntimeError(
+                reason="overlapping_lane_ownership",
+                retryable=False,
+                repair_required=True,
+            )
+        if len(occupants) != 1 or occupants[0].get("name") != worker_name:
+            raise CoordinatorRuntimeError(
+                reason="overlapping_lane_ownership",
+                retryable=False,
+                repair_required=True,
+            )
+        self._validate_worker_agent(
+            worker,
+            worker_name=worker_name,
+            worker_kind=request.lane.worker_kind,
+            workspace_id=registry.workspace_id,
+            window_id=registry.tab_id,
+            pane_id=registry.pane_id,
+            execution_worktree=request.lane.execution_worktree,
+        )
+        if worker.get("agent_status") != "done":
+            raise CoordinatorRuntimeError(
+                reason=(
+                    "worker_requires_input"
+                    if worker.get("agent_status") == "blocked"
+                    else "worker_not_terminal"
+                ),
+                retryable=True,
+            )
+        result = self._result(
+            self._command_json(
+                [
+                    *prefix,
+                    "agent",
+                    "read",
+                    worker_name,
+                    "--source",
+                    "recent-unwrapped",
+                    "--lines",
+                    "400",
+                    "--format",
+                    "text",
+                ]
+            )
+        )
+        read = result.get("read")
+        if result.get("type") != "pane_read" or not isinstance(read, Mapping):
+            return self._git_recovery_report()
+        text = read.get("text")
+        if (
+            read.get("workspace_id") != registry.workspace_id
+            or read.get("tab_id") != registry.tab_id
+            or read.get("pane_id") != registry.pane_id
+        ):
+            raise CoordinatorRuntimeError(
+                reason="worker_final_report_invalid",
+                retryable=False,
+                repair_required=True,
+            )
+        if (
+            read.get("truncated") is not False
+            or not isinstance(text, str)
+            or len(text) > 65_536
+        ):
+            return self._git_recovery_report()
+        report = self._latest_complete_worker_report(text)
+        if report is None:
+            return self._git_recovery_report()
+        lane = request.lane
+        expected_ticket = f"{lane.ticket_id} {lane.ticket_title} {lane.ticket_url}"
+        expected_pane = (
+            f"{registry.pane_id} {lane.execution_worktree} {lane.execution_branch}"
+        )
+        parsed = self._parse_worker_final_report(
+            report,
+            expected_ticket=expected_ticket,
+            expected_pane=expected_pane,
+        )
+        self._corroborate_worker_coordinates(
+            parsed,
+            request=request,
+            registry=registry,
+        )
+        return {
+            **parsed,
+            "digest": "sha256:" + hashlib.sha256(report.encode()).hexdigest(),
+            "revision": read.get("revision"),
+        }, []
+
+    @staticmethod
+    def _latest_complete_worker_report(text: str) -> str | None:
+        marker_pattern = re.compile(
+            r"(?m)^[\t ]*(FINAL_REPORT_BEGIN|FINAL_REPORT_END)[\t ]*\r?$"
+        )
+        pending_begin: re.Match[str] | None = None
+        complete: tuple[re.Match[str], re.Match[str]] | None = None
+        for marker in marker_pattern.finditer(text):
+            if marker.group(1) == "FINAL_REPORT_BEGIN":
+                pending_begin = marker
+            elif pending_begin is not None:
+                complete = (pending_begin, marker)
+                pending_begin = None
+        if pending_begin is not None:
+            return (
+                "FINAL_REPORT_BEGIN"
+                + text[pending_begin.end() :]
+                + "\nFINAL_REPORT_END"
+            )
+        if complete is None:
+            return None
+        begin, end = complete
+        return (
+            "FINAL_REPORT_BEGIN" + text[begin.end() : end.start()] + "FINAL_REPORT_END"
+        )
+
+    @staticmethod
+    def _git_recovery_report() -> tuple[dict[str, Any], list[str]]:
+        return (
+            {"status": "recovered_from_git", "digest": None},
+            [DELIVERY_TRANSPORT_RECOVERY_LIMITATION],
+        )
+
+    @classmethod
+    def _parse_worker_final_report(
+        cls,
+        report: str,
+        *,
+        expected_ticket: str | None = None,
+        expected_pane: str | None = None,
+    ) -> dict[str, Any]:
+        report = report.strip()
+        aliases = {
+            "ticket": "ticket",
+            "状态": "status",
+            "status": "status",
+            "pane/worktree/branch": "pane",
+            "commit": "commit",
+            "checks": "checks",
+            "review": "review",
+            "dirty state": "dirty_state",
+            "touched files": "touched_files",
+            "blocker": "blocker",
+        }
+        canonical_order = (
+            "ticket",
+            "status",
+            "pane",
+            "commit",
+            "checks",
+            "review",
+            "dirty_state",
+            "touched_files",
+            "blocker",
+        )
+        fields: dict[str, str] = {}
+        order: list[str] = []
+        if not (
+            report.startswith("FINAL_REPORT_BEGIN")
+            and report.endswith("FINAL_REPORT_END")
+        ):
+            raise cls._incomplete_worker_report()
+        body = report.removeprefix("FINAL_REPORT_BEGIN").removesuffix(
+            "FINAL_REPORT_END"
+        )
+        for line in body.splitlines():
+            match = re.fullmatch(r"\s*([^:：]+?)\s*[:：]\s*(.*?)\s*", line)
+            if match is None:
+                continue
+            name = aliases.get(match.group(1).strip().lower())
+            if name is None:
+                name = aliases.get(match.group(1).strip())
+            if name is not None:
+                if name in fields:
+                    raise cls._negative_worker_report()
+                fields[name] = match.group(2).strip()
+                order.append(name)
+        for name, expected in (
+            ("ticket", expected_ticket),
+            ("pane", expected_pane),
+        ):
+            value = fields.get(name)
+            if (
+                expected is not None
+                and not cls._empty_report_field(value)
+                and value != expected
+            ):
+                raise cls._invalid_worker_report()
+        status_field = fields.get("status")
+        status = (
+            None
+            if cls._empty_report_field(status_field)
+            else str(status_field).strip().lower()
+        )
+        if status not in {None, "blocked", "completed"}:
+            raise cls._negative_worker_report()
+        success_values = {"pass", "passed", "通过", "成功"}
+        if status == "completed":
+            for name in ("checks", "review"):
+                value = fields.get(name)
+                if (
+                    not cls._empty_report_field(value)
+                    and str(value).strip().lower() not in success_values
+                ):
+                    raise cls._negative_worker_report()
+            dirty_state = fields.get("dirty_state")
+            if not cls._empty_report_field(dirty_state) and str(
+                dirty_state
+            ).strip().lower() not in {"clean", "干净"}:
+                raise cls._negative_worker_report()
+            blocker = fields.get("blocker")
+            if (
+                not cls._empty_report_field(blocker)
+                and str(blocker).strip().lower() != "none"
+            ):
+                raise cls._negative_worker_report()
+        if any(name not in fields for name in canonical_order):
+            if status == "blocked":
+                raise cls._negative_worker_report()
+            raise cls._incomplete_worker_report()
+        if tuple(order) != canonical_order:
+            raise cls._negative_worker_report()
+        if any(
+            cls._empty_report_field(fields[name])
+            for name in ("ticket", "status", "pane")
+        ):
+            raise cls._incomplete_worker_report()
+        if status == "blocked":
+            blocker = fields["blocker"]
+            if any(
+                cls._empty_report_field(fields[name])
+                for name in ("checks", "review", "dirty_state", "blocker")
+            ):
+                raise cls._incomplete_worker_report()
+            if (
+                len(blocker) > 500
+                or cls._contains_sensitive(blocker)
+                or fields["commit"].strip().lower() != "none"
+                or fields["checks"].strip().lower() != "blocked"
+                or fields["review"].strip().lower() != "blocked"
+                or fields["dirty_state"].strip().lower() != "clean"
+                or fields["touched_files"].strip().lower() != "none"
+            ):
+                raise cls._negative_worker_report()
+            return {
+                "status": "blocked",
+                "blocker": blocker,
+                "reported_ticket": fields["ticket"],
+                "reported_pane": fields["pane"],
+            }
+        if status != "completed":
+            raise cls._negative_worker_report()
+        required_nonempty = (
+            "commit",
+            "checks",
+            "review",
+            "dirty_state",
+            "touched_files",
+        )
+        if any(cls._empty_report_field(fields[name]) for name in required_nonempty):
+            raise cls._incomplete_worker_report()
+        if (
+            cls._empty_report_field(fields["blocker"])
+            and fields["blocker"].strip().lower() != "none"
+        ):
+            raise cls._incomplete_worker_report()
+        if (
+            fields["checks"].strip().lower() not in success_values
+            or fields["review"].strip().lower() not in success_values
+            or fields["dirty_state"].strip().lower() not in {"clean", "干净"}
+            or fields["blocker"].strip().lower() != "none"
+        ):
+            raise cls._negative_worker_report()
+        return {
+            "status": "confirmed",
+            "reported_commit": fields["commit"].split(maxsplit=1)[0],
+            "reported_ticket": fields["ticket"],
+            "reported_pane": fields["pane"],
+        }
+
+    @staticmethod
+    def _empty_report_field(value: str | None) -> bool:
+        return not value or value.strip().lower() in {"none", "n/a", "unknown"}
+
+    @staticmethod
+    def _invalid_worker_report() -> CoordinatorRuntimeError:
+        return CoordinatorRuntimeError(
+            reason="worker_final_report_invalid",
+            retryable=False,
+            repair_required=True,
+        )
+
+    @staticmethod
+    def _incomplete_worker_report() -> CoordinatorRuntimeError:
+        return CoordinatorRuntimeError(
+            reason="worker_final_report_incomplete",
+            retryable=False,
+        )
+
+    @staticmethod
+    def _negative_worker_report() -> CoordinatorRuntimeError:
+        return CoordinatorRuntimeError(
+            reason="worker_final_report_negative",
+            retryable=False,
+            repair_required=True,
+        )
+
+    @classmethod
+    def _corroborate_worker_commit(
+        cls,
+        final_report: Mapping[str, Any],
+        execution_commit: str,
+    ) -> None:
+        if final_report.get("status") != "confirmed":
+            return
+        reported = final_report.get("reported_commit")
+        if (
+            not isinstance(reported, str)
+            or not re.fullmatch(r"[0-9a-f]{7,40}", reported)
+            or not execution_commit.startswith(reported)
+        ):
+            raise cls._invalid_worker_report()
+
+    @classmethod
+    def _corroborate_worker_coordinates(
+        cls,
+        final_report: Mapping[str, Any],
+        *,
+        request: DeliveryRuntimeRequest,
+        registry: DeliveryLaneRegistry,
+    ) -> None:
+        lane = request.lane
+        expected_ticket = f"{lane.ticket_id} {lane.ticket_title} {lane.ticket_url}"
+        expected_pane = (
+            f"{registry.pane_id} {lane.execution_worktree} {lane.execution_branch}"
+        )
+        if (
+            final_report.get("reported_ticket") != expected_ticket
+            or final_report.get("reported_pane") != expected_pane
+        ):
+            raise cls._invalid_worker_report()
+
+    @classmethod
+    def _handle_failed_cherry_pick(
+        cls,
+        *,
+        lane: DeliveryLaneSpec,
+        expected_parent: str,
+        cause: CoordinatorRuntimeError,
+    ) -> NoReturn:
+        current_head = cls._local_result(
+            ["git", "-C", lane.integration_worktree, "rev-parse", "HEAD"]
+        )
+        try:
+            cherry_pick_head = cls._local_result(
+                [
+                    "git",
+                    "-C",
+                    lane.integration_worktree,
+                    "rev-parse",
+                    "--verify",
+                    "CHERRY_PICK_HEAD",
+                ]
+            )
+        except CoordinatorRuntimeError:
+            cherry_pick_head = None
+        if current_head != expected_parent or cherry_pick_head is not None:
+            raise CoordinatorRuntimeError(
+                reason="overlapping_integration_ownership",
+                retryable=False,
+                repair_required=True,
+            ) from cause
+        raise CoordinatorRuntimeError(
+            reason="integration_cherry_pick_failed",
+            retryable=False,
+            repair_required=True,
+        ) from cause
+
+    @classmethod
+    def delivery_agent_name(
+        cls, lifecycle_id: str, dispatch_id: str, worker_kind: str
+    ) -> str:
+        return (
+            f"mapgov_{worker_kind}_{cls._digest(lifecycle_id + ':' + dispatch_id, 16)}"
+        )
+
+    def _delivery_runtime_record(
+        self, request: DeliveryRuntimeRequest
+    ) -> dict[str, Any]:
+        record = self._storage.pm_runtime(request.map_id)
+        if record is None or record.get("state") != "active":
+            raise CoordinatorRuntimeError(
+                reason="pm_runtime_not_active",
+                retryable=True,
+            )
+        expected = {
+            "project_id": request.context.project_id,
+            "project_url": request.context.project_url,
+            "repository": request.context.repository,
+            "repository_path": request.context.repository_path,
+            "pm_profile": request.context.pm_profile,
+            "routing_policy": request.context.routing_policy,
+            "herdr_executable": request.context.herdr_executable,
+        }
+        if any(
+            str(record.get(name) or "") != value for name, value in expected.items()
+        ):
+            raise CoordinatorRuntimeError(
+                reason="delivery_context_mismatch",
+                retryable=False,
+                repair_required=True,
+            )
+        return record
+
+    def _delivery_pane(
+        self,
+        *,
+        prefix: Sequence[str],
+        record: Mapping[str, Any],
+        execution_worktree: str,
+    ) -> Mapping[str, Any]:
+        panes_result = self._result(self._command_json([*prefix, "pane", "list"]))
+        panes = panes_result.get("panes")
+        if panes_result.get("type") != "pane_list" or not isinstance(panes, list):
+            raise self._malformed("partial_coordinates")
+        if any(
+            not isinstance(pane, Mapping)
+            or any(
+                not isinstance(pane.get(field), str) or not pane.get(field)
+                for field in ("workspace_id", "tab_id", "pane_id", "cwd")
+            )
+            for pane in panes
+        ):
+            raise self._malformed("partial_coordinates")
+        cwd_panes = [pane for pane in panes if pane.get("cwd") == execution_worktree]
+        if any(
+            pane.get("workspace_id") != record["workspace_id"]
+            or pane.get("tab_id") != record["window_id"]
+            for pane in cwd_panes
+        ):
+            raise CoordinatorRuntimeError(
+                reason="overlapping_lane_ownership",
+                retryable=False,
+                repair_required=True,
+            )
+        matching = [
+            pane
+            for pane in cwd_panes
+            if pane.get("workspace_id") == record["workspace_id"]
+            and pane.get("tab_id") == record["window_id"]
+        ]
+        if len(matching) > 1:
+            raise CoordinatorRuntimeError(
+                reason="overlapping_lane_ownership",
+                retryable=False,
+                repair_required=True,
+            )
+        if matching:
+            return matching[0]
+        result = self._result(
+            self._command_json(
+                [
+                    *prefix,
+                    "pane",
+                    "split",
+                    "--pane",
+                    str(record["pane_id"]),
+                    "--direction",
+                    "right",
+                    "--cwd",
+                    execution_worktree,
+                    "--no-focus",
+                ]
+            )
+        )
+        pane = result.get("pane")
+        if result.get("type") != "pane_info" or not isinstance(pane, Mapping):
+            raise self._malformed("partial_coordinates")
+        if (
+            pane.get("workspace_id") != record["workspace_id"]
+            or pane.get("tab_id") != record["window_id"]
+            or pane.get("cwd") != execution_worktree
+            or not pane.get("pane_id")
+        ):
+            raise CoordinatorRuntimeError(
+                reason="opaque_coordinate_mismatch",
+                retryable=False,
+                repair_required=True,
+            )
+        return pane
+
+    def _registered_delivery_pane(
+        self,
+        *,
+        prefix: Sequence[str],
+        registry: DeliveryLaneRegistry,
+    ) -> Mapping[str, Any]:
+        pane = self._registered_delivery_pane_or_none(
+            prefix=prefix,
+            registry=registry,
+        )
+        if pane is None:
+            raise CoordinatorRuntimeError(
+                reason="lane_registry_readback_mismatch",
+                retryable=False,
+                repair_required=True,
+            )
+        return pane
+
+    def _registered_delivery_pane_or_none(
+        self,
+        *,
+        prefix: Sequence[str],
+        registry: DeliveryLaneRegistry,
+    ) -> Mapping[str, Any] | None:
+        panes_result = self._result(self._command_json([*prefix, "pane", "list"]))
+        panes = panes_result.get("panes")
+        if panes_result.get("type") != "pane_list" or not isinstance(panes, list):
+            raise self._malformed("partial_coordinates")
+        if any(
+            not isinstance(pane, Mapping)
+            or any(
+                not isinstance(pane.get(field), str) or not pane.get(field)
+                for field in ("workspace_id", "tab_id", "pane_id", "cwd")
+            )
+            for pane in panes
+        ):
+            raise self._malformed("partial_coordinates")
+        matching = [pane for pane in panes if pane.get("pane_id") == registry.pane_id]
+        if any(
+            pane.get("cwd") == registry.worktree
+            and pane.get("pane_id") != registry.pane_id
+            for pane in panes
+        ):
+            raise CoordinatorRuntimeError(
+                reason="overlapping_lane_ownership",
+                retryable=False,
+                repair_required=True,
+            )
+        if not matching:
+            return None
+        if len(matching) != 1 or any(
+            matching[0].get(name) != value
+            for name, value in {
+                "workspace_id": registry.workspace_id,
+                "tab_id": registry.tab_id,
+                "cwd": registry.worktree,
+            }.items()
+        ):
+            raise CoordinatorRuntimeError(
+                reason="lane_registry_readback_mismatch",
+                retryable=False,
+                repair_required=True,
+            )
+        return matching[0]
+
+    def _delivery_pane_occupants(
+        self,
+        *,
+        prefix: Sequence[str],
+        pane: Mapping[str, Any],
+    ) -> list[Mapping[str, Any]]:
+        agents_result = self._result(self._command_json([*prefix, "agent", "list"]))
+        agents = agents_result.get("agents")
+        if agents_result.get("type") != "agent_list" or not isinstance(agents, list):
+            raise self._malformed("partial_coordinates")
+        if any(
+            not isinstance(agent, Mapping)
+            or any(
+                not isinstance(agent.get(field), str) or not agent.get(field)
+                for field in (
+                    "name",
+                    "agent",
+                    "agent_status",
+                    "workspace_id",
+                    "tab_id",
+                    "pane_id",
+                    "cwd",
+                )
+            )
+            for agent in agents
+        ):
+            raise self._malformed("partial_coordinates")
+        return [
+            agent for agent in agents if agent.get("pane_id") == pane.get("pane_id")
+        ]
+
+    @staticmethod
+    def _validate_worker_agent(
+        agent: Mapping[str, Any],
+        *,
+        worker_name: str,
+        worker_kind: str,
+        workspace_id: str,
+        window_id: str,
+        pane_id: str,
+        execution_worktree: str,
+        expected_status: str | None = None,
+    ) -> None:
+        expected = {
+            "name": worker_name,
+            "agent": worker_kind,
+            "workspace_id": workspace_id,
+            "tab_id": window_id,
+            "pane_id": pane_id,
+            "cwd": execution_worktree,
+        }
+        if any(agent.get(name) != value for name, value in expected.items()):
+            raise CoordinatorRuntimeError(
+                reason="worker_coordinate_mismatch",
+                retryable=False,
+                repair_required=True,
+            )
+        if expected_status is not None and agent.get("agent_status") != expected_status:
+            raise CoordinatorRuntimeError(
+                reason="worker_handoff_unconfirmed",
+                retryable=True,
+            )
+
+    @staticmethod
+    def _local_result(arguments: Sequence[str], *, cwd: str | None = None) -> str:
+        try:
+            completed = subprocess.run(
+                [str(item) for item in arguments],
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=35,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise CoordinatorRuntimeError(
+                reason="local_evidence_unavailable", retryable=True
+            ) from error
+        if completed.returncode != 0:
+            raise CoordinatorRuntimeError(
+                reason="local_evidence_unavailable", retryable=True
+            )
+        return completed.stdout.strip()
+
+    @classmethod
+    def _validate_delivery_git(
+        cls,
+        request: DeliveryRuntimeRequest,
+        *,
+        collecting: bool,
+        allow_active_execution: bool = False,
+    ) -> None:
+        lane = request.lane
+        integration = str(Path(lane.integration_worktree).resolve())
+        execution = str(Path(lane.execution_worktree).resolve())
+        repository = str(Path(request.context.repository_path).resolve())
+        common_directories = {
+            cls._local_result(
+                [
+                    "git",
+                    "-C",
+                    path,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ]
+            )
+            for path in (repository, integration, execution)
+        }
+        if len(common_directories) != 1:
+            raise CoordinatorRuntimeError(
+                reason="worktree_repository_mismatch",
+                retryable=False,
+                repair_required=True,
+            )
+        registered = {
+            str(Path(line.removeprefix("worktree ")).resolve())
+            for line in cls._local_result(
+                ["git", "-C", repository, "worktree", "list", "--porcelain"]
+            ).splitlines()
+            if line.startswith("worktree ")
+        }
+        if not {integration, execution}.issubset(registered):
+            raise CoordinatorRuntimeError(
+                reason="worktree_registration_mismatch",
+                retryable=False,
+                repair_required=True,
+            )
+        expected_branches = (
+            (integration, lane.integration_branch),
+            (execution, lane.execution_branch),
+        )
+        for path, branch in expected_branches:
+            if (
+                cls._local_result(["git", "-C", path, "branch", "--show-current"])
+                != branch
+            ):
+                raise CoordinatorRuntimeError(
+                    reason="worktree_branch_mismatch",
+                    retryable=False,
+                    repair_required=True,
+                )
+            if not (allow_active_execution and path == execution) and cls._local_result(
+                ["git", "-C", path, "status", "--porcelain=v1"]
+            ):
+                raise CoordinatorRuntimeError(
+                    reason="worktree_not_clean",
+                    retryable=False,
+                    repair_required=True,
+                )
+        if not collecting:
+            for path in (integration, execution):
+                if (
+                    cls._local_result(["git", "-C", path, "rev-parse", "HEAD"])
+                    != lane.base_commit
+                ):
+                    raise CoordinatorRuntimeError(
+                        reason="delivery_base_mismatch",
+                        retryable=False,
+                        repair_required=True,
+                    )
+
+    @classmethod
+    def _validate_delivery_request(cls, request: DeliveryRuntimeRequest) -> None:
+        if not isinstance(request, DeliveryRuntimeRequest):
+            raise TypeError("Delivery runtime request is required")
+        lane = request.lane
+        required_text = (
+            request.map_id,
+            request.map_url,
+            lane.lane_id,
+            lane.ticket_id,
+            lane.ticket_title,
+            lane.ticket_url,
+            lane.parent_spec_url,
+            lane.integration_worktree,
+            lane.integration_branch,
+            lane.execution_worktree,
+            lane.execution_branch,
+            lane.base_commit,
+            lane.owner_skill_path,
+        )
+        if any(
+            not isinstance(value, str) or not value.strip() for value in required_text
+        ):
+            raise ValueError("Delivery lane has an empty required field")
+        if lane.protocol != "delivery-pipeline/herdr-implementation-v1":
+            raise ValueError("Delivery lane protocol is not supported")
+        if lane.ticket_url == request.map_url:
+            raise ValueError("Delivery ticket must be distinct from the Map Issue")
+        repository_issue_prefix = (
+            f"https://github.com/{request.context.repository}/issues/"
+        )
+        map_match = re.fullmatch(
+            re.escape(repository_issue_prefix) + r"([1-9][0-9]*)", request.map_url
+        )
+        ticket_match = re.fullmatch(
+            re.escape(repository_issue_prefix) + r"([1-9][0-9]*)", lane.ticket_url
+        )
+        spec_match = re.fullmatch(
+            re.escape(repository_issue_prefix) + r"([1-9][0-9]*)",
+            lane.parent_spec_url,
+        )
+        if map_match is None or ticket_match is None:
+            raise ValueError("Delivery ticket is outside the Map repository")
+        if spec_match is None or lane.parent_spec_url in {
+            request.map_url,
+            lane.ticket_url,
+        }:
+            raise ValueError("Delivery parent Spec relationship is invalid")
+        if lane.completion_contract != "one-local-commit-integrated-and-validated":
+            raise ValueError("Delivery completion contract is not supported")
+        if (
+            lane.owner_skill_name != "implement"
+            or lane.owner_invocation_label != "$implement"
+        ):
+            raise ValueError("Delivery lane must declare the implement owner")
+        owner = Path(lane.owner_skill_path)
+        configured_owner = request.context.implement_skill_path
+        resolved_owner = owner.resolve()
+        if (
+            not owner.is_absolute()
+            or not owner.is_file()
+            or owner.is_symlink()
+            or str(owner) != str(resolved_owner)
+            or (
+                configured_owner is not None
+                and lane.owner_skill_path != str(Path(configured_owner).resolve())
+            )
+        ):
+            raise ValueError("Delivery lane implement owner path is unavailable")
+        try:
+            owner_text = owner.read_text(encoding="utf-8")
+        except OSError as error:
+            raise ValueError(
+                "Delivery lane implement owner path is unavailable"
+            ) from error
+        if not re.search(r"(?m)^name:\s*[\"']?implement[\"']?\s*$", owner_text):
+            raise ValueError("Delivery lane owner frontmatter does not match implement")
+        if lane.worker_kind != "codex":
+            raise CommissioningPrerequisiteError(
+                reason="supported_worker_routing_missing",
+                failed_checks=("delivery.worker.codex",),
+            )
+        if lane.worker_kind not in request.context.supported_worker_kinds:
+            raise CommissioningPrerequisiteError(
+                reason="supported_worker_integration_missing",
+                failed_checks=(f"herdr.integration.{lane.worker_kind}",),
+            )
+        ticket_number = ticket_match.group(1)
+        map_number = map_match.group(1)
+        if lane.lane_id != f"implementation-{ticket_number}":
+            raise ValueError("Delivery lane identity does not match the ticket")
+        if lane.execution_branch != f"{lane.worker_kind}/issue-{ticket_number}":
+            raise ValueError("Delivery execution branch does not match the ticket")
+        if lane.integration_branch != f"feature/map-{map_number}":
+            raise ValueError("Delivery integration branch does not match the Map")
+        if not re.fullmatch(r"[0-9a-f]{40}", lane.base_commit):
+            raise ValueError("Delivery base commit must be a full Git SHA")
+        paths = (Path(lane.integration_worktree), Path(lane.execution_worktree))
+        if any(
+            not path.is_absolute()
+            or not path.is_dir()
+            or path.is_symlink()
+            or str(path) != str(path.resolve())
+            for path in paths
+        ):
+            raise ValueError("Delivery worktrees must be existing absolute directories")
+        if paths[0].resolve() == paths[1].resolve():
+            raise ValueError("Integration and execution worktrees must be distinct")
+        if (
+            not isinstance(lane.validation_argv, tuple)
+            or not lane.validation_argv
+            or len(lane.validation_argv) > 64
+            or any(
+                not isinstance(item, str) or not item or "\x00" in item or "\n" in item
+                for item in lane.validation_argv
+            )
+        ):
+            raise ValueError("Delivery validation must be one fixed argv command")
+        if any(
+            not isinstance(item, str) or not item.strip() or len(item) > 1000
+            for item in lane.known_limitations
+        ):
+            raise ValueError("Delivery limitations must be concise non-empty strings")
+        executable = lane.validation_argv[0]
+        allowed_executables = {
+            "cargo",
+            "git",
+            "go",
+            "node",
+            "npm",
+            "pytest",
+            "python",
+            "python3",
+            "ruff",
+            "swift",
+            "ty",
+            "xcodebuild",
+        }
+        if (
+            executable not in allowed_executables
+            or Path(executable).name != executable
+            or shutil.which(executable) is None
+        ):
+            raise ValueError("Delivery validation command is not safely bounded")
+        command = lane.validation_argv[1] if len(lane.validation_argv) > 1 else ""
+        unsafe_arguments = {
+            "--fix",
+            "--unsafe-fixes",
+            "--write",
+            "-w",
+            "--ext-diff",
+            "--no-index",
+        }
+        if any(
+            item in unsafe_arguments
+            or item.startswith("--fix")
+            or item.startswith("--unsafe-fixes")
+            or item.startswith("--output")
+            or Path(item).is_absolute()
+            or ".." in Path(item).parts
+            for item in lane.validation_argv[1:]
+        ):
+            raise ValueError("Delivery validation command is not safely bounded")
+        if executable == "git" and command not in {
+            "diff",
+            "status",
+            "rev-parse",
+            "show",
+            "log",
+            "grep",
+        }:
+            raise ValueError(
+                "Delivery validation cannot perform remote or merge actions"
+            )
+        if executable in {"python", "python3"}:
+            if len(lane.validation_argv) < 3 or lane.validation_argv[1] != "-m":
+                raise ValueError("Delivery Python validation is not safely bounded")
+            if lane.validation_argv[2] not in {"compileall", "pytest", "unittest"}:
+                raise ValueError("Delivery Python validation is not safely bounded")
+        if executable == "node" and command not in {"--check", "--test"}:
+            raise ValueError("Delivery Node validation is not safely bounded")
+        if executable == "npm" and command != "test":
+            raise ValueError("Delivery npm validation is not safely bounded")
+        safe_subcommands = {
+            "cargo": {"check", "test"},
+            "go": {"test"},
+            "ruff": {"check"},
+            "swift": {"build", "test"},
+            "ty": {"check"},
+            "xcodebuild": {"build", "test"},
+        }
+        if (
+            executable in safe_subcommands
+            and command not in safe_subcommands[executable]
+        ):
+            raise ValueError("Delivery validation command is not safely bounded")
+        packet = delivery_lane_packet(request)
+        serialized = json.dumps(packet, ensure_ascii=False, sort_keys=True)
+        if len(serialized.encode()) > 32_768 or cls._contains_sensitive(packet):
+            raise ValueError("Delivery lane packet is too large or sensitive")
+
     def _advance(
         self,
         *,
@@ -649,6 +2684,7 @@ class CoordinatorRuntime:
         prefix: Sequence[str],
         coordinates: OwnedPaneCoordinates,
         repository_path: str,
+        missing_reason: str | None = None,
     ) -> None:
         result = self._result(
             self._command_json(
@@ -666,6 +2702,11 @@ class CoordinatorRuntime:
             if isinstance(panes, list)
             else []
         )
+        if not matching and missing_reason is not None:
+            raise CoordinatorRuntimeError(
+                reason=missing_reason,
+                retryable=True,
+            )
         if len(matching) != 1 or not coordinates.matches(
             matching[0], repository_path=repository_path
         ):
@@ -772,11 +2813,21 @@ class CoordinatorRuntime:
         prefix = [executable, "--session", namespace]
         result = self._result(self._command_json([*prefix, "workspace", "list"]))
         workspaces = result.get("workspaces")
-        if not isinstance(workspaces, list) or not any(
-            isinstance(item, Mapping)
-            and item.get("workspace_id") == record["workspace_id"]
-            and item.get("label") == record["workspace_label"]
+        if not isinstance(workspaces, list):
+            raise self._malformed("partial_coordinates")
+        registered_workspaces = [
+            item
             for item in workspaces
+            if isinstance(item, Mapping)
+            and item.get("workspace_id") == record["workspace_id"]
+        ]
+        if not registered_workspaces:
+            raise CoordinatorRuntimeError(
+                reason="owned_workspace_unavailable",
+                retryable=True,
+            )
+        if len(registered_workspaces) != 1 or (
+            registered_workspaces[0].get("label") != record["workspace_label"]
         ):
             raise CoordinatorRuntimeError(
                 reason="workspace_ownership_mismatch",
@@ -806,6 +2857,7 @@ class CoordinatorRuntime:
                 str(record["pane_id"]),
             ),
             repository_path=str(record["repository_path"]),
+            missing_reason="owned_pane_unavailable",
         )
         agent = self._get_agent([*prefix, "agent", "get", str(record["agent_id"])])
         if agent is None:

@@ -153,5 +153,23 @@ terminal failures do not change governance stage, acceptance outcome evidence ma
 request `acceptance`, and non-blocking questions remain in `delivery`. A confirmed
 report or coordinator-confirmed dispatch ends the PM turn idle; failed reporting
 stays in the active turn for identical-payload retry. The PM contract fixes
-`dispatch_runtime: herdr`. This plugin commissions the single root PM runtime;
-implementation worker-lane routing remains outside this phase.
+`dispatch_runtime: herdr`. `delivery-pipeline` remains the lane/worktree/registry
+owner. Once it has prepared exactly one independently grabbable lane, the bounded
+`map_governance_pm_dispatch` tool validates the declared Integration and Execution
+Worktrees, resolved `implement` owner, configured Codex integration,
+validation argv, and local-only completion contract. Before any worker starts, the
+prepared Herdr coordinates are tracker-confirmed as a `created` registry; `dispatch`
+then reconciles those exact coordinates, starts or resumes the worker, confirms the
+`running` registry, and leaves the PM idle. A later coordinator turn calls `collect`
+with the identical payload to consume one bounded Herdr final report plus one local
+commit, cherry-pick once, validate, read back `terminal` and `integrated`, and write either
+a whole-Map blocker or acceptance recommendation. No push, PR, merge, release,
+Issue closure, or lane cleanup is performed, and lane coordinates never become
+Map cards.
+Dispatch also reads back the ticket's implementation label, exact Spec `Parent`
+backlink, and closed `Blocked by` dependencies. A worker-reported blocker can resume
+only after governed Map state returns to `delivery`; resume revalidates the same
+registered Herdr worker and Git ownership before `blocked -> running`.
+This proof lane supports Codex CLI and records canonical `bootstrap_authority: none`;
+Claude-only routing is reported as a prerequisite to select Codex/mixed routing and
+verify the Codex Herdr integration.

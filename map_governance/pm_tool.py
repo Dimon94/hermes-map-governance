@@ -14,6 +14,11 @@ from .application import (
     StaleProjectionError,
     TrackerPMReportConfirmationError,
 )
+from .coordinator import (
+    CommissioningPrerequisiteError,
+    CoordinatorRuntimeError,
+    DeliveryLaneSpec,
+)
 from .reports import PMReportDraft
 from .runtime import application_for_pm_request
 from .tracker import TrackerError
@@ -71,6 +76,175 @@ PM_TOOL_SCHEMA = {
         "additionalProperties": False,
     },
 }
+
+PM_DISPATCH_TOOL_SCHEMA = {
+    "name": "map_governance_pm_dispatch",
+    "description": (
+        "Dispatch or collect exactly one delivery-pipeline-owned Herdr "
+        "implementation lane."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["dispatch", "collect"]},
+            "lane": {
+                "type": "object",
+                "properties": {
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["delivery-pipeline/herdr-implementation-v1"],
+                    },
+                    "lane_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "ticket": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "minLength": 1},
+                            "title": {"type": "string", "minLength": 1},
+                            "url": {"type": "string", "minLength": 1},
+                            "parent_spec_url": {"type": "string", "minLength": 1},
+                        },
+                        "required": ["id", "title", "url", "parent_spec_url"],
+                        "additionalProperties": False,
+                    },
+                    "integration": {
+                        "type": "object",
+                        "properties": {
+                            "worktree": {"type": "string", "minLength": 1},
+                            "branch": {"type": "string", "minLength": 1},
+                        },
+                        "required": ["worktree", "branch"],
+                        "additionalProperties": False,
+                    },
+                    "execution": {
+                        "type": "object",
+                        "properties": {
+                            "working_directory": {"type": "string", "minLength": 1},
+                            "branch": {"type": "string", "minLength": 1},
+                            "base_commit": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{40}$",
+                            },
+                        },
+                        "required": ["working_directory", "branch", "base_commit"],
+                        "additionalProperties": False,
+                    },
+                    "owner": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "enum": ["implement"]},
+                            "skill_path": {"type": "string", "minLength": 1},
+                            "invocation_label": {
+                                "type": "string",
+                                "enum": ["$implement"],
+                            },
+                        },
+                        "required": ["name", "skill_path", "invocation_label"],
+                        "additionalProperties": False,
+                    },
+                    "worker_kind": {
+                        "type": "string",
+                        "enum": ["codex"],
+                    },
+                    "validation": {
+                        "type": "object",
+                        "properties": {
+                            "argv": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 64,
+                                "items": {"type": "string", "minLength": 1},
+                            }
+                        },
+                        "required": ["argv"],
+                        "additionalProperties": False,
+                    },
+                    "completion_contract": {
+                        "type": "string",
+                        "enum": ["one-local-commit-integrated-and-validated"],
+                    },
+                    "known_limitations": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                },
+                "required": [
+                    "protocol",
+                    "lane_id",
+                    "ticket",
+                    "integration",
+                    "execution",
+                    "owner",
+                    "worker_kind",
+                    "validation",
+                    "completion_contract",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["action", "lane"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _delivery_lane(raw: Any) -> DeliveryLaneSpec:
+    if not isinstance(raw, dict):
+        raise ValueError("lane is required")
+
+    def string_field(value: Any, path: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{path} must be a non-empty string")
+        return value
+
+    def object_field(name: str) -> dict[str, Any]:
+        value = raw.get(name)
+        if not isinstance(value, dict):
+            raise ValueError(f"lane.{name} must be an object")
+        return value
+
+    ticket = object_field("ticket")
+    integration = object_field("integration")
+    execution = object_field("execution")
+    owner = object_field("owner")
+    validation = object_field("validation")
+    validation_argv = validation.get("argv")
+    limitations = raw.get("known_limitations", [])
+    if not isinstance(validation_argv, list) or not isinstance(limitations, list):
+        raise ValueError("lane validation and limitations must be arrays")
+    return DeliveryLaneSpec(
+        protocol=string_field(raw.get("protocol"), "lane.protocol"),
+        lane_id=string_field(raw.get("lane_id"), "lane.lane_id"),
+        ticket_id=string_field(ticket.get("id"), "lane.ticket.id"),
+        ticket_title=string_field(ticket.get("title"), "lane.ticket.title"),
+        ticket_url=string_field(ticket.get("url"), "lane.ticket.url"),
+        parent_spec_url=string_field(
+            ticket.get("parent_spec_url"), "lane.ticket.parent_spec_url"
+        ),
+        integration_worktree=string_field(
+            integration.get("worktree"), "lane.integration.worktree"
+        ),
+        integration_branch=string_field(
+            integration.get("branch"), "lane.integration.branch"
+        ),
+        execution_worktree=string_field(
+            execution.get("working_directory"), "lane.execution.working_directory"
+        ),
+        execution_branch=string_field(execution.get("branch"), "lane.execution.branch"),
+        base_commit=string_field(
+            execution.get("base_commit"), "lane.execution.base_commit"
+        ),
+        owner_skill_name=string_field(owner.get("name"), "lane.owner.name"),
+        owner_skill_path=string_field(owner.get("skill_path"), "lane.owner.skill_path"),
+        owner_invocation_label=string_field(
+            owner.get("invocation_label"), "lane.owner.invocation_label"
+        ),
+        worker_kind=string_field(raw.get("worker_kind"), "lane.worker_kind"),
+        validation_argv=tuple(validation_argv),
+        completion_contract=string_field(
+            raw.get("completion_contract"), "lane.completion_contract"
+        ),
+        known_limitations=tuple(limitations),
+    )
 
 
 def register_pm_capabilities(ctx) -> None:
@@ -179,6 +353,77 @@ def register_pm_capabilities(ctx) -> None:
             }
         return None
 
+    def handle_pm_dispatch(
+        arguments: dict[str, Any],
+        *,
+        session_id: str | None = None,
+        **_kwargs: Any,
+    ) -> str:
+        identity = GovernanceRequestIdentity(
+            profile_name=registered_profile,
+            session_id=str(session_id or ""),
+        )
+        try:
+            application = application_for_pm_request(
+                registered_profile, session_id=str(session_id or "")
+            )
+            lane = _delivery_lane(arguments.get("lane"))
+            action = arguments.get("action")
+            if action == "dispatch":
+                result = application.dispatch_pm_delivery_lane(
+                    request_identity=identity,
+                    lane=lane,
+                )
+            elif action == "collect":
+                result = application.collect_pm_delivery_lane(
+                    request_identity=identity,
+                    lane=lane,
+                )
+            else:
+                raise ValueError("action must be dispatch or collect")
+            return json.dumps(result, ensure_ascii=False, sort_keys=True)
+        except (
+            GovernanceAuthorizationError,
+            PMReportConflict,
+            StaleProjectionError,
+            CommissioningPrerequisiteError,
+            CoordinatorRuntimeError,
+        ) as error:
+            return json.dumps({"error": error.as_dict()}, sort_keys=True)
+        except TrackerPMReportConfirmationError as error:
+            return json.dumps(
+                {
+                    "error": {
+                        "type": "tracker_confirmation_error",
+                        "reason": str(error),
+                        "retryable": True,
+                    }
+                },
+                sort_keys=True,
+            )
+        except TrackerError as error:
+            return json.dumps(
+                {
+                    "error": {
+                        "type": "tracker_error",
+                        "reason": str(error),
+                        "retryable": True,
+                    }
+                },
+                sort_keys=True,
+            )
+        except (MapBindingError, RuntimeError, TypeError, ValueError) as error:
+            return json.dumps(
+                {
+                    "error": {
+                        "type": "invalid_request",
+                        "reason": str(error),
+                        "retryable": False,
+                    }
+                },
+                sort_keys=True,
+            )
+
     ctx.register_skill(
         "pm",
         PM_SKILL,
@@ -191,5 +436,13 @@ def register_pm_capabilities(ctx) -> None:
         handler=handle_pm_tool,
         description=PM_TOOL_SCHEMA["description"],
         emoji="📍",
+    )
+    ctx.register_tool(
+        name=PM_DISPATCH_TOOL_SCHEMA["name"],
+        toolset=PM_TOOLSET,
+        schema=PM_DISPATCH_TOOL_SCHEMA,
+        handler=handle_pm_dispatch,
+        description=PM_DISPATCH_TOOL_SCHEMA["description"],
+        emoji="🚚",
     )
     ctx.register_hook("pre_tool_call", enforce_pm_toolset)

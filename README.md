@@ -22,8 +22,15 @@ timestamp 的结构化决策写入 Map Issue comment。插件还独立注册 `ma
 Skill 与 `map-governance-pm` toolset。PM request 只能使用持久 assignment 解析其 Map，
 并可提交 checkpoint、question、blocker、acceptance evidence 和 terminal failure；真实
 PM contract 固定 `dispatch_runtime: herdr`。显式 commission 会在 plugin-owned Herdr
-session 中创建或恢复该 Map 唯一的 workspace 与 root Hermes PM；worker dispatch 仍由
-后续交付阶段负责。
+session 中创建或恢复该 Map 唯一的 workspace 与 root Hermes PM。`delivery-pipeline`
+准备一张 ticket 的 Map Integration / Execution Worktree 与 durable lane registry 后，PM 通过
+bounded `map_governance_pm_dispatch` bridge 派发一个 configured Codex worker；下一次
+coordinator turn 使用 byte-identical lane payload 收集一个本地 commit、幂等 cherry-pick、运行
+declared focused validation，并写入 blocker 或 acceptance recommendation。启动 worker 前会把
+Herdr 坐标写入 implementation ticket 的 `wayfinder-lane-registry:v1` created checkpoint 并 readback；
+确认 prompt handoff 后写入 running，fan-in 再依次 readback blocked 或 terminal / integrated
+checkpoint。该链路不会 push、创建
+PR、merge、release、关闭 Issue 或清理 lane。
 新建或既有 canonical lineage 都会在当前 live continuation 幂等加载完整 CEO Skill user
 turn，因此从 #6 升级和 context compression 后仍保留同一 negative-capability 边界。
 CEO 还可提交内容绑定的 chairman approval packet；Dashboard Map detail 只提供显式
@@ -205,6 +212,31 @@ PM assignment 固定绑定 request-scoped profile/session 与一个 Map，不读
 重启后可安全 resume。acceptance outcome evidence 可出现在 Map detail，但 worker checks、
 commands 与 lane activity 仍只属于 delivery artifacts。该 seam 不创建 implementation card，也不保存 pane、
 worktree、lane 或 worker log。
+
+一个 delivery turn 只接受 `delivery-pipeline/herdr-implementation-v1` 的单 lane contract：
+implementation ticket、resolved `implement` owner、Map Integration Worktree、独立 Execution
+Worktree、Base commit、configured Codex worker kind、固定 validation argv 与
+`one-local-commit-integrated-and-validated` completion contract。dispatch readback 后 PM 立即 idle；
+terminal evidence 唤醒的后续 turn 才 collect。collect 前会比较 byte-stable dispatch identity，拒绝
+payload drift；ticket 必须有 implementation label、精确 Spec `Parent` 回链，且 `Blocked by` 依赖均已
+closed。Git 必须证明同一 repo、两个 clean registered worktrees、exact branches 与一个 child
+commit，而且 common Git dir 必须属于 configured Map repository。worker terminal 时做一次 bounded
+Herdr final-report read，从有界 transcript 中只解析并核对最后一个完整 report 的 successful status、
+commit、checks、review、dirty state 与 touched files 后保存 digest；final-report transport 缺失、截断
+或字段不完整时，只允许从 tracker registry 加 exact Git 证据恢复，明确的 failed/blocker/negative
+evidence 则 fail closed。Map-local integration 从
+Base 到 HEAD 只允许这一张 lane patch，validation 后再次验证 HEAD
+未改变且 clean；
+任何重叠写入或 check side effect 都 fail closed。成功只把 sanitized outcome-level evidence、
+limitations 与 acceptance recommendation 写到 Map；board 不呈现 ticket、pane、worktree、commit 或
+check command。缺少 plugin-supported Codex Herdr route 时，在任何 lane mutation 前写入
+明确 whole-Map blocker。worker blocker 的原始安全摘要只持久化到 ticket registry，Map PM blocker report
+始终使用不含 lane detail 的高管摘要；只在 Map 经治理流程回到 delivery 后才允许向同一 worker
+发送有界 resume prompt。resume 必须重新核对同一 registry、
+Herdr pane occupants 与 Git ownership，并在 `blocked -> running` 时清除旧 blocker receipt。
+当前证明的 execution worker 仅为 Codex CLI，registry 使用 delivery-pipeline canonical
+`bootstrap_authority: none`；Claude-only routing 会明确要求改选 Codex/mixed 并验证 Codex integration，
+不会宣称已执行 Claude workspace-trust/import bootstrap。
 
 Commissioning 使用稳定、冲突安全的 plugin lifecycle namespace。任何同名但缺少本地
 ownership proof 的 Herdr session 或 workspace 都会返回 `repair_required`，不会 attach、删除

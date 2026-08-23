@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Callable, NoReturn, cast
+from typing import Any, Callable, Mapping, NoReturn, cast
 
 from .approvals import (
     APPROVAL_DECISIONS,
@@ -65,10 +66,17 @@ from .sessions import (
 )
 from .reports import PMReport, PMReportDraft, TrackerPMReportRecord
 from .coordinator import (
+    DELIVERY_TRANSPORT_RECOVERY_LIMITATION,
     CommissioningAuthorizationError,
+    CommissioningPrerequisiteError,
     CommissioningPrerequisiteResolver,
     CoordinatorRuntimeBoundary,
+    DeliveryLaneRegistry,
+    DeliveryLaneSpec,
+    DeliveryRuntimeRequest,
     RootRuntimeRequest,
+    delivery_dispatch_id,
+    validate_delivery_lane_registry,
 )
 from .tracker import (
     GitHubTrackerAdapter,
@@ -1426,6 +1434,835 @@ class MapGovernanceApplication:
                     ),
                     "idempotent": idempotent,
                 }
+
+    def dispatch_pm_delivery_lane(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+        lane: DeliveryLaneSpec,
+    ) -> dict[str, Any]:
+        """Hand one delivery-pipeline lane to the bounded Herdr runtime."""
+        assignment = self._storage.pm_assignment_for_request(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+        )
+        if assignment is None:
+            self._deny_governance_request(
+                map_id="unassigned",
+                action="pm:dispatch_lane",
+                request_identity=request_identity,
+                reason="pm_assignment_missing",
+            )
+        map_id = str(assignment["map_id"])
+        self._ensure_map_writable(map_id=map_id)
+        if assignment["state"] != "active" or not assignment.get("active_turn_id"):
+            raise ValueError("PM delivery dispatch requires an active coordinator turn")
+        if (
+            self._commissioning_prerequisites is None
+            or self._coordinator_runtime is None
+        ):
+            raise RuntimeError("PM delivery runtime is not configured")
+        binding = self._storage.map_binding(map_id)
+        if binding is None:  # pragma: no cover - assignment references a bound Map
+            raise MapBindingError(f"Map is not bound: {map_id}")
+        issue = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.get_issue(str(binding["issue_url"])),
+        )
+        if issue.id != map_id or self._executive_stage(issue) != "delivery":
+            raise ValueError("PM delivery dispatch requires a Map in delivery")
+        try:
+            context = self._commissioning_prerequisites.commissioning_context(
+                project_id=str(binding["project_id"]),
+                repository=issue.repository,
+            )
+            ticket = self._delivery_ticket(
+                project_id=str(binding["project_id"]),
+                lane=lane,
+                map_issue=issue,
+            )
+            runtime_request = DeliveryRuntimeRequest(
+                map_id=map_id,
+                map_url=issue.url,
+                context=context,
+                lane=lane,
+                registry_timestamp=str(assignment["updated_at"]),
+            )
+            existing_registry = self._latest_delivery_lane_registry(
+                project_id=str(binding["project_id"]),
+                ticket_url=lane.ticket_url,
+                lane=lane,
+            )
+            if existing_registry is None:
+                prepared = self._coordinator_runtime.prepare_lane(runtime_request)
+                self._validate_delivery_prepare_outcome(
+                    outcome=prepared,
+                    request=runtime_request,
+                )
+                existing_registry = DeliveryLaneRegistry.from_payload(
+                    prepared.get("registry", {})
+                )
+                self._validate_application_lane_registry(
+                    lane=lane,
+                    registry=existing_registry,
+                    allowed_states={"created"},
+                )
+                self._confirm_delivery_lane_registry(
+                    project_id=str(binding["project_id"]),
+                    ticket=ticket,
+                    lane=lane,
+                    registry=existing_registry,
+                )
+            else:
+                self._validate_application_lane_registry(
+                    lane=lane,
+                    registry=existing_registry,
+                    allowed_states={"created", "running", "blocked"},
+                )
+            runtime_request = replace(runtime_request, registry=existing_registry)
+            outcome = self._coordinator_runtime.dispatch_lane(runtime_request)
+            self._validate_delivery_dispatch_outcome(
+                outcome=outcome,
+                request=runtime_request,
+            )
+            registry = DeliveryLaneRegistry.from_payload(outcome.get("registry", {}))
+            self._validate_application_lane_registry(
+                lane=lane,
+                registry=registry,
+                allowed_states={"running"},
+            )
+            self._confirm_delivery_lane_registry(
+                project_id=str(binding["project_id"]),
+                ticket=ticket,
+                lane=lane,
+                registry=registry,
+            )
+        except CommissioningPrerequisiteError as error:
+            record_id = (
+                "delivery-blocked-"
+                + hashlib.sha256(
+                    (
+                        f"{lane.lane_id}:{error.reason}:{assignment['active_turn_id']}"
+                    ).encode()
+                ).hexdigest()[:32]
+            )
+            missing_worker = error.reason in {
+                "supported_worker_integration_missing",
+                "supported_worker_routing_missing",
+            }
+            report_result = self.report_pm(
+                request_identity=request_identity,
+                report=PMReportDraft(
+                    record_id=record_id,
+                    report_type="blocker",
+                    summary=(
+                        "Delivery is blocked because no plugin-supported Codex Herdr "
+                        "route is configured and verified."
+                        if missing_worker
+                        else "Delivery is blocked by an unmet commissioning prerequisite."
+                    ),
+                    timestamp=str(assignment["updated_at"]),
+                    blocking=True,
+                    continuation_requirement=(
+                        "Select Codex or mixed routing and verify the Codex Herdr "
+                        "integration."
+                        if missing_worker
+                        else "Repair the failed commissioning prerequisite and rerun verification."
+                    ),
+                ),
+            )
+            return {
+                "state": "blocked",
+                "blocker": error.as_dict(),
+                **report_result,
+            }
+        completion = self.complete_pm_dispatch(
+            map_id=map_id,
+            request_identity=request_identity,
+            coordinator_id=str(assignment["coordinator_id"]),
+            turn_id=str(assignment["active_turn_id"]),
+            dispatch_id=str(outcome["dispatch_id"]),
+        )
+        return {**outcome, **completion}
+
+    def collect_pm_delivery_lane(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+        lane: DeliveryLaneSpec,
+    ) -> dict[str, Any]:
+        """Integrate one terminal lane and submit executive acceptance evidence."""
+        assignment = self._storage.pm_assignment_for_request(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+        )
+        if assignment is None:
+            self._deny_governance_request(
+                map_id="unassigned",
+                action="pm:collect_lane",
+                request_identity=request_identity,
+                reason="pm_assignment_missing",
+            )
+        map_id = str(assignment["map_id"])
+        self._ensure_map_writable(map_id=map_id)
+        if assignment["state"] != "active" or not assignment.get("active_turn_id"):
+            raise ValueError(
+                "PM delivery collection requires an active coordinator turn"
+            )
+        if assignment.get("last_outcome") != "dispatch" or not assignment.get(
+            "last_outcome_id"
+        ):
+            raise ValueError("PM delivery collection has no confirmed dispatch handoff")
+        if (
+            self._commissioning_prerequisites is None
+            or self._coordinator_runtime is None
+        ):
+            raise RuntimeError("PM delivery runtime is not configured")
+        binding = self._storage.map_binding(map_id)
+        if binding is None:  # pragma: no cover - assignment references a bound Map
+            raise MapBindingError(f"Map is not bound: {map_id}")
+        issue = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.get_issue(str(binding["issue_url"])),
+        )
+        if issue.id != map_id or self._executive_stage(issue) != "delivery":
+            raise ValueError("PM delivery collection requires a Map in delivery")
+        context = self._commissioning_prerequisites.commissioning_context(
+            project_id=str(binding["project_id"]),
+            repository=issue.repository,
+        )
+        runtime_request = DeliveryRuntimeRequest(
+            map_id=map_id,
+            map_url=issue.url,
+            context=context,
+            lane=lane,
+            registry_timestamp=str(assignment["updated_at"]),
+        )
+        if delivery_dispatch_id(runtime_request) != assignment.get("last_outcome_id"):
+            raise ValueError(
+                "Collected delivery lane does not match the dispatch handoff"
+            )
+        ticket = self._delivery_ticket(
+            project_id=str(binding["project_id"]),
+            lane=lane,
+            map_issue=issue,
+        )
+        registry = self._latest_delivery_lane_registry(
+            project_id=str(binding["project_id"]),
+            ticket_url=lane.ticket_url,
+            lane=lane,
+        )
+        if registry is None:
+            raise RuntimeError("Delivery lane registry readback is missing")
+        self._validate_application_lane_registry(
+            lane=lane,
+            registry=registry,
+            allowed_states={"running", "blocked", "terminal", "integrated"},
+        )
+        runtime_request = replace(runtime_request, registry=registry)
+        outcome = self._coordinator_runtime.collect_lane(runtime_request)
+        if outcome.get("state") == "blocked":
+            if outcome.get("dispatch_id") != assignment.get("last_outcome_id"):
+                raise ValueError(
+                    "Collected delivery lane does not match the dispatch handoff"
+                )
+            blocked_registry = DeliveryLaneRegistry.from_payload(
+                outcome.get("blocked_registry", {})
+            )
+            self._validate_application_lane_registry(
+                lane=lane,
+                registry=blocked_registry,
+                allowed_states={"blocked"},
+            )
+            self._validate_blocked_delivery_outcome(
+                outcome=outcome,
+                request=runtime_request,
+                blocked_registry=blocked_registry,
+            )
+            report_summary, continuation_requirement = (
+                self._delivery_blocker_report_text()
+            )
+            self._confirm_delivery_lane_registry(
+                project_id=str(binding["project_id"]),
+                ticket=ticket,
+                lane=lane,
+                registry=blocked_registry,
+            )
+            report_result = self.report_pm(
+                request_identity=request_identity,
+                report=PMReportDraft(
+                    record_id=(
+                        "delivery-worker-blocked-"
+                        + hashlib.sha256(
+                            (
+                                f"{outcome['dispatch_id']}:"
+                                f"{assignment['active_turn_id']}"
+                            ).encode()
+                        ).hexdigest()[:32]
+                    ),
+                    report_type="blocker",
+                    summary=report_summary,
+                    timestamp=str(assignment["updated_at"]),
+                    blocking=True,
+                    continuation_requirement=continuation_requirement,
+                ),
+            )
+            return {**outcome, **report_result}
+        if outcome.get("state") != "locally_validated":
+            raise RuntimeError("Delivery lane did not reach local validation")
+        if outcome.get("dispatch_id") != assignment.get("last_outcome_id"):
+            raise ValueError(
+                "Collected delivery lane does not match the dispatch handoff"
+            )
+        terminal_registry = DeliveryLaneRegistry.from_payload(
+            outcome.get("terminal_registry", {})
+        )
+        integrated_registry = DeliveryLaneRegistry.from_payload(
+            outcome.get("integrated_registry", {})
+        )
+        self._validate_application_lane_registry(
+            lane=lane,
+            registry=terminal_registry,
+            allowed_states={"terminal"},
+        )
+        self._validate_application_lane_registry(
+            lane=lane,
+            registry=integrated_registry,
+            allowed_states={"integrated"},
+        )
+        self._validate_local_delivery_outcome(
+            outcome=outcome,
+            request=runtime_request,
+            source_registry=registry,
+            terminal_registry=terminal_registry,
+            integrated_registry=integrated_registry,
+        )
+        if registry.state != "integrated":
+            if registry.state == "running":
+                self._confirm_delivery_lane_registry(
+                    project_id=str(binding["project_id"]),
+                    ticket=ticket,
+                    lane=lane,
+                    registry=terminal_registry,
+                )
+            self._confirm_delivery_lane_registry(
+                project_id=str(binding["project_id"]),
+                ticket=ticket,
+                lane=lane,
+                registry=integrated_registry,
+            )
+        dispatch_id = str(outcome["dispatch_id"])
+        record_id = (
+            "delivery-acceptance-"
+            + hashlib.sha256(dispatch_id.encode()).hexdigest()[:32]
+        )
+        evidence = self._delivery_acceptance_evidence(outcome=outcome, lane=lane)
+        report_result = self.report_pm(
+            request_identity=request_identity,
+            report=PMReportDraft(
+                record_id=record_id,
+                report_type="acceptance",
+                summary="Local delivery is validated and ready for acceptance review.",
+                timestamp=str(assignment["updated_at"]),
+                evidence=evidence,
+            ),
+        )
+        return {
+            **outcome,
+            "integration_idempotent": bool(outcome.get("idempotent")),
+            **report_result,
+        }
+
+    def _delivery_ticket(
+        self,
+        *,
+        project_id: str,
+        lane: DeliveryLaneSpec,
+        map_issue: TrackerIssue,
+    ) -> TrackerIssue:
+        ticket = self._tracker_read(
+            project_id=project_id,
+            operation=lambda: self._tracker.get_issue(lane.ticket_url),
+        )
+        if (
+            ticket.id != lane.ticket_id
+            or ticket.repository != map_issue.repository
+            or ticket.url != lane.ticket_url
+            or ticket.title != lane.ticket_title
+            or ticket.state != "open"
+            or "implementation" not in ticket.labels
+            or lane.lane_id != f"implementation-{ticket.number}"
+            or lane.integration_branch != f"feature/map-{map_issue.number}"
+            or lane.execution_branch != f"{lane.worker_kind}/issue-{ticket.number}"
+        ):
+            raise ValueError("Delivery ticket does not match tracker authority")
+        parent_spec = self._tracker_read(
+            project_id=project_id,
+            operation=lambda: self._tracker.get_issue(lane.parent_spec_url),
+        )
+        if (
+            parent_spec.repository != map_issue.repository
+            or parent_spec.url != lane.parent_spec_url
+            or parent_spec.url in {map_issue.url, ticket.url}
+            or "spec" not in parent_spec.labels
+        ):
+            raise ValueError("Delivery parent Spec does not match tracker authority")
+        parent_declaration = self._delivery_ticket_field(ticket.body, "Parent")
+        if (
+            re.fullmatch(
+                rf"(?:[-*]\s*)?{re.escape(lane.parent_spec_url)}",
+                parent_declaration,
+            )
+            is None
+        ):
+            raise ValueError("Delivery ticket does not link its declared parent Spec")
+        blocked_by = self._delivery_ticket_field(ticket.body, "Blocked by")
+        no_dependencies = re.fullmatch(
+            r"(?is)(?:[-*]\s*)?none(?:\s*-\s*can start immediately)?[.\s]*",
+            blocked_by,
+        )
+        if no_dependencies is None:
+            dependency_urls = self._delivery_dependency_urls(
+                blocked_by,
+                repository=map_issue.repository,
+            )
+            if not dependency_urls:
+                raise ValueError("Delivery ticket dependency declaration is invalid")
+            for dependency_url in dependency_urls:
+                dependency = self._tracker_read(
+                    project_id=project_id,
+                    operation=lambda url=dependency_url: self._tracker.get_issue(url),
+                )
+                if (
+                    dependency.repository != map_issue.repository
+                    or dependency.url != dependency_url
+                    or dependency.state != "closed"
+                ):
+                    raise ValueError("Delivery ticket is not independently grabbable")
+        return ticket
+
+    @staticmethod
+    def _delivery_ticket_field(body: str, field: str) -> str:
+        declarations = [
+            match.group(1).strip()
+            for match in re.finditer(
+                rf"(?ims)^##\s+{re.escape(field)}\s*$\s*(.*?)(?=^##\s+|\Z)",
+                body,
+            )
+            if match.group(1).strip()
+        ]
+        declarations.extend(
+            match.group(1).strip()
+            for match in re.finditer(
+                rf"(?im)^\*\*{re.escape(field)}:\*\*\s*(.+?)\s*$",
+                body,
+            )
+            if match.group(1).strip()
+        )
+        if len(declarations) == 1:
+            return declarations[0]
+        if len(declarations) > 1:
+            raise ValueError(f"Delivery ticket has multiple {field} declarations")
+        raise ValueError(f"Delivery ticket is missing its {field} declaration")
+
+    @staticmethod
+    def _validate_delivery_prepare_outcome(
+        *,
+        outcome: Mapping[str, Any],
+        request: DeliveryRuntimeRequest,
+    ) -> None:
+        if (
+            not isinstance(outcome, Mapping)
+            or outcome.get("state") != "prepared"
+            or outcome.get("map_id") != request.map_id
+            or outcome.get("dispatch_id") != delivery_dispatch_id(request)
+            or outcome.get("worker_kind") != request.lane.worker_kind
+            or outcome.get("remote_actions") != "forbidden"
+        ):
+            raise RuntimeError("Herdr did not confirm lane preparation")
+
+    @staticmethod
+    def _validate_delivery_dispatch_outcome(
+        *,
+        outcome: Mapping[str, Any],
+        request: DeliveryRuntimeRequest,
+    ) -> None:
+        lane = request.lane
+        if (
+            not isinstance(outcome, Mapping)
+            or outcome.get("state") != "dispatched"
+            or outcome.get("map_id") != request.map_id
+            or outcome.get("dispatch_id") != delivery_dispatch_id(request)
+            or outcome.get("worker_kind") != lane.worker_kind
+            or outcome.get("completion_contract") != lane.completion_contract
+            or outcome.get("remote_actions") != "forbidden"
+        ):
+            raise RuntimeError("Herdr did not confirm the delivery dispatch boundary")
+
+    @staticmethod
+    def _validate_blocked_delivery_outcome(
+        *,
+        outcome: Mapping[str, Any],
+        request: DeliveryRuntimeRequest,
+        blocked_registry: DeliveryLaneRegistry,
+    ) -> None:
+        expected_blocker = {
+            "reason": "worker_reported_blocker",
+            "retryable": True,
+            "summary": blocked_registry.blocker_summary,
+        }
+        if (
+            outcome.get("state") != "blocked"
+            or outcome.get("map_id") != request.map_id
+            or outcome.get("dispatch_id") != delivery_dispatch_id(request)
+            or outcome.get("worker_kind") != request.lane.worker_kind
+            or outcome.get("remote_actions") != "forbidden"
+            or outcome.get("blocker") != expected_blocker
+        ):
+            raise RuntimeError("Worker blocker evidence does not match the registry")
+
+    @staticmethod
+    def _validate_local_delivery_outcome(
+        *,
+        outcome: Mapping[str, Any],
+        request: DeliveryRuntimeRequest,
+        source_registry: DeliveryLaneRegistry,
+        terminal_registry: DeliveryLaneRegistry,
+        integrated_registry: DeliveryLaneRegistry,
+    ) -> None:
+        lane = request.lane
+        evidence = outcome.get("evidence")
+        final_report = (
+            evidence.get("final_report") if isinstance(evidence, Mapping) else None
+        )
+        execution_commit = (
+            evidence.get("execution_commit") if isinstance(evidence, Mapping) else None
+        )
+        integration_commit = (
+            evidence.get("integration_commit")
+            if isinstance(evidence, Mapping)
+            else None
+        )
+        allowed_report_statuses = {
+            "confirmed",
+            "recovered_from_git",
+            "recovered_from_terminal_registry",
+        }
+        report_status = (
+            final_report.get("status") if isinstance(final_report, Mapping) else None
+        )
+        report_digest = (
+            final_report.get("digest") if isinstance(final_report, Mapping) else None
+        )
+        expected_integrated = replace(
+            terminal_registry,
+            state="integrated",
+            integrated_commit=integrated_registry.integrated_commit,
+        )
+        registry_evidence_matches = (
+            report_status in {"confirmed", "recovered_from_terminal_registry"}
+            and terminal_registry.evidence_source == "herdr-final-report"
+            and report_digest == terminal_registry.final_report_digest
+        ) or (
+            report_status == "recovered_from_git"
+            and terminal_registry.evidence_source == "registry-git-recovery"
+            and report_digest is None
+            and terminal_registry.final_report_digest is None
+        )
+        if (
+            outcome.get("map_id") != request.map_id
+            or outcome.get("dispatch_id") != delivery_dispatch_id(request)
+            or outcome.get("worker_kind") != lane.worker_kind
+            or outcome.get("remote_actions") != "forbidden"
+            or outcome.get("acceptance_recommendation") != "accept"
+            or not isinstance(evidence, Mapping)
+            or not isinstance(execution_commit, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", execution_commit)
+            or execution_commit != terminal_registry.head_commit
+            or execution_commit != integrated_registry.head_commit
+            or not isinstance(integration_commit, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", integration_commit)
+            or integration_commit != integrated_registry.integrated_commit
+            or evidence.get("validation") != "passed"
+            or evidence.get("completion_contract") != "satisfied"
+            or not isinstance(final_report, Mapping)
+            or report_status not in allowed_report_statuses
+            or integrated_registry != expected_integrated
+            or not registry_evidence_matches
+            or (
+                source_registry.state == "terminal"
+                and terminal_registry != source_registry
+            )
+            or (
+                source_registry.state == "integrated"
+                and integrated_registry != source_registry
+            )
+        ):
+            raise RuntimeError(
+                "Herdr delivery evidence did not confirm local acceptance readiness"
+            )
+
+    @staticmethod
+    def _delivery_dependency_urls(value: str, *, repository: str) -> tuple[str, ...]:
+        issue_prefix = f"https://github.com/{repository}/issues/"
+        absolute_pattern = re.compile(
+            r"https://github\.com/([^/\s]+)/([^/\s]+)/issues/([1-9][0-9]*)\b"
+        )
+        absolute = absolute_pattern.findall(value)
+        if any(f"{owner}/{name}" != repository for owner, name, _number in absolute):
+            raise ValueError("Delivery ticket dependency is outside the Map repository")
+        numbers = [number for _owner, _name, number in absolute]
+        remainder = absolute_pattern.sub("", value)
+        shorthand = re.findall(r"(?<![\w/])#([1-9][0-9]*)\b", remainder)
+        numbers.extend(shorthand)
+        remainder = re.sub(r"(?<![\w/])#[1-9][0-9]*\b", "", remainder)
+        if not numbers and re.fullmatch(r"[\s,;*\-0-9]+", remainder):
+            bare = re.findall(r"\b([1-9][0-9]*)\b", remainder)
+            numbers.extend(bare)
+            remainder = re.sub(r"\b[1-9][0-9]*\b", "", remainder)
+        if re.sub(r"[\s,;*\-]+", "", remainder):
+            raise ValueError("Delivery ticket dependency declaration is invalid")
+        return tuple(dict.fromkeys(f"{issue_prefix}{number}" for number in numbers))
+
+    def _latest_delivery_lane_registry(
+        self,
+        *,
+        project_id: str,
+        ticket_url: str,
+        lane: DeliveryLaneSpec,
+    ) -> DeliveryLaneRegistry | None:
+        records = self._tracker_read(
+            project_id=project_id,
+            operation=lambda: self._tracker.list_delivery_lane_registries(ticket_url),
+        )
+        conflicting = [
+            record.registry
+            for record in records
+            if record.registry.lane_id != lane.lane_id
+        ]
+        if conflicting:
+            raise RuntimeError(
+                "Another active delivery lane already owns this implementation ticket"
+            )
+        matching = [
+            record.registry
+            for record in records
+            if record.registry.lane_id == lane.lane_id
+        ]
+        if not matching:
+            return None
+        immutable_fields = (
+            "work_item",
+            "role",
+            "lane_id",
+            "runtime",
+            "workspace_id",
+            "tab_id",
+            "pane_id",
+            "herdr_session_name",
+            "herdr_session_owned",
+            "bootstrap_authority",
+            "agent_permission_mode",
+            "worktree",
+            "branch",
+            "base_commit",
+        )
+        allowed_transitions = {
+            ("created", "running"),
+            ("blocked", "running"),
+            ("running", "blocked"),
+            ("running", "terminal"),
+            ("terminal", "integrated"),
+        }
+        try:
+            for registry in matching:
+                validate_delivery_lane_registry(
+                    lane=lane,
+                    registry=registry,
+                    allowed_states={
+                        "created",
+                        "running",
+                        "blocked",
+                        "terminal",
+                        "integrated",
+                    },
+                )
+        except ValueError as error:
+            raise RuntimeError(
+                "Delivery lane registry history conflicts with tracker truth"
+            ) from error
+        if matching[0].state != "created":
+            raise RuntimeError(
+                "Delivery lane registry history conflicts with tracker truth"
+            )
+        for index in range(1, len(matching)):
+            previous = matching[index - 1]
+            registry = matching[index]
+            if registry == previous:
+                continue
+            if (
+                any(
+                    getattr(previous, field) != getattr(registry, field)
+                    for field in immutable_fields
+                )
+                or (previous.state, registry.state) not in allowed_transitions
+            ):
+                raise RuntimeError(
+                    "Delivery lane registry history conflicts with tracker truth"
+                )
+            if previous.state == "terminal" and (
+                registry.head_commit != previous.head_commit
+                or registry.evidence_source != previous.evidence_source
+                or registry.final_report_digest != previous.final_report_digest
+            ):
+                raise RuntimeError(
+                    "Delivery lane registry history conflicts with tracker truth"
+                )
+        return matching[-1]
+
+    @staticmethod
+    def _validate_application_lane_registry(
+        *,
+        lane: DeliveryLaneSpec,
+        registry: DeliveryLaneRegistry,
+        allowed_states: set[str],
+    ) -> None:
+        try:
+            validate_delivery_lane_registry(
+                lane=lane,
+                registry=registry,
+                allowed_states=allowed_states,
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                "Delivery lane registry conflicts with the lane contract"
+            ) from error
+
+    def _confirm_delivery_lane_registry(
+        self,
+        *,
+        project_id: str,
+        ticket: TrackerIssue,
+        lane: DeliveryLaneSpec,
+        registry: DeliveryLaneRegistry,
+    ) -> None:
+        latest = self._latest_delivery_lane_registry(
+            project_id=project_id,
+            ticket_url=ticket.url,
+            lane=lane,
+        )
+        if latest == registry:
+            return
+        immutable_fields = (
+            "work_item",
+            "role",
+            "lane_id",
+            "runtime",
+            "workspace_id",
+            "tab_id",
+            "pane_id",
+            "herdr_session_name",
+            "herdr_session_owned",
+            "bootstrap_authority",
+            "agent_permission_mode",
+            "worktree",
+            "branch",
+            "base_commit",
+        )
+        if latest is not None and any(
+            getattr(latest, field) != getattr(registry, field)
+            for field in immutable_fields
+        ):
+            raise RuntimeError(
+                "Delivery lane registry transition conflicts with tracker truth"
+            )
+        allowed_transition = (latest is None and registry.state == "created") or (
+            latest is not None
+            and (latest.state, registry.state)
+            in {
+                ("created", "running"),
+                ("blocked", "running"),
+                ("running", "blocked"),
+                ("running", "terminal"),
+                ("terminal", "integrated"),
+            }
+        )
+        if not allowed_transition:
+            raise RuntimeError(
+                "Delivery lane registry transition conflicts with tracker truth"
+            )
+        self._tracker_read(
+            project_id=project_id,
+            operation=lambda: self._tracker.append_delivery_lane_registry(
+                ticket.url,
+                issue_id=ticket.id,
+                registry=registry,
+            ),
+        )
+        readback = self._latest_delivery_lane_registry(
+            project_id=project_id,
+            ticket_url=ticket.url,
+            lane=lane,
+        )
+        if readback != registry:
+            raise TrackerError(
+                "Delivery lane registry readback did not match the write"
+            )
+
+    @staticmethod
+    def _delivery_blocker_report_text() -> tuple[str, str]:
+        return (
+            "Delivery is blocked; implementation details remain in the delivery ticket.",
+            "Resolve the recorded implementation blocker in the delivery ticket before requesting acceptance.",
+        )
+
+    @staticmethod
+    def _delivery_acceptance_evidence(
+        *,
+        outcome: Mapping[str, Any],
+        lane: DeliveryLaneSpec,
+    ) -> tuple[str, ...]:
+        evidence = [
+            "One independently owned implementation outcome is integrated in the Map-local workspace.",
+            "The declared focused validation and completion contract passed.",
+        ]
+        forbidden = {
+            lane.lane_id,
+            lane.ticket_id,
+            lane.ticket_title,
+            lane.ticket_url,
+            lane.integration_worktree,
+            lane.integration_branch,
+            lane.execution_worktree,
+            lane.execution_branch,
+            lane.base_commit,
+        }
+        final_report = outcome.get("evidence", {}).get("final_report", {})
+        limitations = [*lane.known_limitations]
+        if final_report.get("status") == "recovered_from_git":
+            limitations.append(DELIVERY_TRANSPORT_RECOVERY_LIMITATION)
+        limitations.append(
+            "Push, PR, merge, release, and Issue closure were not performed."
+        )
+        for item in dict.fromkeys(limitations):
+            normalized = " ".join(item.split())[:500]
+            if (
+                not normalized
+                or any(value and value in normalized for value in forbidden)
+                or re.search(r"\b[0-9a-f]{40}\b", normalized)
+                or "https://" in normalized
+            ):
+                normalized = (
+                    "Additional implementation detail remains in the delivery ticket."
+                )
+            evidence.append(f"Known limitation: {normalized}")
+        recommendation = outcome.get("acceptance_recommendation")
+        if recommendation not in {"accept", "hold"}:
+            raise RuntimeError("Delivery acceptance recommendation is invalid")
+        evidence.append(
+            f"Acceptance recommendation: {recommendation} the locally validated outcome."
+        )
+        return tuple(dict.fromkeys(evidence))
 
     def report_pm(
         self,

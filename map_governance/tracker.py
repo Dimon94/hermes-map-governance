@@ -9,7 +9,10 @@ from datetime import datetime
 from typing import Any, Callable, Mapping, Protocol, Sequence, TypeVar
 from urllib.parse import urlparse
 
+import yaml
+
 from .approvals import ApprovalHistoryEvent, normalized_json
+from .coordinator import DeliveryLaneRegistry
 from .reports import PMReport, TrackerPMReportRecord
 from .stages import ACTIVE_STAGES, executive_stage
 
@@ -53,6 +56,7 @@ class TrackerIssue:
     state: str
     state_reason: str | None
     labels: tuple[str, ...]
+    body: str = ""
 
 
 @dataclass(frozen=True)
@@ -138,6 +142,15 @@ class TrackerApprovalRecord:
     tracker_record_url: str
 
 
+@dataclass(frozen=True)
+class TrackerDeliveryLaneRegistryRecord:
+    """One delivery-pipeline registry checkpoint read from ticket history."""
+
+    registry: DeliveryLaneRegistry
+    tracker_record_id: str
+    tracker_record_url: str
+
+
 class TrackerAdapter(Protocol):
     def get_project(self, url: str) -> TrackerProject: ...
 
@@ -180,6 +193,18 @@ class TrackerAdapter(Protocol):
         issue_id: str,
         report: PMReport,
     ) -> TrackerPMReportRecord: ...
+
+    def list_delivery_lane_registries(
+        self, url: str
+    ) -> list[TrackerDeliveryLaneRegistryRecord]: ...
+
+    def append_delivery_lane_registry(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        registry: DeliveryLaneRegistry,
+    ) -> TrackerDeliveryLaneRegistryRecord: ...
 
 
 class CommandRunner(Protocol):
@@ -239,6 +264,7 @@ query MapGovernanceIssue($url: URI!) {
       id
       number
       title
+      body
       url
       state
       stateReason
@@ -306,6 +332,12 @@ _APPEND_PM_REPORT_MUTATION = _APPEND_DECISION_MUTATION.replace(
 )
 
 
+_APPEND_DELIVERY_LANE_MUTATION = _APPEND_DECISION_MUTATION.replace(
+    "MapGovernanceAppendDecision",
+    "MapGovernanceAppendDeliveryLaneRegistry",
+)
+
+
 _DECISION_HISTORY_QUERY = """
 query MapGovernanceDecisionHistory($url: URI!, $after: String) {
   resource(url: $url) {
@@ -334,12 +366,19 @@ _PM_REPORT_HISTORY_QUERY = _DECISION_HISTORY_QUERY.replace(
 )
 
 
+_DELIVERY_LANE_HISTORY_QUERY = _DECISION_HISTORY_QUERY.replace(
+    "MapGovernanceDecisionHistory",
+    "MapGovernanceDeliveryLaneHistory",
+)
+
+
 _DECISION_MARKER_PREFIX = "<!-- map-governance:decision:v1 "
 _DECISION_MARKER_SUFFIX = " -->"
 _APPROVAL_MARKER_PREFIX = "<!-- map-governance:approval:v1 "
 _APPROVAL_MARKER_SUFFIX = " -->"
 _PM_REPORT_MARKER_PREFIX = "<!-- map-governance:pm-report:v1 "
 _PM_REPORT_MARKER_SUFFIX = " -->"
+_DELIVERY_LANE_MARKER = "<!-- wayfinder-lane-registry:v1 -->"
 
 
 class GitHubTrackerAdapter:
@@ -416,6 +455,7 @@ class GitHubTrackerAdapter:
                 repository=str(resource["repository"]["nameWithOwner"]),
                 number=int(resource["number"]),
                 title=str(resource["title"]),
+                body=str(resource.get("body") or ""),
                 url=str(resource["url"]),
                 state=str(resource["state"]).lower(),
                 state_reason=(
@@ -635,6 +675,48 @@ class GitHubTrackerAdapter:
             )
         ]
 
+    def append_delivery_lane_registry(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        registry: DeliveryLaneRegistry,
+    ) -> TrackerDeliveryLaneRegistryRecord:
+        """Append and read back one delivery-pipeline lane checkpoint."""
+        committed, record_id, record_url = self._append_structured_comment(
+            query=_APPEND_DELIVERY_LANE_MUTATION,
+            subject_id=issue_id,
+            body=self._delivery_lane_registry_body(registry),
+            parser=self._delivery_lane_registry_from_comment,
+            expected=registry,
+            record_kind="delivery lane registry",
+            requested_kind="delivery lane registry",
+            url=url,
+        )
+        return TrackerDeliveryLaneRegistryRecord(
+            registry=committed,
+            tracker_record_id=record_id,
+            tracker_record_url=record_url,
+        )
+
+    def list_delivery_lane_registries(
+        self, url: str
+    ) -> list[TrackerDeliveryLaneRegistryRecord]:
+        """Read delivery-pipeline lane checkpoints from ticket history."""
+        return [
+            TrackerDeliveryLaneRegistryRecord(
+                registry=self._delivery_lane_registry_from_comment(body),
+                tracker_record_id=record_id,
+                tracker_record_url=record_url,
+            )
+            for body, record_id, record_url in self._structured_comment_history(
+                url,
+                query=_DELIVERY_LANE_HISTORY_QUERY,
+                marker_prefix=_DELIVERY_LANE_MARKER,
+                record_kind="delivery lane registry",
+            )
+        ]
+
     def _append_structured_comment(
         self,
         *,
@@ -848,6 +930,23 @@ class GitHubTrackerAdapter:
             return PMReport.from_payload(payload)
         except (TypeError, ValueError) as error:
             raise TrackerError("GitHub PM report comment marker is invalid") from error
+
+    @staticmethod
+    def _delivery_lane_registry_body(registry: DeliveryLaneRegistry) -> str:
+        payload = json.dumps(registry.payload(), ensure_ascii=False, indent=2)
+        return f"{_DELIVERY_LANE_MARKER}\n{payload}\n"
+
+    @staticmethod
+    def _delivery_lane_registry_from_comment(body: str) -> DeliveryLaneRegistry:
+        lines = body.splitlines()
+        try:
+            marker_index = lines.index(_DELIVERY_LANE_MARKER)
+            payload = yaml.safe_load("\n".join(lines[marker_index + 1 :]))
+            if not isinstance(payload, dict):
+                raise ValueError("registry payload is not an object")
+            return DeliveryLaneRegistry.from_payload(payload)
+        except (TypeError, ValueError, yaml.YAMLError) as error:
+            raise TrackerError("GitHub delivery lane registry is invalid") from error
 
     @staticmethod
     def _structured_marker_payload(
