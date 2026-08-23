@@ -69,6 +69,17 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
         help="Stable idempotency identity for a protected transition attempt",
     )
 
+    outbox = commands.add_parser("outbox", help="Inspect and recover durable effects")
+    outbox_commands = outbox.add_subparsers(dest="outbox_command", required=True)
+    status = outbox_commands.add_parser("status", help="Inspect one durable effect")
+    status.add_argument("--effect", required=True, help="Stable external effect id")
+    recover = outbox_commands.add_parser("recover", help="Dispatch due effects")
+    recover.add_argument("--limit", type=int, default=100)
+    repair = outbox_commands.add_parser("repair", help="Requeue a terminal effect")
+    repair.add_argument("--effect", required=True, help="Stable external effect id")
+    repair.add_argument("--repair-id", required=True, help="Stable repair audit id")
+    repair.add_argument("--note", required=True, help="Operator repair rationale")
+
 
 def register(ctx) -> None:
     """Register the native diagnostic capability with Hermes."""
@@ -76,14 +87,19 @@ def register(ctx) -> None:
     register_pm_capabilities(ctx)
     get_config = getattr(ctx, "get_config", lambda _key, default=None: default)
     authority_settings = get_config("authority", {})
+    outbox_settings = get_config("outbox", {})
     application = (
         application_for_storage(
             ctx.state.data_dir,
             authority_settings=authority_settings,
+            outbox_settings=outbox_settings,
         )
-        if authority_settings
+        if authority_settings or outbox_settings
         else application_for_storage(ctx.state.data_dir)
     )
+    start_outbox_runtime = getattr(application, "start_outbox_runtime", None)
+    if callable(start_outbox_runtime):
+        start_outbox_runtime()
 
     def handle_maps_command(args: Namespace) -> int:
         if args.maps_command == "health":
@@ -120,6 +136,35 @@ def register(ctx) -> None:
             return 0
         if args.maps_command == "refresh":
             report = application.refresh(project_id=args.project)
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        if args.maps_command == "outbox":
+            try:
+                if args.outbox_command == "status":
+                    report = application.outbox_status(effect_id=args.effect)
+                elif args.outbox_command == "recover":
+                    report = application.recover_outbox(limit=args.limit)
+                else:
+                    report = application.repair_outbox(
+                        effect_id=args.effect,
+                        repair_id=args.repair_id,
+                        note=args.note,
+                    )
+            except ValueError as error:
+                print(
+                    json.dumps(
+                        {
+                            "error": {
+                                "type": "outbox_error",
+                                "reason": str(error),
+                                "retryable": False,
+                            }
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
             print(json.dumps(report, sort_keys=True))
             return 0
         if args.maps_command == "transition":

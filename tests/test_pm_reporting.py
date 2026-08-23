@@ -45,6 +45,7 @@ class PMTracker:
         self.report_writes = 0
         self.confirm_report_writes = True
         self.fail_transitions = False
+        self.before_report_append = None
 
     def get_project(self, url: str) -> TrackerProject:
         return TrackerProject(
@@ -96,6 +97,8 @@ class PMTracker:
     ) -> TrackerPMReportRecord:
         assert url == ISSUE_URL
         assert issue_id == MAP_ID
+        if self.before_report_append is not None:
+            self.before_report_append(report)
         self.report_writes += 1
         record = TrackerPMReportRecord(
             report=report,
@@ -105,6 +108,44 @@ class PMTracker:
         if self.confirm_report_writes:
             self.reports.append(record)
         return record
+
+
+class ControllableCoordinatorResume:
+    def __init__(self) -> None:
+        self.markers = {}
+        self.calls = []
+        self.before_resume = None
+
+    def readback(self, *, map_id: str, turn_id: str):
+        return self.markers.get((map_id, turn_id))
+
+    def resume(
+        self,
+        *,
+        map_id: str,
+        profile_name: str,
+        session_id: str,
+        coordinator_id: str,
+        turn_id: str,
+    ) -> None:
+        if self.before_resume is not None:
+            self.before_resume(map_id, turn_id)
+        self.calls.append((map_id, turn_id))
+        self.markers[(map_id, turn_id)] = {
+            "map_id": map_id,
+            "turn_id": turn_id,
+            "profile_name": profile_name,
+            "session_id": session_id,
+            "coordinator_id": coordinator_id,
+        }
+
+
+class SimulatedCoordinatorProcessCrash(BaseException):
+    pass
+
+
+class SimulatedPMReportProcessCrash(BaseException):
+    pass
 
 
 def _application(tmp_path, tracker: PMTracker) -> MapGovernanceApplication:
@@ -161,6 +202,31 @@ def test_tracker_confirmed_checkpoint_projects_an_executive_summary_and_ends_idl
     }
     assert "evidence" not in card["delivery_summary"]["latest"]
     assert tracker.reports[0].report.assignment_map_id == MAP_ID
+
+
+def test_pm_report_intent_is_durable_before_tracker_append(tmp_path):
+    tracker = PMTracker()
+    application = _application(tmp_path, tracker)
+    effect_id = f"tracker-pm-report:{MAP_ID}:pm-durable-001"
+    observed = []
+
+    tracker.before_report_append = lambda _report: observed.append(
+        application.outbox_status(effect_id=effect_id)["state"]
+    )
+    application.report_pm(
+        request_identity=PM_IDENTITY,
+        report=PMReportDraft(
+            record_id="pm-durable-001",
+            report_type="checkpoint",
+            summary="The durable intent exists before GitHub is called.",
+            timestamp="2026-08-23T09:59:30Z",
+        ),
+    )
+
+    assert observed == ["leased"]
+    status = application.outbox_status(effect_id=effect_id)
+    assert status["effect_type"] == "tracker.pm-report"
+    assert status["state"] == "succeeded"
 
 
 @pytest.mark.parametrize(
@@ -333,6 +399,244 @@ def test_controllable_coordinator_runs_every_report_type_without_lane_leakage(
         "worker_logs",
     } & set(card)
     assert tracker.issue.state == "open"
+
+
+def test_coordinator_resume_restarts_from_marker_without_duplicate_call(tmp_path):
+    tracker = PMTracker()
+    coordinator = ControllableCoordinatorResume()
+    storage_root = tmp_path / "plugin-data" / "map-governance"
+
+    def crash_after_resume(point, _intent):
+        if point == "after_external_call":
+            raise SimulatedCoordinatorProcessCrash()
+
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc),
+        coordinator_resume=coordinator,
+        outbox_crash_injector=crash_after_resume,
+    )
+    project = application.configure_project(project_url=PROJECT_URL)
+    application.bind_map(project_id=project["id"], issue_url=ISSUE_URL)
+    application.assign_pm(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+    )
+    effect_id = f"coordinator-resume:{MAP_ID}:turn-durable-resume"
+    observed = []
+    coordinator.before_resume = lambda _map_id, _turn_id: observed.append(
+        application.outbox_status(effect_id=effect_id)["state"]
+    )
+
+    with pytest.raises(SimulatedCoordinatorProcessCrash):
+        application.begin_pm_turn(
+            map_id=MAP_ID,
+            request_identity=PM_IDENTITY,
+            coordinator_id="coordinator-atlas",
+            turn_id="turn-durable-resume",
+        )
+
+    assert (
+        application.pm_state(request_identity=PM_IDENTITY)["assignment"]["coordinator"][
+            "state"
+        ]
+        == "idle"
+    )
+    coordinator.before_resume = None
+    restarted = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 23, 10, 1, tzinfo=timezone.utc),
+        coordinator_resume=coordinator,
+    )
+    recovered = restarted.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="turn-durable-resume",
+    )
+
+    assert observed == ["leased"]
+    assert coordinator.calls == [(MAP_ID, "turn-durable-resume")]
+    assert recovered["coordinator"]["state"] == "active"
+    status = restarted.outbox_status(effect_id=effect_id)
+    assert status["state"] == "succeeded"
+    assert [attempt["outcome"] for attempt in status["attempts"]] == [
+        "lease_expired",
+        "succeeded",
+    ]
+
+
+def test_unresolved_coordinator_resume_reserves_turn_across_process_crash(tmp_path):
+    tracker = PMTracker()
+    coordinator = ControllableCoordinatorResume()
+    storage_root = tmp_path / "plugin-data" / "map-governance"
+
+    def crash_after_resume(point, _intent):
+        if point == "after_external_call":
+            raise SimulatedCoordinatorProcessCrash()
+
+    crashing_process = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc),
+        coordinator_resume=coordinator,
+        outbox_crash_injector=crash_after_resume,
+    )
+    project = crashing_process.configure_project(project_url=PROJECT_URL)
+    crashing_process.bind_map(project_id=project["id"], issue_url=ISSUE_URL)
+    crashing_process.assign_pm(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+    )
+
+    with pytest.raises(SimulatedCoordinatorProcessCrash):
+        crashing_process.begin_pm_turn(
+            map_id=MAP_ID,
+            request_identity=PM_IDENTITY,
+            coordinator_id="coordinator-atlas",
+            turn_id="turn-1",
+        )
+
+    restarted = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc),
+        coordinator_resume=coordinator,
+    )
+    with pytest.raises(ValueError, match="unresolved coordinator turn"):
+        restarted.begin_pm_turn(
+            map_id=MAP_ID,
+            request_identity=PM_IDENTITY,
+            coordinator_id="coordinator-atlas",
+            turn_id="turn-2",
+        )
+
+    assert coordinator.calls == [(MAP_ID, "turn-1")]
+    with pytest.raises(ValueError, match="does not exist"):
+        restarted.outbox_status(effect_id=f"coordinator-resume:{MAP_ID}:turn-2")
+
+
+@pytest.mark.parametrize("competing_outcome", ("report", "dispatch"))
+def test_unresolved_pm_report_reserves_the_turn_outcome_across_process_crash(
+    tmp_path,
+    competing_outcome,
+):
+    tracker = PMTracker()
+    _application(tmp_path, tracker)
+    storage_root = tmp_path / "plugin-data" / "map-governance"
+
+    def crash_after_report(point, intent):
+        if point == "after_external_call" and intent.effect_type == "tracker.pm-report":
+            raise SimulatedPMReportProcessCrash()
+
+    crashing_process = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc),
+        outbox_crash_injector=crash_after_report,
+    )
+    with pytest.raises(SimulatedPMReportProcessCrash):
+        crashing_process.report_pm(
+            request_identity=PM_IDENTITY,
+            report=PMReportDraft(
+                record_id="confirmed-before-report-crash",
+                report_type="checkpoint",
+                summary="Tracker confirmed this turn outcome before the crash.",
+                timestamp="2026-08-23T10:00:00Z",
+            ),
+        )
+
+    restarted = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc),
+    )
+    with pytest.raises(ValueError, match="already has a reserved report outcome"):
+        if competing_outcome == "report":
+            restarted.report_pm(
+                request_identity=PM_IDENTITY,
+                report=PMReportDraft(
+                    record_id="competing-report-after-crash",
+                    report_type="checkpoint",
+                    summary="This second outcome must never reach the tracker.",
+                    timestamp="2026-08-23T10:00:01Z",
+                ),
+            )
+        else:
+            restarted.complete_pm_dispatch(
+                map_id=MAP_ID,
+                request_identity=PM_IDENTITY,
+                coordinator_id="coordinator-atlas",
+                turn_id="turn-checkpoint-1",
+                dispatch_id="competing-dispatch-after-crash",
+            )
+
+    assert tracker.report_writes == 1
+    assert [record.report.content.record_id for record in tracker.reports] == [
+        "confirmed-before-report-crash"
+    ]
+    assert (
+        restarted.pm_state(request_identity=PM_IDENTITY)["assignment"]["coordinator"][
+            "state"
+        ]
+        == "active"
+    )
+
+
+def test_active_pm_turn_rejects_another_coordinator_resume_before_external_call(
+    tmp_path,
+):
+    tracker = PMTracker()
+    coordinator = ControllableCoordinatorResume()
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data" / "map-governance",
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc),
+        coordinator_resume=coordinator,
+    )
+    project = application.configure_project(project_url=PROJECT_URL)
+    application.bind_map(project_id=project["id"], issue_url=ISSUE_URL)
+    application.assign_pm(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="turn-1",
+    )
+
+    with pytest.raises(ValueError, match="already has an active turn"):
+        application.begin_pm_turn(
+            map_id=MAP_ID,
+            request_identity=PM_IDENTITY,
+            coordinator_id="coordinator-atlas",
+            turn_id="turn-2",
+        )
+
+    assert coordinator.calls == [(MAP_ID, "turn-1")]
+    with pytest.raises(ValueError, match="does not exist"):
+        application.outbox_status(effect_id=f"coordinator-resume:{MAP_ID}:turn-2")
 
 
 @pytest.mark.parametrize(

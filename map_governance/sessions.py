@@ -96,6 +96,8 @@ class SessionBackend(Protocol):
         idempotency_key: str,
     ) -> bool: ...
 
+    def has_message_id(self, session_id: str, idempotency_key: str) -> bool: ...
+
 
 class CEOSessionRunner(Protocol):
     """External-effect seam consumed by the governance application."""
@@ -122,6 +124,21 @@ class CEOSessionRunner(Protocol):
 
     def resolve(self, *, root_session_id: str) -> CanonicalSession | None: ...
 
+    def has_resume_marker(
+        self,
+        *,
+        root_session_id: str,
+        idempotency_key: str,
+    ) -> bool: ...
+
+    def resume_once(
+        self,
+        *,
+        root_session_id: str,
+        content: str,
+        idempotency_key: str,
+    ) -> CanonicalSession: ...
+
     def load_skill(
         self,
         session: CanonicalSession,
@@ -135,6 +152,10 @@ class HermesSessionAdapter:
     """Run canonical matching, creation, bootstrap and lineage resolution."""
 
     def __init__(self, backend: SessionBackend) -> None:
+        if not hasattr(backend, "has_message_id"):
+            raise ValueError(
+                "Hermes session backend must provide durable message-id readback"
+            )
         self._backend = backend
 
     def find_exact(self, *, title: str) -> list[CanonicalSession]:
@@ -230,6 +251,41 @@ class HermesSessionAdapter:
             bootstrap_sent=session.bootstrap_sent,
             operation="CEO Skill loading",
         )
+
+    def has_resume_marker(
+        self,
+        *,
+        root_session_id: str,
+        idempotency_key: str,
+    ) -> bool:
+        """Read the durable Hermes platform-message marker for one resume."""
+        session = self.resolve(root_session_id=root_session_id)
+        if session is None:
+            return False
+        return bool(
+            self._backend.has_message_id(session.live_session_id, idempotency_key)
+        )
+
+    def resume_once(
+        self,
+        *,
+        root_session_id: str,
+        content: str,
+        idempotency_key: str,
+    ) -> CanonicalSession:
+        """Append one retry-stable user turn to the current canonical lineage."""
+        session = self.resolve(root_session_id=root_session_id)
+        if session is None:
+            raise RuntimeError("Hermes session disappeared before resume")
+        self._backend.append_message_once(
+            session.live_session_id,
+            content=content,
+            idempotency_key=idempotency_key,
+        )
+        refreshed = self.resolve(root_session_id=root_session_id)
+        if refreshed is None:
+            raise RuntimeError("Hermes session disappeared during resume")
+        return refreshed
 
     def _refreshed_session(
         self,
@@ -349,6 +405,12 @@ class HermesSessionDatabaseBackend:
                 platform_message_id=idempotency_key,
             )
         return True
+
+    def has_message_id(self, session_id: str, idempotency_key: str) -> bool:
+        with self._session_db() as database:
+            if database.get_session(session_id) is None:
+                return False
+            return bool(database.has_platform_message_id(session_id, idempotency_key))
 
     def _session_db(self):
         from hermes_state import SessionDB

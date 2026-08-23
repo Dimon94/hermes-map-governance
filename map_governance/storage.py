@@ -14,7 +14,7 @@ from .approvals import normalized_json
 
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class PluginStorage:
@@ -206,6 +206,12 @@ class PluginStorage:
     def pm_report_lease(self, map_id: str) -> Iterator[None]:
         """Serialize one Map's PM report confirmation and projection."""
         with self._map_lease(namespace="pm-report", map_id=map_id):
+            yield
+
+    @contextmanager
+    def pm_turn_lease(self, map_id: str) -> Iterator[None]:
+        """Serialize one Map's coordinator turn reservation across processes."""
+        with self._map_lease(namespace="pm-turn", map_id=map_id):
             yield
 
     def save_pm_assignment(
@@ -1043,78 +1049,112 @@ class PluginStorage:
     ) -> tuple[bool, str]:
         """Atomically bind one approved ledger record to exactly one mutation."""
         with self._connect() as connection:
-            existing = connection.execute(
-                """
+            return self.reserve_protected_mutation_in_transaction(
+                connection,
+                mutation_id=mutation_id,
+                map_id=map_id,
+                request_id=request_id,
+                action=action,
+                scope=scope,
+                payload=payload,
+                payload_hash=payload_hash,
+                reserved_at=reserved_at,
+            )
+
+    def reserve_protected_mutation_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        mutation_id: str,
+        map_id: str,
+        request_id: str,
+        action: str,
+        scope: dict[str, Any],
+        payload: dict[str, Any],
+        payload_hash: str,
+        reserved_at: str,
+    ) -> tuple[bool, str]:
+        """Reserve through a caller-owned plugin DB transaction."""
+        existing = connection.execute(
+            """
                 SELECT map_id, request_id, action, scope_json, payload_json,
                        payload_hash, status
                 FROM protected_mutations
                 WHERE mutation_id = ?
                 """,
-                (mutation_id,),
-            ).fetchone()
-            scope_json = normalized_json(scope)
-            payload_json = normalized_json(payload)
-            if existing is not None:
-                same = (
-                    existing["map_id"] == map_id
-                    and existing["request_id"] == request_id
-                    and existing["action"] == action
-                    and existing["scope_json"] == scope_json
-                    and existing["payload_json"] == payload_json
-                    and existing["payload_hash"] == payload_hash
-                )
-                if not same:
-                    raise ValueError("Mutation identity belongs to another payload")
-                return True, str(existing["status"])
+            (mutation_id,),
+        ).fetchone()
+        scope_json = normalized_json(scope)
+        payload_json = normalized_json(payload)
+        if existing is not None:
+            same = (
+                existing["map_id"] == map_id
+                and existing["request_id"] == request_id
+                and existing["action"] == action
+                and existing["scope_json"] == scope_json
+                and existing["payload_json"] == payload_json
+                and existing["payload_hash"] == payload_hash
+            )
+            if not same:
+                raise ValueError("Mutation identity belongs to another payload")
+            return True, str(existing["status"])
 
-            cursor = connection.execute(
-                """
-                UPDATE approval_ledger
-                SET status = 'consumed', consumed_by_mutation_id = ?,
-                    consumed_at = ?, updated_at = ?
-                WHERE request_id = ? AND map_id = ? AND status = 'approved'
-                """,
-                (mutation_id, reserved_at, reserved_at, request_id, map_id),
-            )
-            if cursor.rowcount != 1:
-                row = connection.execute(
-                    "SELECT status FROM approval_ledger WHERE request_id = ?",
-                    (request_id,),
-                ).fetchone()
-                return False, str(row["status"]) if row is not None else "missing"
-            connection.execute(
-                """
-                INSERT INTO protected_mutations(
-                    mutation_id, map_id, request_id, action, scope_json,
-                    payload_json, payload_hash, status, reserved_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?)
-                """,
-                (
-                    mutation_id,
-                    map_id,
-                    request_id,
-                    action,
-                    scope_json,
-                    payload_json,
-                    payload_hash,
-                    reserved_at,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO approval_ledger_events(
-                    event_id, request_id, event_type, occurred_at,
-                    payload_hash
-                ) VALUES (?, ?, 'consumed', ?, ?)
-                """,
-                (
-                    f"approval:{request_id}:consumed:{mutation_id}",
-                    request_id,
-                    reserved_at,
-                    payload_hash,
-                ),
-            )
+        cursor = connection.execute(
+            """
+            UPDATE approval_ledger
+            SET status = 'consumed', consumed_by_mutation_id = ?,
+                consumed_at = ?, updated_at = ?
+            WHERE request_id = ? AND map_id = ? AND status = 'approved'
+            """,
+            (mutation_id, reserved_at, reserved_at, request_id, map_id),
+        )
+        if cursor.rowcount != 1:
+            row = connection.execute(
+                "SELECT status FROM approval_ledger WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            return False, str(row["status"]) if row is not None else "missing"
+        connection.execute(
+            """
+            INSERT INTO protected_mutations(
+                mutation_id, map_id, request_id, action, scope_json,
+                payload_json, payload_hash, status, reserved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?)
+            """,
+            (
+                mutation_id,
+                map_id,
+                request_id,
+                action,
+                scope_json,
+                payload_json,
+                payload_hash,
+                reserved_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO approval_ledger_events(
+                event_id, request_id, event_type, occurred_at,
+                payload_hash
+            ) VALUES (?, ?, 'consumed', ?, ?)
+            """,
+            (
+                f"approval:{request_id}:consumed:{mutation_id}",
+                request_id,
+                reserved_at,
+                payload_hash,
+            ),
+        )
         return False, "reserved"
+
+    @contextmanager
+    def atomic(self) -> Iterator[sqlite3.Connection]:
+        """Open one immediate transaction across plugin-owned repositories."""
+        with self._connect() as connection:
+            connection.commit()  # finish readiness metadata before explicit BEGIN
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
 
     def confirm_protected_mutation(
         self,
@@ -1521,6 +1561,64 @@ class PluginStorage:
                 tracker_record_url TEXT NOT NULL,
                 confirmed_at TEXT NOT NULL,
                 PRIMARY KEY(map_id, record_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbox_intents (
+                effect_id TEXT PRIMARY KEY,
+                effect_type TEXT NOT NULL,
+                map_id TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'pending', 'leased', 'succeeded',
+                    'retry_scheduled', 'terminal'
+                )),
+                owner_id TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                acknowledged_at TEXT,
+                acknowledgment_json TEXT,
+                last_error_type TEXT,
+                last_error_message TEXT,
+                terminal_reason TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbox_attempts (
+                attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                effect_id TEXT NOT NULL REFERENCES outbox_intents(effect_id),
+                attempt_number INTEGER NOT NULL,
+                owner_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                finished_at TEXT,
+                outcome TEXT NOT NULL CHECK(outcome IN (
+                    'claimed', 'lease_expired', 'released', 'succeeded',
+                    'retry_scheduled', 'terminal'
+                )),
+                error_type TEXT,
+                error_message TEXT,
+                UNIQUE(effect_id, attempt_number)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbox_repairs (
+                repair_id TEXT PRIMARY KEY,
+                effect_id TEXT NOT NULL REFERENCES outbox_intents(effect_id),
+                note TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                prior_terminal_reason TEXT NOT NULL,
+                prior_attempt_count INTEGER NOT NULL
             )
             """
         )

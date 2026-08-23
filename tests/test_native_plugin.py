@@ -78,6 +78,18 @@ def test_native_maps_commands_delegate_to_the_application(
             calls.append(("open_map", arguments))
             return {"operation": "open_map"}
 
+        def outbox_status(self, **arguments):
+            calls.append(("outbox_status", arguments))
+            return {"operation": "outbox_status"}
+
+        def recover_outbox(self, **arguments):
+            calls.append(("recover_outbox", arguments))
+            return {"operation": "recover_outbox"}
+
+        def repair_outbox(self, **arguments):
+            calls.append(("repair_outbox", arguments))
+            return {"operation": "repair_outbox"}
+
     monkeypatch.setattr(
         native, "application_for_storage", lambda root: ApplicationProbe()
     )
@@ -130,9 +142,26 @@ def test_native_maps_commands_delegate_to_the_application(
         parser.parse_args(["board"]),
         parser.parse_args(["detail", "--map", "I_atlas_41"]),
         parser.parse_args(["open", "--map", "I_atlas_41", "--profile", "ceo"]),
+        parser.parse_args(["outbox", "status", "--effect", "effect-001"]),
+        parser.parse_args(["outbox", "recover", "--limit", "12"]),
+        parser.parse_args(
+            [
+                "outbox",
+                "repair",
+                "--effect",
+                "effect-001",
+                "--repair-id",
+                "repair-001",
+                "--note",
+                "Verified downstream.",
+            ]
+        ),
     ]
 
     assert [command["handler_fn"](args) for args in arguments] == [
+        0,
+        0,
+        0,
         0,
         0,
         0,
@@ -150,6 +179,9 @@ def test_native_maps_commands_delegate_to_the_application(
         {"operation": "board"},
         {"operation": "map_detail"},
         {"operation": "open_map"},
+        {"operation": "outbox_status"},
+        {"operation": "recover_outbox"},
+        {"operation": "repair_outbox"},
     ]
     assert calls == [
         (
@@ -176,6 +208,16 @@ def test_native_maps_commands_delegate_to_the_application(
         ("map_detail", {"map_id": "I_atlas_41"}),
         ("profile", {"profile": "ceo"}),
         ("open_map", {"map_id": "I_atlas_41"}),
+        ("outbox_status", {"effect_id": "effect-001"}),
+        ("recover_outbox", {"limit": 12}),
+        (
+            "repair_outbox",
+            {
+                "effect_id": "effect-001",
+                "repair_id": "repair-001",
+                "note": "Verified downstream.",
+            },
+        ),
     ]
 
 

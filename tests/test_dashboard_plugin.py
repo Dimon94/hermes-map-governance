@@ -125,6 +125,18 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
             calls.append(("open_map", arguments))
             return {"operation": "open_map"}
 
+        def outbox_status(self, **arguments):
+            calls.append(("outbox_status", arguments))
+            return {"operation": "outbox_status"}
+
+        def recover_outbox(self, **arguments):
+            calls.append(("recover_outbox", arguments))
+            return {"operation": "recover_outbox"}
+
+        def repair_outbox(self, **arguments):
+            calls.append(("repair_outbox", arguments))
+            return {"operation": "repair_outbox"}
+
     monkeypatch.setattr(
         adapter,
         "application_for_profile",
@@ -166,11 +178,41 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
             opened = await client.post(
                 "/api/plugins/map-governance/maps/I_atlas_41/session?profile=ceo"
             )
-        return configured, bound, refreshed, transitioned, detail, opened
+            outbox_status = await client.get(
+                "/api/plugins/map-governance/outbox/effect-001?profile=ceo"
+            )
+            recovered = await client.post(
+                "/api/plugins/map-governance/outbox/recover?profile=ceo",
+                json={"limit": 12},
+            )
+            repaired = await client.post(
+                "/api/plugins/map-governance/outbox/effect-001/repair?profile=ceo",
+                json={"repair_id": "repair-001", "note": "Verified downstream."},
+            )
+        return (
+            configured,
+            bound,
+            refreshed,
+            transitioned,
+            detail,
+            opened,
+            outbox_status,
+            recovered,
+            repaired,
+        )
 
-    configured, bound, refreshed, transitioned, detail, opened = asyncio.run(
-        exercise_routes()
-    )
+    responses = asyncio.run(exercise_routes())
+    (
+        configured,
+        bound,
+        refreshed,
+        transitioned,
+        detail,
+        opened,
+        outbox_status,
+        recovered,
+        repaired,
+    ) = responses
 
     assert configured.status_code == 200
     assert bound.status_code == 200
@@ -178,6 +220,9 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
     assert transitioned.status_code == 200
     assert detail.status_code == 200
     assert opened.status_code == 200
+    assert outbox_status.status_code == 200
+    assert recovered.status_code == 200
+    assert repaired.status_code == 200
     assert [
         configured.json(),
         bound.json(),
@@ -185,6 +230,9 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
         transitioned.json(),
         detail.json(),
         opened.json(),
+        outbox_status.json(),
+        recovered.json(),
+        repaired.json(),
     ] == [
         {"operation": "configure_project"},
         {"operation": "bind_map"},
@@ -192,6 +240,9 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
         {"operation": "transition_map"},
         {"operation": "map_detail"},
         {"operation": "open_map"},
+        {"operation": "outbox_status"},
+        {"operation": "recover_outbox"},
+        {"operation": "repair_outbox"},
     ]
     assert calls == [
         ("profile", "ceo"),
@@ -222,6 +273,19 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
         ("map_detail", {"map_id": "I_atlas_41"}),
         ("profile", "ceo"),
         ("open_map", {"map_id": "I_atlas_41"}),
+        ("profile", "ceo"),
+        ("outbox_status", {"effect_id": "effect-001"}),
+        ("profile", "ceo"),
+        ("recover_outbox", {"limit": 12}),
+        ("profile", "ceo"),
+        (
+            "repair_outbox",
+            {
+                "effect_id": "effect-001",
+                "repair_id": "repair-001",
+                "note": "Verified downstream.",
+            },
+        ),
     ]
 
 

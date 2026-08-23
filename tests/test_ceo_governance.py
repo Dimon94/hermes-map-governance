@@ -41,6 +41,7 @@ class ExecutiveTracker:
         self.governance_writes = 0
         self.decisions: list[TrackerDecisionRecord] = []
         self.confirm_decision_writes = True
+        self.before_decision_append = None
         self.issues = {
             ISSUE_URL: TrackerIssue(
                 id=MAP_ID,
@@ -82,6 +83,8 @@ class ExecutiveTracker:
         raise AssertionError("CEO governance tests do not transition Map stages")
 
     def append_decision(self, *args, **kwargs):
+        if self.before_decision_append is not None:
+            self.before_decision_append()
         self.governance_writes += 1
         decision = kwargs["decision"]
         record = TrackerDecisionRecord(
@@ -101,6 +104,7 @@ class CanonicalSessionRunner:
     def __init__(self) -> None:
         self.sessions_by_title: dict[str, CanonicalSession] = {}
         self.sessions_by_root: dict[str, CanonicalSession] = {}
+        self.resume_markers: set[tuple[str, str]] = set()
 
     def find_exact(self, *, title: str) -> list[CanonicalSession]:
         session = self.sessions_by_title.get(title)
@@ -125,8 +129,43 @@ class CanonicalSessionRunner:
     def resolve(self, *, root_session_id: str) -> CanonicalSession | None:
         return self.sessions_by_root.get(root_session_id)
 
+    def has_resume_marker(self, *, root_session_id: str, idempotency_key: str):
+        return (root_session_id, idempotency_key) in self.resume_markers
+
+    def resume_once(self, *, root_session_id: str, idempotency_key: str, **_kwargs):
+        self.resume_markers.add((root_session_id, idempotency_key))
+        return self.sessions_by_root[root_session_id]
+
     def load_skill(self, session: CanonicalSession, **kwargs) -> CanonicalSession:
         return session
+
+
+class NonDurableSessionRunner:
+    def find_exact(self, *, title):
+        return []
+
+    def initialize(self, session, **_kwargs):
+        return session
+
+    def mint(self, **_kwargs):
+        raise AssertionError("must fail before session mutation")
+
+    def resolve(self, *, root_session_id):
+        return None
+
+    def load_skill(self, session, **_kwargs):
+        raise AssertionError("must not bypass the Outbox")
+
+
+def test_session_runner_without_durable_resume_contract_fails_closed(tmp_path):
+    with pytest.raises(ValueError, match="durable resume readback/apply"):
+        MapGovernanceApplication(
+            plugin_root=PLUGIN_ROOT,
+            storage_root=tmp_path / "plugin-data" / "map-governance",
+            tracker=ExecutiveTracker(),
+            session_runner=NonDurableSessionRunner(),
+            profile_name=PROFILE,
+        )
 
 
 def _canonical_application(
@@ -370,6 +409,37 @@ def test_confirmed_decision_appears_in_detail_card_and_executive_state(tmp_path)
         map_id=MAP_ID,
         request_identity=request_identity,
     )["recent_decisions"] == [expected]
+
+
+def test_decision_tracker_effect_is_durable_before_append_and_operator_visible(
+    tmp_path,
+):
+    tracker = ExecutiveTracker()
+    application = _canonical_application(tmp_path, tracker)
+    effect_id = "tracker-decision:I_atlas_41:decision-outbox-001"
+    observed_states = []
+    tracker.before_decision_append = lambda: observed_states.append(
+        application.outbox_status(effect_id=effect_id)["state"]
+    )
+
+    application.record_decision(
+        map_id=MAP_ID,
+        request_identity=GovernanceRequestIdentity(PROFILE, LIVE_SESSION_ID),
+        decision=StructuredDecision(
+            decision_id="decision-outbox-001",
+            type="product",
+            rationale="Persist transport intent before tracker mutation.",
+            authority="ceo",
+            affected_stage="authorized",
+            timestamp="2026-08-23T09:25:00Z",
+        ),
+    )
+
+    assert observed_states == ["leased"]
+    status = application.outbox_status(effect_id=effect_id)
+    assert status["effect_type"] == "tracker.decision"
+    assert status["state"] == "succeeded"
+    assert status["attempts"][0]["outcome"] == "succeeded"
 
 
 def test_recent_decisions_and_card_latest_sort_by_absolute_timestamp(tmp_path):

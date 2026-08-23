@@ -10,6 +10,8 @@ from map_governance import (
     MapTransitionConflict,
     MapTransitionError,
 )
+from map_governance.outbox import OutboxRepository
+from map_governance.runtime import application_for_storage
 from map_governance.tracker import (
     TrackerConflictError,
     TrackerError,
@@ -164,6 +166,22 @@ def test_health_connects_the_application_to_plugin_owned_storage(tmp_path):
     assert kanban_database.read_bytes() == b"existing-kanban-data"
 
 
+def test_profileless_startup_leaves_session_effect_for_a_capable_runtime(tmp_path):
+    storage_root = tmp_path / "plugin-data" / "map-governance"
+    effect_id = "session-resume:I_atlas_41:profile-runtime"
+    OutboxRepository(storage_root).enqueue(
+        effect_id=effect_id,
+        effect_type="session.resume",
+        map_id="I_atlas_41",
+        payload={"root_session_id": "mapgov-root"},
+        created_at="2026-08-23T07:30:00Z",
+    )
+
+    application = application_for_storage(storage_root)
+
+    assert application.outbox_status(effect_id=effect_id)["state"] == "pending"
+
+
 def test_board_exposes_a_useful_empty_projection_before_any_maps_are_bound(tmp_path):
     board = MapGovernanceApplication(
         plugin_root=PLUGIN_ROOT,
@@ -221,6 +239,15 @@ def test_operator_binds_an_existing_issue_once_as_a_complete_map_card(tmp_path):
         "decision_summary": {"count": 0, "latest": None},
         "approval_summary": {"count": 0, "pending_count": 0, "latest": None},
         "delivery_summary": {"state": "not_reported"},
+        "external_effects": {
+            "state": "healthy",
+            "pending_count": 0,
+            "retry_scheduled_count": 0,
+            "leased_count": 0,
+            "succeeded_count": 0,
+            "terminal_count": 0,
+            "latest_terminal": None,
+        },
         "ceo_session": {"state": "unbound"},
         "last_synchronized_at": "2026-08-23T07:30:00Z",
     }
@@ -344,6 +371,282 @@ def test_valid_transition_commits_tracker_before_visible_projection(tmp_path):
     ]
     assert transitioned["stage"] == "delivery"
     assert application.board()["maps"][0]["stage"] == "delivery"
+
+
+def test_repeated_stage_cycle_uses_a_fresh_effect_occurrence(tmp_path):
+    tracker = ControllableTracker()
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+
+    for expected_stage, requested_stage in (
+        ("authorized", "delivery"),
+        ("delivery", "decision"),
+        ("decision", "delivery"),
+        ("delivery", "decision"),
+    ):
+        transitioned = application.transition_map(
+            map_id=bound["id"],
+            expected_stage=expected_stage,
+            requested_stage=requested_stage,
+        )
+        assert transitioned["stage"] == requested_stage
+
+    assert [
+        (call["expected_stage"], call["requested_stage"])
+        for call in tracker.transition_calls
+    ] == [
+        ("authorized", "delivery"),
+        ("delivery", "decision"),
+        ("decision", "delivery"),
+        ("delivery", "decision"),
+    ]
+    assert application.board()["maps"][0]["stage"] == "decision"
+
+
+def test_synchronous_transition_uses_a_durable_outbox_execution_record(tmp_path):
+    tracker = ControllableTracker()
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+    effect_id = "stage-transition:stage-sync-001"
+    tracker.before_transition = lambda: application.outbox_status(effect_id=effect_id)[
+        "state"
+    ]
+
+    transitioned = application.transition_map(
+        map_id=bound["id"],
+        expected_stage="authorized",
+        requested_stage="delivery",
+        mutation_id="stage-sync-001",
+    )
+
+    assert tracker.transition_calls[0]["observed_projection"] == "leased"
+    assert transitioned["stage"] == "delivery"
+    assert transitioned["external_effect"] == {
+        "effect_id": effect_id,
+        "state": "succeeded",
+        "attempt_count": 1,
+        "acknowledged_at": "2026-08-23T07:30:00.000000Z",
+    }
+    status = application.outbox_status(effect_id=effect_id)
+    assert status["effect_type"] == "tracker.stage-transition"
+    assert status["state"] == "succeeded"
+    assert status["attempts"][0]["outcome"] == "succeeded"
+    assert application.map_detail(map_id=bound["id"])["external_effects"] == {
+        "state": "healthy",
+        "pending_count": 0,
+        "retry_scheduled_count": 0,
+        "leased_count": 0,
+        "succeeded_count": 1,
+        "terminal_count": 0,
+        "latest_terminal": None,
+    }
+
+
+def test_terminal_effect_reason_and_repair_action_are_visible_on_the_map(tmp_path):
+    tracker = ControllableTracker()
+    tracker.after_transition_stage = "parked"
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+    effect_id = "stage-transition:stage-terminal-001"
+
+    with pytest.raises(MapTransitionConflict):
+        application.transition_map(
+            map_id=bound["id"],
+            expected_stage="authorized",
+            requested_stage="delivery",
+            mutation_id="stage-terminal-001",
+        )
+
+    effects = application.board()["maps"][0]["external_effects"]
+    assert effects["state"] == "needs_repair"
+    assert effects["terminal_count"] == 1
+    assert effects["latest_terminal"]["terminal_outcome"]["message"] == (
+        "tracker stage is 'parked', not 'delivery'"
+    )
+    assert effects["latest_terminal"]["repair_action"] == {
+        "action": "repair_outbox",
+        "effect_id": effect_id,
+        "requires": ["repair_id", "note"],
+    }
+
+    repaired = application.repair_outbox(
+        effect_id=effect_id,
+        repair_id="repair-stage-terminal-001",
+        note="Operator verified tracker truth and explicitly requeued the intent.",
+    )
+
+    assert repaired["state"] == "pending"
+    assert repaired["repairs"][0]["repair_id"] == "repair-stage-terminal-001"
+    summary = application.map_detail(map_id=bound["id"])["external_effects"]
+    assert summary["state"] == "in_progress"
+    assert summary["pending_count"] == 1
+
+
+def test_populated_schema_v6_migrates_to_outbox_without_losing_the_map(tmp_path):
+    tracker = ControllableTracker()
+    storage_root = tmp_path / "plugin-data" / "map-governance"
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        clock=lambda: datetime(2026, 8, 23, 7, 30, tzinfo=timezone.utc),
+    )
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+    with sqlite3.connect(storage_root / "registry.db") as connection:
+        connection.execute("DROP TABLE outbox_repairs")
+        connection.execute("DROP TABLE outbox_attempts")
+        connection.execute("DROP TABLE outbox_intents")
+        connection.execute(
+            "UPDATE plugin_metadata SET schema_version = 6 WHERE namespace = ?",
+            ("map-governance",),
+        )
+
+    migrated = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        clock=lambda: datetime(2026, 8, 23, 7, 31, tzinfo=timezone.utc),
+    )
+    transitioned = migrated.transition_map(
+        map_id=bound["id"],
+        expected_stage="authorized",
+        requested_stage="delivery",
+        mutation_id="post-v6-migration",
+    )
+
+    assert transitioned["stage"] == "delivery"
+    assert migrated.board()["maps"][0]["id"] == bound["id"]
+    assert (
+        migrated.outbox_status(effect_id="stage-transition:post-v6-migration")["state"]
+        == "succeeded"
+    )
+
+
+class SimulatedApplicationProcessCrash(BaseException):
+    pass
+
+
+def test_restart_recovery_dispatches_a_pre_call_crash_through_public_seam(tmp_path):
+    tracker = ControllableTracker()
+    storage_root = tmp_path / "plugin-data" / "map-governance"
+
+    def crash_before_call(point, _intent):
+        if point == "before_external_call":
+            raise SimulatedApplicationProcessCrash()
+
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        clock=lambda: datetime(2026, 8, 23, 7, 30, tzinfo=timezone.utc),
+        outbox_crash_injector=crash_before_call,
+    )
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+    with pytest.raises(SimulatedApplicationProcessCrash):
+        application.transition_map(
+            map_id=bound["id"],
+            expected_stage="authorized",
+            requested_stage="delivery",
+            mutation_id="restart-before-call",
+        )
+
+    assert tracker.transition_calls == []
+    restarted = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        clock=lambda: datetime(2026, 8, 23, 7, 31, tzinfo=timezone.utc),
+    )
+    recovered = restarted.recover_outbox()
+
+    assert recovered["processed_count"] == 1
+    assert recovered["outcomes"] == [
+        {
+            "effect_id": "stage-transition:restart-before-call",
+            "state": "succeeded",
+            "attempt_number": 2,
+            "reconciled_by_readback": False,
+            "next_attempt_at": None,
+            "terminal_reason": None,
+        }
+    ]
+    assert len(tracker.transition_calls) == 1
+    assert restarted.board()["maps"][0]["stage"] == "delivery"
+
+
+def test_tracker_readback_converges_after_call_before_ack_without_duplicate(tmp_path):
+    tracker = ControllableTracker()
+    storage_root = tmp_path / "plugin-data" / "map-governance"
+
+    def crash_after_call(point, _intent):
+        if point == "after_external_call":
+            raise SimulatedApplicationProcessCrash()
+
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        clock=lambda: datetime(2026, 8, 23, 7, 30, tzinfo=timezone.utc),
+        outbox_crash_injector=crash_after_call,
+    )
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+    with pytest.raises(SimulatedApplicationProcessCrash):
+        application.transition_map(
+            map_id=bound["id"],
+            expected_stage="authorized",
+            requested_stage="delivery",
+            mutation_id="restart-after-call",
+        )
+
+    assert len(tracker.transition_calls) == 1
+    assert application.board()["maps"][0]["stage"] == "authorized"
+    restarted = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        clock=lambda: datetime(2026, 8, 23, 7, 31, tzinfo=timezone.utc),
+    )
+    recovered = restarted.recover_outbox()
+
+    assert recovered["outcomes"][0]["reconciled_by_readback"] is True
+    assert len(tracker.transition_calls) == 1
+    assert restarted.board()["maps"][0]["stage"] == "delivery"
 
 
 def test_invalid_transition_reports_policy_context_without_tracker_write(tmp_path):

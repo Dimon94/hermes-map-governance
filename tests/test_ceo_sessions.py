@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -79,6 +80,7 @@ class ControllableSessionBackend:
         self.message_ids: dict[str, set[str]] = {}
         self.exact_override: list[str] | None = None
         self.session_configs: dict[str, tuple[str, str]] = {}
+        self.before_message_append = None
 
     def exact_title_sessions(self, title: str) -> list[BackendSession]:
         with self._lock:
@@ -193,6 +195,8 @@ class ControllableSessionBackend:
             message_ids = self.message_ids.setdefault(session_id, set())
             if idempotency_key in message_ids:
                 return False
+            if self.before_message_append is not None:
+                self.before_message_append(session_id, idempotency_key)
             message_ids.add(idempotency_key)
             self.messages[session_id].append(content)
             self.skill_calls.append(
@@ -212,6 +216,10 @@ class ControllableSessionBackend:
                 ),
             )
             return True
+
+    def has_message_id(self, session_id: str, idempotency_key: str) -> bool:
+        with self._lock:
+            return idempotency_key in self.message_ids.get(session_id, set())
 
     def add_existing(
         self,
@@ -294,6 +302,68 @@ def test_unique_exact_session_is_adopted_before_mint(tmp_path):
         "state": "ready",
         "last_activity_at": "2026-08-23T08:01:00Z",
     }
+
+
+class SimulatedSessionProcessCrash(BaseException):
+    pass
+
+
+def test_session_resume_restarts_from_readback_without_duplicate_message(tmp_path):
+    backend = ControllableSessionBackend()
+    backend.add_existing("existing-root", title=canonical_session_title(MAP_ID))
+    storage_root = tmp_path / "plugin-data" / "map-governance"
+    tracker = SessionTracker()
+
+    def crash_after_resume(point, _intent):
+        if point == "after_external_call":
+            raise SimulatedSessionProcessCrash()
+
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        session_runner=HermesSessionAdapter(backend),
+        profile_name=PROFILE,
+        clock=lambda: datetime(2026, 8, 23, 8, 2, tzinfo=timezone.utc),
+        outbox_crash_injector=crash_after_resume,
+    )
+    card = _bind(application)
+    observed = []
+
+    def observe(session_id, idempotency_key):
+        skill_hash = idempotency_key.rsplit(":", 1)[-1]
+        tip_hash = hashlib.sha256(session_id.encode()).hexdigest()[:16]
+        effect_id = f"session-resume:{MAP_ID}:ceo-skill:{skill_hash}:{tip_hash}"
+        observed.append(application.outbox_status(effect_id=effect_id)["state"])
+
+    backend.before_message_append = observe
+    with pytest.raises(SimulatedSessionProcessCrash):
+        application.open_map(map_id=card["id"])
+
+    backend.before_message_append = None
+    restarted = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        tracker=tracker,
+        session_runner=HermesSessionAdapter(backend),
+        profile_name=PROFILE,
+        clock=lambda: datetime(2026, 8, 23, 8, 3, tzinfo=timezone.utc),
+    )
+    recovered = restarted.open_map(map_id=card["id"])
+
+    assert observed == ["leased"]
+    assert recovered["ceo_session"]["state"] == "ready"
+    assert len(backend.skill_calls) == 1
+    skill_hash = backend.skill_calls[0]["idempotency_key"].rsplit(":", 1)[-1]
+    tip_hash = hashlib.sha256("existing-root".encode()).hexdigest()[:16]
+    status = restarted.outbox_status(
+        effect_id=f"session-resume:{MAP_ID}:ceo-skill:{skill_hash}:{tip_hash}"
+    )
+    assert status["state"] == "succeeded"
+    assert [attempt["outcome"] for attempt in status["attempts"]] == [
+        "lease_expired",
+        "succeeded",
+    ]
 
 
 def test_multiple_exact_candidates_require_repair_without_guessing_or_leaking(tmp_path):

@@ -135,6 +135,31 @@ PM assignment 固定绑定 request-scoped profile/session 与一个 Map，不读
 commands 与 lane activity 仍只属于 delivery artifacts。该 seam 不创建 implementation card，也不保存 pane、
 worktree、lane 或 worker log。
 
+Tracker governance writes、canonical session resume 与可控 coordinator resume 会先写入
+plugin-owned SQLite Outbox，再领取有期限的 durable lease 后调用外部边界。稳定 effect id
+与 payload hash 拒绝同 id 异 payload；每次调用前先从 GitHub marker、Hermes
+`platform_message_id` 或 coordinator turn marker 读回，因此 “外部成功、ack 前崩溃” 的
+重启只会收敛到一次语义效果，而不承诺物理 exactly-once。可重试错误按正常 plugin
+settings 中的 `outbox` 配置退避；terminal 错误停止自动调用，并在 Map 卡片/detail 暴露原因：
+
+```yaml
+plugins:
+  entries:
+    map-governance:
+      settings:
+        outbox:
+          lease_seconds: 30
+          poll_seconds: 1
+          base_retry_seconds: 5
+          max_retry_seconds: 300
+          max_attempts: 5
+```
+
+Operator 可用 `hermes maps outbox status --effect EFFECT_ID` 检查 attempt history，
+`hermes maps outbox recover --limit 100` 运行到期 action，并用带稳定 repair id 和说明的
+`hermes maps outbox repair --effect EFFECT_ID --repair-id REPAIR_ID --note NOTE`
+显式重排 terminal intent。Repair 只增加审计记录并重置执行状态，不删除历史或静默吞掉失败。
+
 Authority envelope 使用正常 Hermes plugin settings，不读取进程环境。默认 `product` 与
 `operational` 属于 CEO autonomy；delivery authorization、budget、scope、material
 schedule、security/legal、cancellation、publication 与 final acceptance 要求 chairman。

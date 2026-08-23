@@ -21,6 +21,7 @@ from map_governance import (
 )
 from map_governance.approvals import ApprovalHistoryEvent
 from map_governance.sessions import CanonicalSession
+from map_governance.outbox import OutboxRepository
 from map_governance.tracker import (
     StructuredDecision,
     TrackerApprovalRecord,
@@ -88,6 +89,7 @@ class ApprovalTracker:
         self.decision_writes = 0
         self.transition_calls = 0
         self.confirm_approval_writes = True
+        self.before_approval_append = None
         self.transition_error: Exception | None = None
         self._lock = Lock()
 
@@ -117,6 +119,8 @@ class ApprovalTracker:
         issue_id: str,
         event: ApprovalHistoryEvent,
     ) -> TrackerApprovalRecord:
+        if self.before_approval_append is not None:
+            self.before_approval_append(event)
         with self._lock:
             self.approval_writes += 1
             record = TrackerApprovalRecord(
@@ -170,6 +174,7 @@ class ApprovalTracker:
 class SessionRunner:
     def __init__(self) -> None:
         self.session = None
+        self.resume_markers = set()
 
     def find_exact(self, *, title: str):
         return (
@@ -196,8 +201,19 @@ class SessionRunner:
             return None
         return self.session
 
+    def has_resume_marker(self, *, root_session_id, idempotency_key):
+        return (root_session_id, idempotency_key) in self.resume_markers
+
+    def resume_once(self, *, root_session_id, idempotency_key, **_kwargs):
+        self.resume_markers.add((root_session_id, idempotency_key))
+        return self.resolve(root_session_id=root_session_id)
+
     def load_skill(self, session, **_kwargs):
         return session
+
+
+class SimulatedApprovalProcessCrash(BaseException):
+    pass
 
 
 def _clock_box():
@@ -471,6 +487,44 @@ def test_ceo_submits_complete_packet_with_normalized_payload_hash_and_tracker_co
         "count": 1,
         "items": [item],
     }
+
+
+def test_each_approval_event_is_durable_before_tracker_append(tmp_path):
+    application, tracker = _application(tmp_path)
+    observed = []
+
+    def observe(event):
+        effect_id = f"tracker-approval:{MAP_ID}:{event.event_id}"
+        observed.append(
+            (event.event_type, application.outbox_status(effect_id=effect_id)["state"])
+        )
+
+    tracker.before_approval_append = observe
+    application.request_approval(
+        map_id=MAP_ID,
+        request_identity=_ceo_identity(),
+        packet=_packet(),
+    )
+    application.decide_approval(
+        map_id=MAP_ID,
+        request_id="approval-delivery-001",
+        actor_identity=_chairman_identity(),
+        decision="approved",
+        note="Approve after durable transport intent.",
+    )
+
+    assert observed == [("requested", "leased"), ("approved", "leased")]
+    statuses = [
+        application.outbox_status(
+            effect_id=f"tracker-approval:{MAP_ID}:approval:approval-delivery-001:{suffix}"
+        )
+        for suffix in ("request", "decision")
+    ]
+    assert [status["state"] for status in statuses] == ["succeeded", "succeeded"]
+    assert [status["effect_type"] for status in statuses] == [
+        "tracker.approval-event",
+        "tracker.approval-event",
+    ]
 
 
 def test_request_id_cannot_be_reused_for_changed_payload_or_another_map(tmp_path):
@@ -953,6 +1007,91 @@ def test_valid_approval_is_consumed_atomically_and_same_mutation_replays_idempot
         "approved",
         "consumed",
     ]
+
+
+def test_protected_reservation_rolls_back_when_outbox_enqueue_conflicts(tmp_path):
+    application, tracker = _application(tmp_path)
+    _request_and_approve(application)
+    storage_root = tmp_path / "plugin-data" / "map-governance"
+    OutboxRepository(storage_root).enqueue(
+        effect_id="stage-transition:transition-atomic-001",
+        effect_type="tracker.stage-transition",
+        map_id=MAP_ID,
+        payload={"different": "payload"},
+        created_at="2026-08-23T09:30:00Z",
+    )
+
+    with pytest.raises(ApprovalRequestConflict, match="stable mutation identity"):
+        application.transition_map(
+            map_id=MAP_ID,
+            expected_stage="awaiting-approval",
+            requested_stage="authorized",
+            approval_request_id="approval-delivery-001",
+            mutation_id="transition-atomic-001",
+        )
+
+    approval = application.map_detail(map_id=MAP_ID)["approvals"]["items"][0]
+    assert approval["status"] == "approved"
+    assert [event["event_type"] for event in approval["history"]] == [
+        "requested",
+        "approved",
+    ]
+    assert tracker.transition_calls == 0
+
+
+def test_unresolved_confirmed_revocation_blocks_approval_consumption(tmp_path):
+    clock = _clock_box()
+    application, tracker = _application(tmp_path, clock=clock)
+    _request_and_approve(application)
+
+    def crash_after_revocation(point, intent):
+        event = intent.payload.get("event")
+        if (
+            point == "after_external_call"
+            and isinstance(event, dict)
+            and event.get("event_type") == "revoked"
+        ):
+            raise SimulatedApprovalProcessCrash()
+
+    crashing_process = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data" / "map-governance",
+        tracker=tracker,
+        profile_name=PROFILE,
+        clock=lambda: clock[0],
+        authority_policy=AuthorityEnvelopePolicy.from_settings(
+            {"chairman_actor_ids": ["chairman-1"]}
+        ),
+        outbox_crash_injector=crash_after_revocation,
+    )
+
+    with pytest.raises(SimulatedApprovalProcessCrash):
+        crashing_process.revoke_approval(
+            map_id=MAP_ID,
+            request_id="approval-delivery-001",
+            actor_identity=_chairman_identity(),
+            note="Withdrawn before delivery authorization was consumed.",
+        )
+
+    approval = application.map_detail(map_id=MAP_ID)["approvals"]["items"][0]
+    assert approval["status"] == "approved"
+    assert tracker.approval_records[ISSUE_URL][-1].event.event_type == "revoked"
+
+    with pytest.raises(ApprovalEnforcementError) as raised:
+        application.transition_map(
+            map_id=MAP_ID,
+            expected_stage="awaiting-approval",
+            requested_stage="authorized",
+            approval_request_id="approval-delivery-001",
+            mutation_id="transition-after-confirmed-revocation",
+        )
+
+    assert raised.value.reason == "approval_revocation_pending"
+    assert tracker.transition_calls == 0
+    assert (
+        application.map_detail(map_id=MAP_ID)["approvals"]["items"][0]["status"]
+        == "approved"
+    )
 
 
 def test_tracker_transition_failure_keeps_projection_prior_and_reserves_only_same_mutation(

@@ -402,3 +402,25 @@ class ApprovalHistoryEvent:
             "payload_hash": self.payload_hash,
             "details": self.details,
         }
+
+
+def approval_events_semantically_compatible(
+    existing: ApprovalHistoryEvent,
+    requested: ApprovalHistoryEvent,
+) -> bool:
+    """Compare the stable meaning of an approval event across retries."""
+    if (
+        existing.event_id != requested.event_id
+        or existing.request_id != requested.request_id
+        or existing.event_type != requested.event_type
+        or existing.payload_hash != requested.payload_hash
+    ):
+        return False
+    if existing.event_type == "requested":
+        return existing.details == requested.details
+    stable_keys = {"actor_id", "actor_profile", "note", "decision"}
+    return all(
+        existing.details.get(key) == requested.details.get(key)
+        for key in stable_keys
+        if key in existing.details or key in requested.details
+    )

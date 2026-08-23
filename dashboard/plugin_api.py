@@ -60,6 +60,15 @@ class ApprovalDecisionRequest(BaseModel):
     note: str = Field(min_length=1)
 
 
+class OutboxRecoveryRequest(BaseModel):
+    limit: int = Field(default=100, ge=1, le=1000)
+
+
+class OutboxRepairRequest(BaseModel):
+    repair_id: str = Field(min_length=1, max_length=256)
+    note: str = Field(min_length=1)
+
+
 def _application(profile: str):
     try:
         return application_for_profile(profile)
@@ -85,6 +94,8 @@ def _operation(profile: str, method: str, **arguments):
         raise HTTPException(status_code=409, detail=str(error)) from error
     except TrackerError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 def _chairman_identity(request: Request, *, profile: str) -> GovernanceActorIdentity:
@@ -123,6 +134,40 @@ async def board(profile: str = Query(min_length=1)):
 @router.get("/maps/{map_id}")
 async def map_detail(map_id: str, profile: str = Query(min_length=1)):
     return _operation(profile, "map_detail", map_id=map_id)
+
+
+@router.get("/outbox/{effect_id}")
+async def outbox_status(effect_id: str, profile: str = Query(min_length=1)):
+    return _operation(profile, "outbox_status", effect_id=effect_id)
+
+
+@router.post("/outbox/recover")
+async def recover_outbox(
+    request: OutboxRecoveryRequest,
+    profile: str = Query(min_length=1),
+):
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "recover_outbox",
+        limit=request.limit,
+    )
+
+
+@router.post("/outbox/{effect_id}/repair")
+async def repair_outbox(
+    effect_id: str,
+    request: OutboxRepairRequest,
+    profile: str = Query(min_length=1),
+):
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "repair_outbox",
+        effect_id=effect_id,
+        repair_id=request.repair_id,
+        note=request.note,
+    )
 
 
 @router.post("/maps/{map_id}/session")

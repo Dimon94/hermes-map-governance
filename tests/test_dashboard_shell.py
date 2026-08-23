@@ -147,3 +147,23 @@ def test_map_card_and_detail_render_pm_executive_summary_without_lane_cards():
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout == "dashboard PM reporting ready\n"
+
+
+def test_map_card_renders_terminal_outbox_reason_and_repair_command():
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail("Node.js is required to exercise the dashboard plugin bundle")
+    result = subprocess.run(
+        [
+            node,
+            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
+            "outbox-terminal",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "dashboard Outbox repair ready\n"

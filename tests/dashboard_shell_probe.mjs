@@ -188,6 +188,28 @@ function fetchJSON(path, options) {
             { type: "terminal_failure", count: 1 },
           ],
         } : { state: "not_reported" },
+        external_effects: mode === "outbox-terminal" ? {
+          state: "needs_repair",
+          pending_count: 0,
+          retry_scheduled_count: 0,
+          leased_count: 0,
+          succeeded_count: 2,
+          terminal_count: 1,
+          latest_terminal: {
+            effect_id: "tracker-decision:I_atlas_41:terminal-001",
+            terminal_outcome: {
+              message: "GitHub rejected the stable governance marker.",
+            },
+          },
+        } : {
+          state: "healthy",
+          pending_count: 0,
+          retry_scheduled_count: 0,
+          leased_count: 0,
+          succeeded_count: 0,
+          terminal_count: 0,
+          latest_terminal: null,
+        },
         ceo_session: mode === "ready" || mode === "hydration-retry"
           ? { state: "ready", last_activity_at: "2026-08-23T09:05:00Z" }
           : { state: "unbound" },
@@ -376,6 +398,11 @@ if (mode !== "empty") {
     assert.match(detailText, /A yes\/no answer about legacy aliases/);
     assert.doesNotMatch(detailText, /worker lane|worktree|pane log|implementation ticket/i);
   }
+  if (mode === "outbox-terminal") {
+    assert.match(renderedText, /External effects need operator repair/);
+    assert.match(renderedText, /GitHub rejected the stable governance marker/);
+    assert.match(renderedText, /maps outbox repair --effect tracker-decision:I_atlas_41:terminal-001/);
+  }
   if (mode === "approval") {
     assert.match(detailText, /Alternatives.*Authorize delivery.*Return to discovery/s);
     assert.match(detailText, /Cost \/ risk: Two engineering weeks/);
@@ -546,5 +573,7 @@ process.stdout.write(
       ? "dashboard chairman approval ready\n"
     : mode === "pm-report"
       ? "dashboard PM reporting ready\n"
+    : mode === "outbox-terminal"
+      ? "dashboard Outbox repair ready\n"
       : "dashboard board ready\n",
 );

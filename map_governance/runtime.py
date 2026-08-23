@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Lock
 from typing import Any, Mapping
 
 from .application import MapGovernanceApplication
 from .approvals import AuthorityEnvelopePolicy
+from .outbox import OutboxSettings
 from .sessions import HermesSessionAdapter, HermesSessionDatabaseBackend
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ID = "map-governance"
+_PROFILE_APPLICATIONS: dict[tuple[str, str], MapGovernanceApplication] = {}
+_PROFILE_APPLICATIONS_LOCK = Lock()
 
 
 class ProfileResolutionError(ValueError):
@@ -24,6 +28,8 @@ def application_for_storage(
     profile_name: str | None = None,
     state_database: Path | None = None,
     authority_settings: Mapping[str, Any] | None = None,
+    outbox_settings: Mapping[str, Any] | None = None,
+    recover_pending: bool = True,
 ) -> MapGovernanceApplication:
     """Build the application for an explicitly selected storage directory."""
     session_runner = (
@@ -31,13 +37,17 @@ def application_for_storage(
         if profile_name is not None and state_database is not None
         else None
     )
-    return MapGovernanceApplication(
+    application = MapGovernanceApplication(
         plugin_root=PLUGIN_ROOT,
         storage_root=storage_root,
         session_runner=session_runner,
         profile_name=profile_name,
         authority_policy=AuthorityEnvelopePolicy.from_settings(authority_settings),
+        outbox_settings=OutboxSettings(**dict(outbox_settings or {})),
     )
+    if recover_pending:
+        application.recover_outbox()
+    return application
 
 
 def application_for_profile(profile: str) -> MapGovernanceApplication:
@@ -74,14 +84,26 @@ def application_for_profile(profile: str) -> MapGovernanceApplication:
         authority_settings = (
             settings.get("authority") if isinstance(settings, dict) else None
         )
+        outbox_settings = settings.get("outbox") if isinstance(settings, dict) else None
     finally:
         reset_hermes_home_override(token)
 
-    return application_for_storage(
-        storage_root,
-        profile_name=canonical_profile,
-        state_database=profile_home / "state.db",
-        authority_settings=(
-            authority_settings if isinstance(authority_settings, dict) else None
-        ),
-    )
+    cache_key = (canonical_profile, str(storage_root.resolve()))
+    with _PROFILE_APPLICATIONS_LOCK:
+        existing = _PROFILE_APPLICATIONS.get(cache_key)
+        if existing is not None:
+            return existing
+        application = application_for_storage(
+            storage_root,
+            profile_name=canonical_profile,
+            state_database=profile_home / "state.db",
+            authority_settings=(
+                authority_settings if isinstance(authority_settings, dict) else None
+            ),
+            outbox_settings=(
+                outbox_settings if isinstance(outbox_settings, dict) else None
+            ),
+        )
+        application.start_outbox_runtime()
+        _PROFILE_APPLICATIONS[cache_key] = application
+        return application

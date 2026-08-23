@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Callable, NoReturn
+from typing import Any, Callable, NoReturn, cast
 
 from .approvals import (
     APPROVAL_DECISIONS,
@@ -16,6 +18,7 @@ from .approvals import (
     ApprovalPacket,
     AuthorityEnvelopePolicy,
     GovernanceActorIdentity,
+    approval_events_semantically_compatible,
     normalized_hash,
     normalized_json,
 )
@@ -26,6 +29,32 @@ from .stages import (
     rejection_reason,
 )
 from .storage import PluginStorage
+from .effects import (
+    COORDINATOR_RESUME,
+    SESSION_RESUME,
+    TRACKER_APPROVAL_EVENT,
+    TRACKER_DECISION,
+    TRACKER_PM_REPORT,
+    TRACKER_STAGE_TRANSITION,
+    CoordinatorResumeBoundary,
+    CoordinatorResumeEffectAdapter,
+    SessionResumeBoundary,
+    SessionResumeEffectAdapter,
+    TrackerEffectAdapter,
+    TrackerEffectPayloadConflict,
+    TrackerStageEffectConflict,
+)
+from .outbox import (
+    EffectConfirmation,
+    EffectRetryableError,
+    EffectTerminalError,
+    OutboxConflictError,
+    OutboxDispatcher,
+    OutboxIntent,
+    OutboxRepository,
+    OutboxRuntime,
+    OutboxSettings,
+)
 from .sessions import (
     CEOSessionRunner,
     CanonicalSession,
@@ -37,7 +66,6 @@ from .tracker import (
     GitHubTrackerAdapter,
     TrackerAdapter,
     TrackerApprovalRecord,
-    TrackerConflictError,
     StructuredDecision,
     TrackerDecisionRecord,
     TrackerError,
@@ -235,6 +263,10 @@ class MapGovernanceApplication:
         profile_name: str | None = None,
         clock: Callable[[], datetime] | None = None,
         authority_policy: AuthorityEnvelopePolicy | None = None,
+        outbox_settings: OutboxSettings | None = None,
+        outbox_owner_id: str | None = None,
+        outbox_crash_injector: Callable[[str, OutboxIntent], None] | None = None,
+        coordinator_resume: CoordinatorResumeBoundary | None = None,
     ) -> None:
         self._plugin_root = plugin_root.resolve()
         self._storage = PluginStorage(storage_root)
@@ -244,6 +276,52 @@ class MapGovernanceApplication:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._authority_policy = (
             authority_policy or AuthorityEnvelopePolicy.from_settings(None)
+        )
+        self._outbox = OutboxRepository(storage_root)
+        self._outbox_settings = outbox_settings or OutboxSettings()
+        self._outbox_owner_id = outbox_owner_id or (
+            f"map-governance:{os.getpid()}:{uuid.uuid4()}"
+        )
+        self._outbox_runtime: OutboxRuntime | None = None
+        tracker_effects = TrackerEffectAdapter(self._tracker)
+        effect_adapters: dict[str, Any] = {
+            TRACKER_STAGE_TRANSITION: tracker_effects,
+            TRACKER_DECISION: tracker_effects,
+            TRACKER_APPROVAL_EVENT: tracker_effects,
+            TRACKER_PM_REPORT: tracker_effects,
+        }
+        missing_session_effect_methods = (
+            [
+                name
+                for name in ("has_resume_marker", "resume_once")
+                if self._session_runner is not None
+                and not hasattr(self._session_runner, name)
+            ]
+            if self._session_runner is not None
+            else []
+        )
+        if missing_session_effect_methods:
+            raise ValueError(
+                "CEO session runner must provide durable resume readback/apply: "
+                + ", ".join(missing_session_effect_methods)
+            )
+        self._session_resume_outbox = self._session_runner is not None
+        if self._session_resume_outbox and self._session_runner is not None:
+            effect_adapters[SESSION_RESUME] = SessionResumeEffectAdapter(
+                cast(SessionResumeBoundary, self._session_runner)
+            )
+        self._coordinator_resume = coordinator_resume
+        if coordinator_resume is not None:
+            effect_adapters[COORDINATOR_RESUME] = CoordinatorResumeEffectAdapter(
+                coordinator_resume
+            )
+        self._outbox_dispatcher = OutboxDispatcher(
+            repository=self._outbox,
+            adapters=effect_adapters,
+            clock=self._clock,
+            settings=self._outbox_settings,
+            completion=self._complete_external_effect,
+            crash_injector=outbox_crash_injector,
         )
 
     def health(self) -> dict[str, Any]:
@@ -333,8 +411,81 @@ class MapGovernanceApplication:
                 card["recent_decisions"] = self._storage.recent_decisions(map_id=map_id)
                 card["approvals"] = self._approval_collection(map_id=map_id)
                 card["pm_reports"] = self._storage.recent_pm_reports(map_id=map_id)
+                card["external_effects"] = self._outbox.map_summary(map_id)
                 return card
         raise MapBindingError(f"Map is not bound: {map_id}")
+
+    def outbox_status(self, *, effect_id: str) -> dict[str, Any]:
+        """Return one operator-visible durable execution record."""
+        return self._outbox.operator_status(effect_id)
+
+    def recover_outbox(self, *, limit: int = 100) -> dict[str, Any]:
+        """Dispatch due durable effects during startup or an operator recovery."""
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("Outbox recovery limit must be between 1 and 1000")
+        outcomes = []
+        while len(outcomes) < limit:
+            outcome = self._outbox_dispatcher.dispatch_next(
+                owner_id=self._outbox_owner_id
+            )
+            if outcome is None:
+                break
+            outcomes.append(
+                {
+                    "effect_id": outcome.effect_id,
+                    "state": outcome.state,
+                    "attempt_number": outcome.attempt_number,
+                    "reconciled_by_readback": outcome.reconciled_by_readback,
+                    "next_attempt_at": outcome.next_attempt_at,
+                    "terminal_reason": outcome.terminal_reason,
+                }
+            )
+        return {"processed_count": len(outcomes), "outcomes": outcomes}
+
+    def start_outbox_runtime(
+        self,
+        *,
+        poll_seconds: float | None = None,
+    ) -> OutboxRuntime:
+        """Start one recurring durable dispatcher for this composition root."""
+        if self._outbox_runtime is None:
+            self._outbox_runtime = OutboxRuntime(
+                dispatcher=self._outbox_dispatcher,
+                owner_id=f"{self._outbox_owner_id}:runtime",
+                poll_seconds=(
+                    self._outbox_settings.poll_seconds
+                    if poll_seconds is None
+                    else poll_seconds
+                ),
+            )
+            self._outbox_runtime.start()
+        return self._outbox_runtime
+
+    def stop_outbox_runtime(self) -> None:
+        """Stop the recurring dispatcher during an owned runtime shutdown."""
+        if self._outbox_runtime is not None:
+            self._outbox_runtime.stop()
+            self._outbox_runtime = None
+
+    def repair_outbox(
+        self,
+        *,
+        effect_id: str,
+        repair_id: str,
+        note: str,
+    ) -> dict[str, Any]:
+        """Audit an explicit operator repair and requeue a terminal intent."""
+        self._outbox.repair(
+            effect_id=effect_id,
+            repair_id=repair_id,
+            note=note,
+            requested_at=self._synchronized_at(),
+        )
+        return self._outbox.operator_status(effect_id)
 
     def executive_state(
         self,
@@ -433,7 +584,25 @@ class MapGovernanceApplication:
         turn_id: str,
     ) -> dict[str, Any]:
         """Resume an assigned PM for one coordinator-controlled turn."""
-        self._authorize_pm_coordinator(
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("pm-turn", lock_key):
+            with self._storage.pm_turn_lease(map_id):
+                return self._begin_pm_turn(
+                    map_id=map_id,
+                    request_identity=request_identity,
+                    coordinator_id=coordinator_id,
+                    turn_id=turn_id,
+                )
+
+    def _begin_pm_turn(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        coordinator_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        assignment = self._authorize_pm_coordinator(
             map_id=map_id,
             action="pm:begin_turn",
             request_identity=request_identity,
@@ -441,6 +610,62 @@ class MapGovernanceApplication:
         )
         if not isinstance(turn_id, str) or not turn_id.strip():
             raise ValueError("PM turn requires a stable turn identity")
+        normalized_turn_id = turn_id.strip()
+        if (
+            assignment["state"] == "active"
+            and assignment["active_turn_id"] != normalized_turn_id
+        ):
+            raise ValueError("PM assignment already has an active turn")
+        unresolved_turns = {
+            str(intent.payload.get("turn_id", ""))
+            for intent in self._outbox.unfinished_intents(
+                map_id=map_id,
+                effect_type=COORDINATOR_RESUME,
+            )
+        }
+        if unresolved_turns - {normalized_turn_id}:
+            raise ValueError("PM assignment already has an unresolved coordinator turn")
+        if self._coordinator_resume is not None:
+            effect_id = f"coordinator-resume:{map_id}:{normalized_turn_id}"
+            try:
+                enqueued = self._outbox.enqueue(
+                    effect_id=effect_id,
+                    effect_type=COORDINATOR_RESUME,
+                    map_id=map_id,
+                    payload={
+                        "profile_name": request_identity.profile_name,
+                        "session_id": request_identity.session_id,
+                        "coordinator_id": coordinator_id,
+                        "turn_id": normalized_turn_id,
+                    },
+                    created_at=self._synchronized_at(),
+                )
+            except OutboxConflictError as error:
+                raise ValueError(
+                    "PM turn identity belongs to another coordinator resume"
+                ) from error
+            outcome = self._outbox_dispatcher.dispatch_effect(
+                effect_id=effect_id,
+                owner_id=self._outbox_owner_id,
+                expedite_retry=not enqueued.created,
+            )
+            status = self._outbox.intent(effect_id)
+            if status is None:  # pragma: no cover
+                raise RuntimeError("Coordinator resume Outbox intent disappeared")
+            if status.state != "succeeded":
+                raise RuntimeError(
+                    status.last_error_message
+                    or status.terminal_reason
+                    or "Coordinator resume is pending"
+                )
+            assignment = self._storage.pm_assignment(map_id)
+            return {
+                "coordinator": self._pm_assignment_projection(assignment),
+                "idempotent": (
+                    not enqueued.created
+                    or (outcome is not None and outcome.reconciled_by_readback)
+                ),
+            }
         idempotent = self._storage.begin_pm_turn(
             map_id=map_id,
             coordinator_id=coordinator_id,
@@ -463,28 +688,40 @@ class MapGovernanceApplication:
         dispatch_id: str,
     ) -> dict[str, Any]:
         """Record the coordinator's dispatch boundary and leave the PM idle."""
-        self._authorize_pm_coordinator(
-            map_id=map_id,
-            action="pm:dispatch",
-            request_identity=request_identity,
-            coordinator_id=coordinator_id,
-        )
-        for name, value in (("turn_id", turn_id), ("dispatch_id", dispatch_id)):
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"PM dispatch requires a stable {name}")
-        idempotent = self._storage.finish_pm_turn(
-            map_id=map_id,
-            turn_id=turn_id.strip(),
-            outcome="dispatch",
-            outcome_id=dispatch_id.strip(),
-            finished_at=self._synchronized_at(),
-        )
-        return {
-            "coordinator": self._pm_assignment_projection(
-                self._storage.pm_assignment(map_id)
-            ),
-            "idempotent": idempotent,
-        }
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("pm-turn", lock_key):
+            with self._storage.pm_turn_lease(map_id):
+                self._authorize_pm_coordinator(
+                    map_id=map_id,
+                    action="pm:dispatch",
+                    request_identity=request_identity,
+                    coordinator_id=coordinator_id,
+                )
+                for name, value in (
+                    ("turn_id", turn_id),
+                    ("dispatch_id", dispatch_id),
+                ):
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(f"PM dispatch requires a stable {name}")
+                normalized_turn_id = turn_id.strip()
+                if self._pm_report_outcome_reserved(
+                    map_id=map_id,
+                    turn_id=normalized_turn_id,
+                ):
+                    raise ValueError("PM turn already has a reserved report outcome")
+                idempotent = self._storage.finish_pm_turn(
+                    map_id=map_id,
+                    turn_id=normalized_turn_id,
+                    outcome="dispatch",
+                    outcome_id=dispatch_id.strip(),
+                    finished_at=self._synchronized_at(),
+                )
+                return {
+                    "coordinator": self._pm_assignment_projection(
+                        self._storage.pm_assignment(map_id)
+                    ),
+                    "idempotent": idempotent,
+                }
 
     def report_pm(
         self,
@@ -510,62 +747,167 @@ class MapGovernanceApplication:
         if binding is None:
             raise MapBindingError(f"Map is not bound: {map_id}")
         lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("pm-turn", lock_key):
+            with self._storage.pm_turn_lease(map_id):
+                assignment = self._storage.pm_assignment_for_request(
+                    profile_name=request_identity.profile_name,
+                    session_id=request_identity.session_id,
+                )
+                if assignment is None or assignment["map_id"] != map_id:
+                    self._deny_governance_request(
+                        map_id=map_id,
+                        action="pm:report",
+                        request_identity=request_identity,
+                        reason="pm_assignment_missing",
+                    )
+                return self._report_pm_under_turn_lease(
+                    map_id=map_id,
+                    binding=binding,
+                    assignment=assignment,
+                    bound_report=bound_report,
+                )
+
+    def _report_pm_under_turn_lease(
+        self,
+        *,
+        map_id: str,
+        binding: dict[str, Any],
+        assignment: dict[str, Any],
+        bound_report: PMReport,
+    ) -> dict[str, Any]:
+        lock_key = f"{self._storage.database}:{map_id}"
         with _operation_lock("pm-report", lock_key):
             with self._storage.pm_report_lease(map_id):
-                active_turn_id = assignment.get("active_turn_id")
-                records = self._pm_report_records_by_id(
-                    self._tracker.list_pm_reports(binding["issue_url"])
+                effect_id = (
+                    f"tracker-pm-report:{map_id}:{bound_report.content.record_id}"
                 )
-                confirmed = records.get(bound_report.content.record_id)
-                idempotent = confirmed is not None
-                if confirmed is None:
+                existing_intent = self._outbox.intent(effect_id)
+                if existing_intent is None:
+                    active_turn_id = assignment.get("active_turn_id")
                     if assignment["state"] != "active" or not active_turn_id:
                         raise ValueError(
                             "PM report requires an active coordinator turn"
                         )
-                    self._tracker.append_pm_report(
-                        binding["issue_url"],
-                        issue_id=map_id,
-                        report=bound_report,
-                    )
-                    confirmed = self._pm_report_records_by_id(
-                        self._tracker.list_pm_reports(binding["issue_url"])
-                    ).get(bound_report.content.record_id)
-                    if confirmed is None:
-                        raise TrackerPMReportConfirmationError(
-                            "Tracker did not confirm the PM report in Issue history"
-                        )
-                if confirmed.report != bound_report:
-                    raise PMReportConflict(record_id=bound_report.content.record_id)
-                synchronized_at = self._project_pm_report_stage(
-                    binding=binding,
-                    report=bound_report,
-                )
-                projection = self._pm_report_projection(
-                    confirmed,
-                    confirmed_at=synchronized_at,
-                )
-                self._storage.save_pm_report_projection(
-                    map_id=map_id,
-                    report=projection,
-                )
-                result = {
-                    "map_id": map_id,
-                    "report": projection,
-                    "idempotent": idempotent,
-                }
-                if active_turn_id:
-                    self._storage.finish_pm_turn(
+                    if self._pm_report_outcome_reserved(
                         map_id=map_id,
                         turn_id=str(active_turn_id),
-                        outcome="report",
-                        outcome_id=bound_report.content.record_id,
-                        finished_at=self._synchronized_at(),
+                    ):
+                        raise ValueError(
+                            "PM turn already has a reserved report outcome"
+                        )
+                    issue = self._tracker.get_issue(binding["issue_url"])
+                    if issue.id != map_id:
+                        raise MapBindingError("Bound GitHub Issue identity changed")
+                    current_stage = self._executive_stage(issue)
+                    requested_stage = self._pm_report_requested_stage(
+                        current_stage=current_stage,
+                        report=bound_report,
                     )
-                result["coordinator"] = self._pm_assignment_projection(
-                    self._storage.pm_assignment(map_id)
+                    effect_payload = {
+                        "issue_url": binding["issue_url"],
+                        "issue_id": map_id,
+                        "project_id": binding["project_id"],
+                        "report": bound_report.payload(),
+                        "active_turn_id": str(active_turn_id),
+                        "expected_stage": current_stage,
+                        "requested_stage": requested_stage,
+                    }
+                else:
+                    persisted_report = existing_intent.payload.get("report")
+                    if (
+                        not isinstance(persisted_report, dict)
+                        or PMReport.from_payload(persisted_report) != bound_report
+                    ):
+                        raise PMReportConflict(record_id=bound_report.content.record_id)
+                    effect_payload = existing_intent.payload
+                try:
+                    enqueued = self._outbox.enqueue(
+                        effect_id=effect_id,
+                        effect_type=TRACKER_PM_REPORT,
+                        map_id=map_id,
+                        payload=effect_payload,
+                        created_at=self._synchronized_at(),
+                    )
+                except OutboxConflictError as error:
+                    raise PMReportConflict(
+                        record_id=bound_report.content.record_id
+                    ) from error
+                outcome = self._outbox_dispatcher.dispatch_effect(
+                    effect_id=effect_id,
+                    owner_id=self._outbox_owner_id,
+                    expedite_retry=not enqueued.created,
                 )
-                return result
+                self._require_pm_effect_success(
+                    effect_id=effect_id,
+                    record_id=bound_report.content.record_id,
+                )
+                stage_effect_id = self._pm_stage_effect_id(
+                    map_id=map_id,
+                    record_id=bound_report.content.record_id,
+                )
+                if self._outbox.intent(stage_effect_id) is not None:
+                    self._outbox_dispatcher.dispatch_effect(
+                        effect_id=stage_effect_id,
+                        owner_id=self._outbox_owner_id,
+                        expedite_retry=True,
+                    )
+                    stage_status = self._outbox.intent(stage_effect_id)
+                    if stage_status is None:  # pragma: no cover
+                        raise RuntimeError("PM stage Outbox intent disappeared")
+                    if stage_status.state != "succeeded":
+                        raise TrackerError(
+                            stage_status.last_error_message
+                            or stage_status.terminal_reason
+                            or "PM report stage transition is pending"
+                        )
+                stored_projection = next(
+                    (
+                        item
+                        for item in self._storage.recent_pm_reports(map_id=map_id)
+                        if item["record_id"] == bound_report.content.record_id
+                    ),
+                    None,
+                )
+                if stored_projection is None:  # pragma: no cover
+                    raise RuntimeError("Confirmed PM report projection disappeared")
+                report_status = self._outbox.intent(effect_id)
+                if report_status is None or report_status.acknowledgment is None:
+                    raise RuntimeError("Confirmed PM report acknowledgment disappeared")
+                report_acknowledgment = report_status.acknowledgment
+                projection = self._pm_report_projection(
+                    TrackerPMReportRecord(
+                        report=PMReport.from_payload(
+                            dict(report_acknowledgment["report"])
+                        ),
+                        tracker_record_id=str(
+                            report_acknowledgment["tracker_record_id"]
+                        ),
+                        tracker_record_url=str(
+                            report_acknowledgment["tracker_record_url"]
+                        ),
+                    ),
+                    confirmed_at=str(stored_projection["confirmed_at"]),
+                )
+                return {
+                    "map_id": map_id,
+                    "report": projection,
+                    "idempotent": (
+                        not enqueued.created
+                        or (outcome is not None and outcome.reconciled_by_readback)
+                    ),
+                    "coordinator": self._pm_assignment_projection(
+                        self._storage.pm_assignment(map_id)
+                    ),
+                }
+
+    def _pm_report_outcome_reserved(self, *, map_id: str, turn_id: str) -> bool:
+        return any(
+            intent.payload.get("active_turn_id") == turn_id
+            for intent in self._outbox.effect_intents(
+                map_id=map_id,
+                effect_type=TRACKER_PM_REPORT,
+            )
+        )
 
     def pm_state(
         self,
@@ -658,50 +1000,38 @@ class MapGovernanceApplication:
             )
         return assignment
 
-    def _project_pm_report_stage(
-        self,
+    @staticmethod
+    def _pm_report_requested_stage(
         *,
-        binding: dict[str, Any],
+        current_stage: str,
         report: PMReport,
-    ) -> str:
-        """Confirm any report-driven governance stage before local projection."""
-        issue = self._tracker.get_issue(binding["issue_url"])
-        if issue.id != report.assignment_map_id:
-            raise MapBindingError("Bound GitHub Issue identity changed")
-        current_stage = self._executive_stage(issue)
-        requested_stage = None
+    ) -> str | None:
         if current_stage == "delivery":
             if report.content.report_type == "acceptance":
-                requested_stage = "acceptance"
-            elif (
+                return "acceptance"
+            if (
                 report.content.report_type in {"question", "blocker"}
                 and report.content.blocking is True
             ):
-                requested_stage = "decision"
-        if requested_stage is not None:
-            issue = self._tracker.transition_issue_stage(
-                binding["issue_url"],
-                expected_stage=current_stage,
-                requested_stage=requested_stage,
-            )
-            if issue.id != report.assignment_map_id:
-                raise MapBindingError(
-                    "Bound GitHub Issue identity changed during PM stage projection"
-                )
-            if self._executive_stage(issue) != requested_stage:
-                raise TrackerConflictError(
-                    current_stage=self._executive_stage(issue),
-                    requested_stage=requested_stage,
-                )
-        synchronized_at = self._synchronized_at()
-        self._storage.save_map_projection(
-            self._stored_card(
-                issue,
-                project_id=binding["project_id"],
-                synchronized_at=synchronized_at,
-            )
+                return "decision"
+        return None
+
+    def _require_pm_effect_success(self, *, effect_id: str, record_id: str) -> None:
+        status = self._outbox.intent(effect_id)
+        if status is None:  # pragma: no cover
+            raise RuntimeError("PM report Outbox intent disappeared")
+        if status.state == "succeeded":
+            return
+        if status.last_error_type == TrackerEffectPayloadConflict.__name__:
+            raise PMReportConflict(record_id=record_id)
+        raise TrackerPMReportConfirmationError(
+            status.last_error_message
+            or "Tracker did not confirm the PM report in Issue history"
         )
-        return synchronized_at
+
+    @staticmethod
+    def _pm_stage_effect_id(*, map_id: str, record_id: str) -> str:
+        return f"stage-transition:pm-report:{map_id}:{record_id}"
 
     @staticmethod
     def _pm_report_records_by_id(
@@ -797,38 +1127,65 @@ class MapGovernanceApplication:
         binding = self._storage.map_binding(map_id)
         if binding is None:
             raise MapBindingError(f"Map is not bound: {map_id}")
-        existing = self._decision_records_by_id(
-            self._tracker.list_decisions(binding["issue_url"])
-        ).get(decision.decision_id)
-        idempotent = existing is not None
-        if existing is None:
-            self._tracker.append_decision(
-                binding["issue_url"],
-                issue_id=map_id,
-                decision=decision,
+        effect_id = f"tracker-decision:{map_id}:{decision.decision_id}"
+        try:
+            enqueued = self._outbox.enqueue(
+                effect_id=effect_id,
+                effect_type=TRACKER_DECISION,
+                map_id=map_id,
+                payload={
+                    "issue_url": binding["issue_url"],
+                    "issue_id": map_id,
+                    "decision": decision.payload(),
+                },
+                created_at=self._synchronized_at(),
             )
-            confirmed = self._decision_records_by_id(
-                self._tracker.list_decisions(binding["issue_url"])
-            ).get(decision.decision_id)
-            if confirmed is None:
-                raise TrackerDecisionConfirmationError(
-                    "Tracker did not confirm the structured decision in Issue history"
-                )
-        else:
-            confirmed = existing
-        if confirmed.decision != decision:
+        except OutboxConflictError as error:
             raise StructuredDecisionConflict(
-                decision_id=decision.decision_id,
-            )
-        projection = self._decision_projection(
-            confirmed,
-            confirmed_at=self._synchronized_at(),
+                decision_id=decision.decision_id
+            ) from error
+        outcome = self._outbox_dispatcher.dispatch_effect(
+            effect_id=effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=not enqueued.created,
         )
-        self._storage.save_decision_projection(map_id=map_id, decision=projection)
+        status = self._outbox.intent(effect_id)
+        if status is None:  # pragma: no cover
+            raise RuntimeError("Decision Outbox intent disappeared")
+        if status.state != "succeeded":
+            if status.last_error_type == TrackerEffectPayloadConflict.__name__:
+                raise StructuredDecisionConflict(decision_id=decision.decision_id)
+            message = status.last_error_message or "Tracker decision is pending retry"
+            if status.last_error_type == EffectRetryableError.__name__:
+                raise TrackerDecisionConfirmationError(message)
+            raise TrackerError(message)
+        acknowledgment = status.acknowledgment or {}
+        confirmed_payload = acknowledgment.get("decision")
+        if not isinstance(confirmed_payload, dict):  # pragma: no cover
+            raise RuntimeError("Confirmed decision acknowledgment disappeared")
+        projection = self._decision_projection(
+            TrackerDecisionRecord(
+                decision=StructuredDecision(**confirmed_payload),
+                tracker_record_id=str(acknowledgment["tracker_record_id"]),
+                tracker_record_url=str(acknowledgment["tracker_record_url"]),
+            ),
+            confirmed_at=(
+                self._format_datetime(
+                    datetime.fromisoformat(
+                        status.acknowledged_at.replace("Z", "+00:00")
+                    )
+                )
+                if status.acknowledged_at
+                else self._synchronized_at()
+            ),
+        )
         return {
             "map_id": map_id,
             "decision": projection,
-            "idempotent": idempotent,
+            "idempotent": (
+                not enqueued.created
+                or (outcome is not None and outcome.reconciled_by_readback)
+            ),
         }
 
     @staticmethod
@@ -932,28 +1289,16 @@ class MapGovernanceApplication:
                     payload_hash=packet.payload_hash,
                     details={**packet.payload(), "packet_hash": packet.packet_hash},
                 )
-                confirmed = self._append_confirmed_approval_event(
+                self._append_confirmed_approval_event(
                     issue_url=binding["issue_url"],
                     issue_id=map_id,
                     event=event,
+                    completion={
+                        "operation": "request",
+                        "requested_by_profile": request_identity.profile_name,
+                        "requested_by_session": request_identity.session_id,
+                    },
                 )
-                confirmed_requested_at = confirmed.event.occurred_at
-                try:
-                    self._storage.save_approval_request(
-                        map_id=map_id,
-                        packet=packet.payload(),
-                        packet_hash=packet.packet_hash,
-                        requested_by_profile=request_identity.profile_name,
-                        requested_by_session=request_identity.session_id,
-                        requested_at=confirmed_requested_at,
-                        tracker_record_id=confirmed.tracker_record_id,
-                        tracker_record_url=confirmed.tracker_record_url,
-                    )
-                except ValueError as error:
-                    raise ApprovalRequestConflict(
-                        request_id=packet.request_id,
-                        reason="stable request identity belongs to another packet",
-                    ) from error
                 stored = self._storage.approval(packet.request_id)
                 if stored is None:  # pragma: no cover - SQLite contract guard
                     raise RuntimeError("Approval ledger did not persist the request")
@@ -1042,26 +1387,11 @@ class MapGovernanceApplication:
                 binding = self._storage.map_binding(map_id)
                 if binding is None:
                     raise MapBindingError(f"Map is not bound: {map_id}")
-                confirmed = self._append_confirmed_approval_event(
+                self._append_confirmed_approval_event(
                     issue_url=binding["issue_url"],
                     issue_id=map_id,
                     event=event,
-                )
-                confirmed_details = confirmed.event.details
-                self._storage.apply_approval_decision(
-                    request_id=request_id,
-                    decision=decision,
-                    actor_id=str(confirmed_details["actor_id"]),
-                    actor_profile=str(confirmed_details["actor_profile"]),
-                    note=str(confirmed_details["note"]),
-                    decided_at=confirmed.event.occurred_at,
-                    expires_at=(
-                        str(confirmed_details["expires_at"])
-                        if confirmed_details.get("expires_at")
-                        else None
-                    ),
-                    tracker_record_id=confirmed.tracker_record_id,
-                    tracker_record_url=confirmed.tracker_record_url,
+                    completion={"operation": "decision"},
                 )
                 stored = self._storage.approval(request_id)
                 if stored is None:  # pragma: no cover - SQLite contract guard
@@ -1136,20 +1466,11 @@ class MapGovernanceApplication:
                 binding = self._storage.map_binding(map_id)
                 if binding is None:
                     raise MapBindingError(f"Map is not bound: {map_id}")
-                confirmed = self._append_confirmed_approval_event(
+                self._append_confirmed_approval_event(
                     issue_url=binding["issue_url"],
                     issue_id=map_id,
                     event=event,
-                )
-                confirmed_details = confirmed.event.details
-                self._storage.revoke_approval(
-                    request_id=request_id,
-                    actor_id=str(confirmed_details["actor_id"]),
-                    actor_profile=str(confirmed_details["actor_profile"]),
-                    note=str(confirmed_details["note"]),
-                    revoked_at=confirmed.event.occurred_at,
-                    tracker_record_id=confirmed.tracker_record_id,
-                    tracker_record_url=confirmed.tracker_record_url,
+                    completion={"operation": "revocation"},
                 )
                 stored = self._storage.approval(request_id)
                 if stored is None:  # pragma: no cover
@@ -1166,54 +1487,70 @@ class MapGovernanceApplication:
         issue_url: str,
         issue_id: str,
         event: ApprovalHistoryEvent,
+        completion: dict[str, Any],
     ) -> TrackerApprovalRecord:
-        records = self._approval_records_by_event_id(
-            self._tracker.list_approval_events(issue_url)
-        )
-        existing = records.get(event.event_id)
-        if existing is None:
-            self._tracker.append_approval_event(
-                issue_url,
-                issue_id=issue_id,
-                event=event,
+        effect_id = f"tracker-approval:{issue_id}:{event.event_id}"
+        existing_intent = self._outbox.intent(effect_id)
+        if existing_intent is not None:
+            persisted_event_payload = existing_intent.payload.get("event")
+            if not isinstance(persisted_event_payload, dict):
+                raise ApprovalRequestConflict(
+                    request_id=event.request_id,
+                    reason="durable tracker event has malformed content",
+                )
+            persisted_event = ApprovalHistoryEvent(**persisted_event_payload)
+            if not approval_events_semantically_compatible(persisted_event, event):
+                raise ApprovalRequestConflict(
+                    request_id=event.request_id,
+                    reason="tracker event identity has different content",
+                )
+            event = persisted_event
+        try:
+            enqueued = self._outbox.enqueue(
+                effect_id=effect_id,
+                effect_type=TRACKER_APPROVAL_EVENT,
+                map_id=issue_id,
+                payload={
+                    "issue_url": issue_url,
+                    "issue_id": issue_id,
+                    "event": event.payload(),
+                    "completion": completion,
+                },
+                created_at=self._synchronized_at(),
             )
-            records = self._approval_records_by_event_id(
-                self._tracker.list_approval_events(issue_url)
-            )
-            existing = records.get(event.event_id)
-        if existing is None:
-            raise TrackerApprovalConfirmationError(
-                "Tracker did not confirm the approval event in Issue history"
-            )
-        if not self._approval_events_semantically_compatible(
-            existing.event,
-            event,
-        ):
+        except OutboxConflictError as error:
             raise ApprovalRequestConflict(
                 request_id=event.request_id,
                 reason="tracker event identity has different content",
+            ) from error
+        self._outbox_dispatcher.dispatch_effect(
+            effect_id=effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=not enqueued.created,
+        )
+        status = self._outbox.intent(effect_id)
+        if status is None:  # pragma: no cover - durable enqueue contract guard
+            raise RuntimeError("Approval Outbox intent disappeared")
+        if status.state != "succeeded":
+            if status.last_error_type == TrackerEffectPayloadConflict.__name__:
+                raise ApprovalRequestConflict(
+                    request_id=event.request_id,
+                    reason="tracker event identity has different content",
+                )
+            raise TrackerApprovalConfirmationError(
+                status.last_error_message
+                or "Tracker did not confirm the approval event in Issue history"
             )
-        return existing
-
-    @staticmethod
-    def _approval_events_semantically_compatible(
-        existing: ApprovalHistoryEvent,
-        requested: ApprovalHistoryEvent,
-    ) -> bool:
-        if (
-            existing.event_id != requested.event_id
-            or existing.request_id != requested.request_id
-            or existing.event_type != requested.event_type
-            or existing.payload_hash != requested.payload_hash
-        ):
-            return False
-        if existing.event_type == "requested":
-            return existing.details == requested.details
-        stable_keys = {"actor_id", "actor_profile", "note", "decision"}
-        return all(
-            existing.details.get(key) == requested.details.get(key)
-            for key in stable_keys
-            if key in existing.details or key in requested.details
+        acknowledgment = status.acknowledgment or {}
+        confirmed_event = acknowledgment.get("event")
+        if not isinstance(confirmed_event, dict):
+            raise TrackerApprovalConfirmationError(
+                "Tracker approval acknowledgment has no event payload"
+            )
+        return TrackerApprovalRecord(
+            event=ApprovalHistoryEvent(**confirmed_event),
+            tracker_record_id=str(acknowledgment["tracker_record_id"]),
+            tracker_record_url=str(acknowledgment["tracker_record_url"]),
         )
 
     @staticmethod
@@ -1701,10 +2038,92 @@ class MapGovernanceApplication:
             raise RuntimeError("CEO session runner is unavailable")
         skill_content = self._ceo_skill_message()
         skill_hash = hashlib.sha256(skill_content.encode()).hexdigest()
+        idempotency_key = f"{identity}:skill:{skill_hash}"
+        if self._session_resume_outbox:
+            tip_hash = hashlib.sha256(session.live_session_id.encode()).hexdigest()[:16]
+            effect_id = f"session-resume:{map_id}:ceo-skill:{skill_hash}:{tip_hash}"
+            effect_payload = {
+                "root_session_id": session.root_session_id,
+                "content": skill_content,
+                "idempotency_key": idempotency_key,
+                "profile_name": self._profile_name or "",
+                "canonical_identity": identity,
+                "canonical_title": title,
+                "bootstrap_hash": bootstrap_hash,
+            }
+            existing_intent = self._outbox.intent(effect_id)
+            if existing_intent is not None:
+                stable_fields = {
+                    "root_session_id",
+                    "content",
+                    "idempotency_key",
+                    "profile_name",
+                    "canonical_identity",
+                    "canonical_title",
+                }
+                if any(
+                    existing_intent.payload.get(name) != effect_payload.get(name)
+                    for name in stable_fields
+                ):
+                    raise CEOSessionRepairRequired(
+                        reason="session_resume_identity_conflict"
+                    )
+                effect_payload = existing_intent.payload
+            try:
+                enqueued = self._outbox.enqueue(
+                    effect_id=effect_id,
+                    effect_type=SESSION_RESUME,
+                    map_id=map_id,
+                    payload=effect_payload,
+                    created_at=self._synchronized_at(),
+                )
+            except OutboxConflictError as error:
+                raise CEOSessionRepairRequired(
+                    reason="session_resume_identity_conflict"
+                ) from error
+            self._outbox_dispatcher.dispatch_effect(
+                effect_id=effect_id,
+                owner_id=self._outbox_owner_id,
+                expedite_retry=not enqueued.created,
+            )
+            status = self._outbox.intent(effect_id)
+            if status is None:  # pragma: no cover
+                raise RuntimeError("Session resume Outbox intent disappeared")
+            if status.state != "succeeded":
+                raise RuntimeError(
+                    status.last_error_message
+                    or status.terminal_reason
+                    or "Hermes session resume is pending"
+                )
+            refreshed = self._session_runner.resolve(
+                root_session_id=session.root_session_id
+            )
+            if refreshed is None:
+                raise RuntimeError("Hermes session disappeared after durable resume")
+            self._storage.save_ceo_session_ready(
+                map_id=map_id,
+                profile_name=self._profile_name or "",
+                canonical_identity=identity,
+                canonical_title=title,
+                root_session_id=refreshed.root_session_id,
+                live_session_id=refreshed.live_session_id,
+                last_activity_at=refreshed.last_activity_at,
+                bootstrap_hash=bootstrap_hash,
+                updated_at=self._synchronized_at(),
+            )
+            return {
+                "map_id": map_id,
+                "ceo_session": {
+                    "state": "ready",
+                    "root_session_id": refreshed.root_session_id,
+                    "live_session_id": refreshed.live_session_id,
+                    "last_activity_at": refreshed.last_activity_at,
+                },
+            }
         session = self._session_runner.load_skill(
             session,
             content=skill_content,
-            idempotency_key=f"{identity}:skill:{skill_hash}",
+            idempotency_key=idempotency_key,
         )
         self._storage.save_ceo_session_ready(
             map_id=map_id,
@@ -2024,6 +2443,16 @@ class MapGovernanceApplication:
                         request_id=approval_request_id,
                         reason="stable mutation identity belongs to another payload",
                     )
+            if existing_mutation is None and self._approval_revocation_unfinished(
+                map_id=map_id,
+                request_id=approval_request_id,
+            ):
+                self._deny_approval_enforcement(
+                    map_id=map_id,
+                    action=action,
+                    reason="approval_revocation_pending",
+                    actor_identity=actor_identity,
+                )
             approval = self._current_approval(request_id=approval_request_id)
             if approval is None or approval["map_id"] != map_id:
                 self._deny_approval_enforcement(
@@ -2061,39 +2490,19 @@ class MapGovernanceApplication:
         if current_issue.id != map_id:
             raise MapBindingError("Bound GitHub Issue identity changed")
         current_stage = self._executive_stage(current_issue)
-        if (
-            protected
-            and existing_mutation is not None
-            and current_stage == requested_stage
-        ):
-            synchronized_at = self._synchronized_at()
-            card = self._stored_card(
-                current_issue,
-                project_id=binding["project_id"],
-                synchronized_at=synchronized_at,
-            )
-            self._storage.save_map_projection(card)
-            self._storage.confirm_protected_mutation(
-                mutation_id=mutation_id or "",
-                confirmed_at=synchronized_at,
-            )
-            result = self._card_with_summary(
-                card,
-                project_url=project["project_url"],
-            )
-            result["protected_mutation"] = {
-                "mutation_id": mutation_id,
-                "approval_request_id": approval_request_id,
-                "idempotent": True,
-            }
-            return result
-        if current_stage != expected_stage:
+        replaying_committed_transition = current_stage == requested_stage and (
+            existing_mutation is not None or mutation_id is not None
+        )
+        if current_stage != expected_stage and not replaying_committed_transition:
             raise MapTransitionConflict(
                 current_stage=current_stage,
                 requested_stage=requested_stage,
                 reason="tracker stage changed; refresh and retry",
             )
-        if requested_stage not in ALLOWED_TRANSITIONS.get(current_stage, ()):
+        if (
+            not replaying_committed_transition
+            and requested_stage not in ALLOWED_TRANSITIONS.get(current_stage, ())
+        ):
             raise MapTransitionError(
                 current_stage=current_stage,
                 requested_stage=requested_stage,
@@ -2101,97 +2510,442 @@ class MapGovernanceApplication:
             )
 
         mutation_replay = existing_mutation is not None
-        if protected and existing_mutation is None:
-            try:
-                mutation_replay, reservation_status = (
-                    self._storage.reserve_protected_mutation(
-                        mutation_id=mutation_id or "",
-                        map_id=map_id,
-                        request_id=approval_request_id or "",
-                        action=action,
-                        scope=scope,
-                        payload=payload,
-                        payload_hash=payload_hash,
-                        reserved_at=self._synchronized_at(),
+        effect_payload = {
+            "issue_url": binding["issue_url"],
+            "issue_id": map_id,
+            "project_id": binding["project_id"],
+            "expected_stage": expected_stage,
+            "requested_stage": requested_stage,
+            "protected_mutation_id": mutation_id if protected else None,
+        }
+        effect_id_base = self._stage_effect_id(
+            map_id=map_id,
+            expected_stage=expected_stage,
+            requested_stage=requested_stage,
+            mutation_id=mutation_id,
+        )
+        intent_created_at = self._synchronized_at()
+        try:
+            if protected:
+                with self._storage.atomic() as connection:
+                    mutation_replay, reservation_status = (
+                        self._storage.reserve_protected_mutation_in_transaction(
+                            connection,
+                            mutation_id=mutation_id or "",
+                            map_id=map_id,
+                            request_id=approval_request_id or "",
+                            action=action,
+                            scope=scope,
+                            payload=payload,
+                            payload_hash=payload_hash,
+                            reserved_at=intent_created_at,
+                        )
                     )
+                    if reservation_status not in {"reserved", "confirmed"}:
+                        raise RuntimeError(
+                            "Approved mutation changed while holding its Map lease"
+                        )
+                    enqueued = self._outbox.enqueue_in_transaction(
+                        connection,
+                        effect_id=effect_id_base,
+                        effect_type=TRACKER_STAGE_TRANSITION,
+                        map_id=map_id,
+                        payload=effect_payload,
+                        created_at=intent_created_at,
+                    )
+            elif mutation_id is None:
+                enqueued = self._outbox.enqueue_occurrence(
+                    effect_id_base=effect_id_base,
+                    effect_type=TRACKER_STAGE_TRANSITION,
+                    map_id=map_id,
+                    payload=effect_payload,
+                    created_at=intent_created_at,
                 )
-            except ValueError as error:
+            else:
+                enqueued = self._outbox.enqueue(
+                    effect_id=effect_id_base,
+                    effect_type=TRACKER_STAGE_TRANSITION,
+                    map_id=map_id,
+                    payload=effect_payload,
+                    created_at=intent_created_at,
+                )
+        except OutboxConflictError as error:
+            if protected:
                 raise ApprovalRequestConflict(
                     request_id=approval_request_id or "",
-                    reason=str(error),
+                    reason="stable mutation identity belongs to another payload",
                 ) from error
-            if reservation_status not in {"reserved", "confirmed"}:
-                self._deny_approval_enforcement(
-                    map_id=map_id,
-                    action=action,
-                    reason=self._approval_status_reason(reservation_status),
-                    actor_identity=actor_identity,
+            raise MapTransitionError(
+                current_stage=current_stage,
+                requested_stage=requested_stage,
+                reason="stable transition identity belongs to another payload",
+            ) from error
+        except ValueError as error:
+            raise ApprovalRequestConflict(
+                request_id=approval_request_id or "",
+                reason=str(error),
+            ) from error
+        effect_id = enqueued.intent.effect_id
+        self._outbox_dispatcher.dispatch_effect(
+            effect_id=effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=not enqueued.created,
+        )
+        status = self._outbox.intent(effect_id)
+        if status is None:  # pragma: no cover - durable enqueue contract guard
+            raise RuntimeError("Stage-transition Outbox intent disappeared")
+        if status.state != "succeeded":
+            if status.state == "terminal":
+                observed = self._tracker.get_issue(binding["issue_url"])
+                raise MapTransitionConflict(
+                    current_stage=self._executive_stage(observed),
+                    requested_stage=requested_stage,
+                    reason=(
+                        "tracker stage changed; refresh and retry"
+                        if status.last_error_type == TrackerStageEffectConflict.__name__
+                        else status.terminal_reason or "tracker rejected transition"
+                    ),
                 )
-
-        try:
-            committed_issue = self._tracker.transition_issue_stage(
-                binding["issue_url"],
-                expected_stage=current_stage,
-                requested_stage=requested_stage,
+            reason = status.last_error_message or (
+                f"stage transition is {status.state}"
             )
-        except TrackerConflictError as error:
-            raise MapTransitionConflict(
-                current_stage=error.current_stage,
-                requested_stage=error.requested_stage,
-                reason="tracker stage changed; refresh and retry",
-            ) from error
-        if committed_issue.id != map_id:
-            raise MapBindingError(
-                "Bound GitHub Issue identity changed during transition"
-            )
-        try:
-            committed_stage = self._executive_stage(committed_issue)
-        except MapBindingError as error:
-            raise MapTransitionConflict(
-                current_stage="invalid",
-                requested_stage=requested_stage,
-                reason="tracker returned an invalid stage set; refresh and retry",
-            ) from error
-        if committed_stage != requested_stage:
-            raise MapTransitionConflict(
-                current_stage=committed_stage,
-                requested_stage=requested_stage,
-                reason="tracker stage changed; refresh and retry",
-            )
-        synchronized_at = self._synchronized_at()
-        card = self._stored_card(
-            committed_issue,
-            project_id=binding["project_id"],
-            synchronized_at=synchronized_at,
-        )
-        if protected:
-            self._storage.confirm_protected_mutation(
-                mutation_id=mutation_id or "",
-                confirmed_at=synchronized_at,
-            )
-        competing_stage = self._storage.compare_and_save_map_projection(
-            card,
-            expected_stage=expected_stage,
-        )
-        if competing_stage is not None:
-            raise MapTransitionConflict(
-                current_stage=competing_stage,
-                requested_stage=requested_stage,
-                reason=(
-                    "local projection changed after tracker commit; refresh to reconcile"
-                ),
-            )
-        result = self._card_with_summary(
-            card,
-            project_url=project["project_url"],
-        )
+            raise TrackerError(reason)
+        result = next(card for card in self.board()["maps"] if card["id"] == map_id)
+        result["external_effect"] = {
+            "effect_id": effect_id,
+            "state": status.state,
+            "attempt_count": status.attempt_count,
+            "acknowledged_at": status.acknowledged_at,
+        }
         if protected:
             result["protected_mutation"] = {
                 "mutation_id": mutation_id,
                 "approval_request_id": approval_request_id,
-                "idempotent": mutation_replay,
+                "idempotent": mutation_replay or not enqueued.created,
             }
         return result
+
+    def _approval_revocation_unfinished(
+        self,
+        *,
+        map_id: str,
+        request_id: str,
+    ) -> bool:
+        for intent in self._outbox.unfinished_intents(
+            map_id=map_id,
+            effect_type=TRACKER_APPROVAL_EVENT,
+        ):
+            event = intent.payload.get("event")
+            if (
+                isinstance(event, dict)
+                and event.get("request_id") == request_id
+                and event.get("event_type") == "revoked"
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _stage_effect_id(
+        *,
+        map_id: str,
+        expected_stage: str,
+        requested_stage: str,
+        mutation_id: str | None,
+    ) -> str:
+        if mutation_id:
+            return f"stage-transition:{mutation_id}"
+        digest = hashlib.sha256(
+            normalized_json(
+                {
+                    "map_id": map_id,
+                    "expected_stage": expected_stage,
+                    "requested_stage": requested_stage,
+                }
+            ).encode()
+        ).hexdigest()[:32]
+        return f"stage-transition:{digest}"
+
+    def _complete_external_effect(
+        self,
+        intent: OutboxIntent,
+        confirmation: EffectConfirmation,
+    ) -> None:
+        if intent.effect_type == COORDINATOR_RESUME:
+            try:
+                self._storage.begin_pm_turn(
+                    map_id=intent.map_id,
+                    coordinator_id=str(intent.payload["coordinator_id"]),
+                    turn_id=str(intent.payload["turn_id"]),
+                    started_at=self._synchronized_at(),
+                )
+            except ValueError as error:
+                raise EffectTerminalError(str(error)) from error
+            return
+        if intent.effect_type == SESSION_RESUME:
+            session_payload = confirmation.acknowledgment.get("session")
+            if not isinstance(session_payload, dict):
+                raise EffectRetryableError(
+                    "Hermes resume confirmation has no session payload"
+                )
+            self._storage.save_ceo_session_ready(
+                map_id=intent.map_id,
+                profile_name=str(intent.payload["profile_name"]),
+                canonical_identity=str(intent.payload["canonical_identity"]),
+                canonical_title=str(intent.payload["canonical_title"]),
+                root_session_id=str(session_payload["root_session_id"]),
+                live_session_id=str(session_payload["live_session_id"]),
+                last_activity_at=(
+                    str(session_payload["last_activity_at"])
+                    if session_payload.get("last_activity_at") is not None
+                    else None
+                ),
+                bootstrap_hash=str(intent.payload["bootstrap_hash"]),
+                updated_at=self._synchronized_at(),
+            )
+            return
+        if intent.effect_type == TRACKER_PM_REPORT:
+            self._complete_pm_report_effect(intent, confirmation)
+            return
+        if intent.effect_type == TRACKER_APPROVAL_EVENT:
+            self._complete_approval_effect(intent, confirmation)
+            return
+        if intent.effect_type == TRACKER_DECISION:
+            acknowledgment = confirmation.acknowledgment
+            decision_payload = acknowledgment.get("decision")
+            if not isinstance(decision_payload, dict):
+                raise EffectRetryableError(
+                    "Tracker decision confirmation has no decision payload"
+                )
+            record = TrackerDecisionRecord(
+                decision=StructuredDecision(**decision_payload),
+                tracker_record_id=str(acknowledgment["tracker_record_id"]),
+                tracker_record_url=str(acknowledgment["tracker_record_url"]),
+            )
+            self._storage.save_decision_projection(
+                map_id=intent.map_id,
+                decision=self._decision_projection(
+                    record,
+                    confirmed_at=self._synchronized_at(),
+                ),
+            )
+            return
+        if intent.effect_type != TRACKER_STAGE_TRANSITION:
+            raise EffectRetryableError(
+                f"No local completion is configured for {intent.effect_type}"
+            )
+        issue_payload = confirmation.acknowledgment.get("issue")
+        if not isinstance(issue_payload, dict):
+            raise EffectRetryableError(
+                "Tracker stage confirmation has no authoritative Issue payload"
+            )
+        issue = TrackerEffectAdapter.issue_from_payload(issue_payload)
+        synchronized_at = self._synchronized_at()
+        card = self._stored_card(
+            issue,
+            project_id=str(intent.payload["project_id"]),
+            synchronized_at=synchronized_at,
+        )
+        competing_stage = self._storage.compare_and_save_map_projection(
+            card,
+            expected_stage=str(intent.payload["expected_stage"]),
+        )
+        if competing_stage is not None and competing_stage != card["stage"]:
+            raise EffectRetryableError(
+                "local projection changed after tracker confirmation"
+            )
+        protected_mutation_id = intent.payload.get("protected_mutation_id")
+        if protected_mutation_id:
+            self._storage.confirm_protected_mutation(
+                mutation_id=str(protected_mutation_id),
+                confirmed_at=synchronized_at,
+            )
+        pm_report_completion = intent.payload.get("pm_report_completion")
+        if isinstance(pm_report_completion, dict):
+            self._finalize_pm_report(
+                map_id=intent.map_id,
+                completion=pm_report_completion,
+            )
+
+    def _complete_pm_report_effect(
+        self,
+        intent: OutboxIntent,
+        confirmation: EffectConfirmation,
+    ) -> None:
+        acknowledgment = confirmation.acknowledgment
+        report_payload = acknowledgment.get("report")
+        if not isinstance(report_payload, dict):
+            raise EffectRetryableError("Tracker PM confirmation has no report payload")
+        requested_stage = intent.payload.get("requested_stage")
+        completion = {
+            "report": report_payload,
+            "tracker_record_id": str(acknowledgment["tracker_record_id"]),
+            "tracker_record_url": str(acknowledgment["tracker_record_url"]),
+            "active_turn_id": str(intent.payload["active_turn_id"]),
+        }
+        if requested_stage is None:
+            self._finalize_pm_report(map_id=intent.map_id, completion=completion)
+            return
+        report = PMReport.from_payload(report_payload)
+        effect_id = self._pm_stage_effect_id(
+            map_id=intent.map_id,
+            record_id=report.content.record_id,
+        )
+        try:
+            self._outbox.enqueue(
+                effect_id=effect_id,
+                effect_type=TRACKER_STAGE_TRANSITION,
+                map_id=intent.map_id,
+                payload={
+                    "issue_url": str(intent.payload["issue_url"]),
+                    "issue_id": intent.map_id,
+                    "project_id": str(intent.payload["project_id"]),
+                    "expected_stage": str(intent.payload["expected_stage"]),
+                    "requested_stage": str(requested_stage),
+                    "protected_mutation_id": None,
+                    "pm_report_completion": completion,
+                },
+                created_at=self._synchronized_at(),
+            )
+        except OutboxConflictError as error:
+            raise TrackerEffectPayloadConflict(
+                "PM report stage identity belongs to another payload"
+            ) from error
+
+    def _finalize_pm_report(
+        self,
+        *,
+        map_id: str,
+        completion: dict[str, Any],
+    ) -> None:
+        report_payload = completion.get("report")
+        if not isinstance(report_payload, dict):
+            raise EffectRetryableError("PM completion has no report payload")
+        report = PMReport.from_payload(report_payload)
+        record = TrackerPMReportRecord(
+            report=report,
+            tracker_record_id=str(completion["tracker_record_id"]),
+            tracker_record_url=str(completion["tracker_record_url"]),
+        )
+        self._storage.save_pm_report_projection(
+            map_id=map_id,
+            report=self._pm_report_projection(
+                record,
+                confirmed_at=self._synchronized_at(),
+            ),
+        )
+        try:
+            self._storage.finish_pm_turn(
+                map_id=map_id,
+                turn_id=str(completion["active_turn_id"]),
+                outcome="report",
+                outcome_id=report.content.record_id,
+                finished_at=self._synchronized_at(),
+            )
+        except ValueError as error:
+            raise EffectTerminalError(str(error)) from error
+
+    def _complete_approval_effect(
+        self,
+        intent: OutboxIntent,
+        confirmation: EffectConfirmation,
+    ) -> None:
+        acknowledgment = confirmation.acknowledgment
+        event_payload = acknowledgment.get("event")
+        if not isinstance(event_payload, dict):
+            raise EffectRetryableError(
+                "Tracker approval confirmation has no event payload"
+            )
+        event = ApprovalHistoryEvent(**event_payload)
+        tracker_record_id = str(acknowledgment["tracker_record_id"])
+        tracker_record_url = str(acknowledgment["tracker_record_url"])
+        completion = intent.payload.get("completion")
+        if not isinstance(completion, dict):
+            raise EffectRetryableError("Approval effect has no completion metadata")
+        operation = completion.get("operation")
+        approval = self._storage.approval(event.request_id)
+        if operation == "request":
+            packet = event.details
+            if approval is not None:
+                if approval["map_id"] != intent.map_id or approval[
+                    "packet_hash"
+                ] != packet.get("packet_hash"):
+                    raise TrackerEffectPayloadConflict(
+                        "approval request projection belongs to another packet"
+                    )
+                return
+            self._storage.save_approval_request(
+                map_id=intent.map_id,
+                packet=packet,
+                packet_hash=str(packet["packet_hash"]),
+                requested_by_profile=str(completion["requested_by_profile"]),
+                requested_by_session=str(completion["requested_by_session"]),
+                requested_at=event.occurred_at,
+                tracker_record_id=tracker_record_id,
+                tracker_record_url=tracker_record_url,
+            )
+            return
+        if approval is None:
+            raise EffectRetryableError(
+                "Approval request projection is missing before its outcome"
+            )
+        details = event.details
+        if operation == "decision":
+            if approval["status"] == event.event_type:
+                if (
+                    approval["decided_by"] == details.get("actor_id")
+                    and approval["decided_by_profile"] == details.get("actor_profile")
+                    and approval["decision_note"] == details.get("note")
+                ):
+                    return
+                raise TrackerEffectPayloadConflict(
+                    "approval decision projection has different content"
+                )
+            if approval["status"] != "pending":
+                raise TrackerEffectPayloadConflict(
+                    "approval projection is no longer pending"
+                )
+            self._storage.apply_approval_decision(
+                request_id=event.request_id,
+                decision=event.event_type,
+                actor_id=str(details["actor_id"]),
+                actor_profile=str(details["actor_profile"]),
+                note=str(details["note"]),
+                decided_at=event.occurred_at,
+                expires_at=(
+                    str(details["expires_at"]) if details.get("expires_at") else None
+                ),
+                tracker_record_id=tracker_record_id,
+                tracker_record_url=tracker_record_url,
+            )
+            return
+        if operation == "revocation":
+            if approval["status"] == "revoked":
+                if (
+                    approval["decided_by"] == details.get("actor_id")
+                    and approval["decided_by_profile"] == details.get("actor_profile")
+                    and approval["decision_note"] == details.get("note")
+                ):
+                    return
+                raise TrackerEffectPayloadConflict(
+                    "approval revocation projection has different content"
+                )
+            if approval["status"] != "approved":
+                raise TrackerEffectPayloadConflict(
+                    "approval projection is no longer revocable"
+                )
+            self._storage.revoke_approval(
+                request_id=event.request_id,
+                actor_id=str(details["actor_id"]),
+                actor_profile=str(details["actor_profile"]),
+                note=str(details["note"]),
+                revoked_at=event.occurred_at,
+                tracker_record_id=tracker_record_id,
+                tracker_record_url=tracker_record_url,
+            )
+            return
+        raise EffectTerminalError(
+            f"Unsupported approval completion operation: {operation}"
+        )
 
     def _validate_approval_action(
         self,
@@ -2379,6 +3133,7 @@ class MapGovernanceApplication:
             "latest": approvals["items"][0] if approvals["items"] else None,
         }
         card["delivery_summary"] = self._storage.pm_delivery_summary(map_id=card["id"])
+        card["external_effects"] = self._outbox.map_summary(card["id"])
         return card
 
     @staticmethod

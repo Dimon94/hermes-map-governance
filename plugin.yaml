@@ -11,6 +11,14 @@ tags:
   - dashboard
   - maps
 config_schema:
+  outbox:
+    type: object
+    default:
+      lease_seconds: 30
+      poll_seconds: 1
+      base_retry_seconds: 5
+      max_retry_seconds: 300
+      max_attempts: 5
   authority:
     type: object
     default:

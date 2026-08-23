@@ -566,6 +566,45 @@
                         )
                       : null,
                   ),
+                  React.createElement(
+                    "section",
+                    { className: "space-y-1", "aria-label": "External effect delivery" },
+                    React.createElement(
+                      "p",
+                      null,
+                      (card.external_effects || {}).state === "needs_repair"
+                        ? "External effects need operator repair"
+                        : (card.external_effects || {}).state === "retrying"
+                          ? "External effects retrying"
+                          : (card.external_effects || {}).state === "in_progress"
+                            ? "External effects in progress"
+                            : "External effects healthy",
+                    ),
+                    (card.external_effects || {}).retry_scheduled_count
+                      ? React.createElement(
+                          Badge,
+                          { variant: "outline" },
+                          card.external_effects.retry_scheduled_count + " retry scheduled",
+                        )
+                      : null,
+                    (card.external_effects || {}).latest_terminal
+                      ? React.createElement(
+                          "div",
+                          { className: "space-y-1 rounded-md border p-2" },
+                          React.createElement(
+                            "p",
+                            { className: "font-medium text-foreground" },
+                            card.external_effects.latest_terminal.terminal_outcome.message,
+                          ),
+                          React.createElement(
+                            "p",
+                            null,
+                            "Repair action: maps outbox repair --effect "
+                              + card.external_effects.latest_terminal.effect_id,
+                          ),
+                        )
+                      : null,
+                  ),
                   detailState.mapId === card.id && detailState.status === "ready"
                     ? React.createElement(
                         "section",
