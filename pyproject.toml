@@ -1,0 +1,10 @@
+[project]
+name = "hermes-map-governance"
+version = "0.1.0"
+description = "Standalone Map Governance plugin for Hermes"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

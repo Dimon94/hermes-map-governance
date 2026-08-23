@@ -1,0 +1,13 @@
+{
+  "name": "map-governance",
+  "label": "Maps",
+  "description": "Executive governance boards backed by GitHub Map Issues",
+  "icon": "Globe",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/maps",
+    "position": "after:sessions"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

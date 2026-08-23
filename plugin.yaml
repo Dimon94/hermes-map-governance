@@ -1,0 +1,12 @@
+name: map-governance
+version: 0.1.0
+description: Standalone governance plane for Hermes Maps
+kind: standalone
+manifest_version: 1
+api_version: 1
+license: MIT
+homepage: https://github.com/Dimon94/hermes-map-governance
+tags:
+  - governance
+  - dashboard
+  - maps
