@@ -115,6 +115,18 @@ class PluginStorage:
                 )
             ]
 
+    def map_binding(self, map_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT map_id, project_id, issue_url
+                FROM map_bindings
+                WHERE map_id = ?
+                """,
+                (map_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def save_project_projection(
         self,
         *,
@@ -163,6 +175,49 @@ class PluginStorage:
                     card["synchronized_at"],
                 ),
             )
+
+    def compare_and_save_map_projection(
+        self,
+        card: dict[str, Any],
+        *,
+        expected_stage: str,
+    ) -> str | None:
+        """Save a committed tracker projection unless another writer changed it."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE map_projections
+                SET
+                    project_id = ?,
+                    repository = ?,
+                    issue_number = ?,
+                    issue_url = ?,
+                    title = ?,
+                    stage = ?,
+                    ceo_session_state = ?,
+                    synchronized_at = ?
+                WHERE map_id = ? AND stage = ?
+                """,
+                (
+                    card["project_id"],
+                    card["repository"],
+                    card["issue_number"],
+                    card["issue_url"],
+                    card["title"],
+                    card["stage"],
+                    card["ceo_session_state"],
+                    card["synchronized_at"],
+                    card["id"],
+                    expected_stage,
+                ),
+            )
+            if cursor.rowcount == 1:
+                return None
+            row = connection.execute(
+                "SELECT stage FROM map_projections WHERE map_id = ?",
+                (card["id"],),
+            ).fetchone()
+            return str(row["stage"]) if row is not None else "missing"
 
     def board_rows(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         with self._connect() as connection:

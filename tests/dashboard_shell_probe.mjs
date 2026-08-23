@@ -34,11 +34,17 @@ function useState(initialValue) {
 function fetchJSON(path, options) {
   requestedPaths.push(path);
   requestedOptions.push(options || {});
+  if (path.includes("/transitions?profile=")) {
+    if (mode === "transition-failure") {
+      return Promise.reject(new Error("GitHub denied the stage label update"));
+    }
+    return Promise.resolve({ stage: "delivery" });
+  }
   if (path.includes("/refresh?profile=")) {
     return Promise.resolve({ refreshed: true });
   }
   if (path.includes("/board?profile=")) {
-    if (mode === "populated") {
+    if (mode !== "empty") {
       const card = {
         id: "I_atlas_41",
         project: {
@@ -53,6 +59,7 @@ function fetchJSON(path, options) {
         },
         title: "Map the Atlas launch",
         stage: "authorized",
+        available_transitions: ["delivery", "parked"],
         ceo_session: { state: "unbound" },
         last_synchronized_at: "2026-08-23T07:30:00Z",
       };
@@ -160,13 +167,45 @@ assert.deepEqual(requestedPaths, [
   "/api/plugins/map-governance/board?profile=worker",
   "/api/plugins/map-governance/health?profile=worker",
 ]);
-if (mode === "populated") {
+if (mode !== "empty") {
   assert.match(renderedText, /Acme CEO portfolio/);
   assert.match(renderedText, /Map the Atlas launch/);
   assert.match(renderedText, /acme\/atlas#41/);
   assert.match(renderedText, /authorized/);
   assert.match(renderedText, /CEO session: unbound/);
   assert.match(renderedText, /2026-08-23T07:30:00Z/);
+  const transitionButton = findNode(
+    readyTree,
+    (node) => node.type === "Button" && /Move to delivery/.test(textContent(node)),
+  );
+  assert.ok(transitionButton, "Map card exposes an explicit governed transition control");
+  transitionButton.props.onClick();
+
+  hookIndex = 0;
+  const pendingTree = registeredPage();
+  assert.match(textContent(pendingTree), /authorized/);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const transitionIndex = requestedPaths.findIndex((path) => path.includes("/transitions?profile="));
+  assert.notEqual(transitionIndex, -1);
+  assert.equal(
+    requestedPaths[transitionIndex],
+    "/api/plugins/map-governance/transitions?profile=worker",
+  );
+  assert.equal(requestedOptions[transitionIndex].method, "POST");
+  assert.deepEqual(JSON.parse(requestedOptions[transitionIndex].body), {
+    map_id: "I_atlas_41",
+    expected_stage: "authorized",
+    requested_stage: "delivery",
+  });
+  if (mode === "transition-failure") {
+    hookIndex = 0;
+    const failedTree = registeredPage();
+    const failedText = textContent(failedTree);
+    assert.match(failedText, /authorized/);
+    assert.match(failedText, /GitHub denied the stage label update/);
+  }
 } else {
   assert.match(renderedText, /No Maps are bound/);
   assert.match(renderedText, /Bind an existing GitHub Map Issue/);
@@ -187,4 +226,10 @@ assert.equal(requestedPaths[refreshIndex], "/api/plugins/map-governance/refresh?
 assert.equal(requestedOptions[refreshIndex].method, "POST");
 assert.deepEqual(JSON.parse(requestedOptions[refreshIndex].body), {});
 
-process.stdout.write(mode === "populated" ? "dashboard board ready\n" : "dashboard shell ready\n");
+process.stdout.write(
+  mode === "empty"
+    ? "dashboard shell ready\n"
+    : mode === "transition-failure"
+      ? "dashboard transition failure ready\n"
+      : "dashboard board ready\n",
+);

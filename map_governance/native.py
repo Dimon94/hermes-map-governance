@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import sys
 from argparse import ArgumentParser, Namespace
 
+from .application import MapBindingError, MapTransitionError
 from .runtime import application_for_storage
+from .tracker import TrackerError
 
 
 def _setup_maps_command(parser: ArgumentParser) -> None:
@@ -27,6 +30,19 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
 
     refresh = commands.add_parser("refresh", help="Refresh board projections")
     refresh.add_argument("--project", help="Refresh only this configured Project")
+
+    transition = commands.add_parser(
+        "transition",
+        help="Request a governed Map stage transition",
+    )
+    transition.add_argument("--map", required=True, help="Bound Map Issue node id")
+    transition.add_argument(
+        "--from",
+        dest="expected_stage",
+        required=True,
+        help="Stage shown when the transition was requested",
+    )
+    transition.add_argument("--stage", required=True, help="Requested executive stage")
 
 
 def register(ctx) -> None:
@@ -53,6 +69,48 @@ def register(ctx) -> None:
             return 0
         if args.maps_command == "refresh":
             report = application.refresh(project_id=args.project)
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        if args.maps_command == "transition":
+            try:
+                report = application.transition_map(
+                    map_id=args.map,
+                    expected_stage=args.expected_stage,
+                    requested_stage=args.stage,
+                )
+            except MapTransitionError as error:
+                print(json.dumps({"error": error.as_dict()}, sort_keys=True), file=sys.stderr)
+                return 1
+            except MapBindingError as error:
+                print(
+                    json.dumps(
+                        {
+                            "error": {
+                                "type": "binding_error",
+                                "reason": str(error),
+                                "retryable": False,
+                            }
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            except TrackerError as error:
+                print(
+                    json.dumps(
+                        {
+                            "error": {
+                                "type": "tracker_error",
+                                "reason": str(error),
+                                "retryable": True,
+                            }
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
             print(json.dumps(report, sort_keys=True))
             return 0
         return 2

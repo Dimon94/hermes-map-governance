@@ -5,27 +5,67 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock, RLock
 from typing import Any, Callable
 
+from .stages import (
+    ALLOWED_TRANSITIONS,
+    available_transitions,
+    executive_stage,
+    rejection_reason,
+)
 from .storage import PluginStorage
-from .tracker import GitHubTrackerAdapter, TrackerAdapter, TrackerIssue, TrackerProject
-
-
-ACTIVE_STAGES = frozenset(
-    {
-        "discovery",
-        "awaiting-approval",
-        "authorized",
-        "delivery",
-        "decision",
-        "acceptance",
-        "parked",
-    }
+from .tracker import (
+    GitHubTrackerAdapter,
+    TrackerAdapter,
+    TrackerConflictError,
+    TrackerIssue,
+    TrackerProject,
 )
 
 
 class MapBindingError(ValueError):
     """Raised when a requested binding violates governance identity rules."""
+
+
+class MapTransitionError(ValueError):
+    """Raised when the governance policy rejects a requested stage change."""
+
+    def __init__(self, *, current_stage: str, requested_stage: str, reason: str) -> None:
+        self.current_stage = current_stage
+        self.requested_stage = requested_stage
+        self.reason = reason
+        super().__init__(
+            f"Cannot transition Map from {current_stage!r} to "
+            f"{requested_stage!r}: {reason}"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "invalid_transition",
+            "current_stage": self.current_stage,
+            "requested_stage": self.requested_stage,
+            "reason": self.reason,
+            "retryable": False,
+        }
+
+
+class MapTransitionConflict(MapTransitionError):
+    """Raised when a concurrent tracker change requires refresh or retry."""
+
+    def as_dict(self) -> dict[str, Any]:
+        detail = super().as_dict()
+        detail.update(type="transition_conflict", retryable=True)
+        return detail
+
+
+_TRANSITION_LOCKS: dict[str, RLock] = {}
+_TRANSITION_LOCKS_GUARD = Lock()
+
+
+def _transition_lock(map_id: str) -> RLock:
+    with _TRANSITION_LOCKS_GUARD:
+        return _TRANSITION_LOCKS.setdefault(map_id, RLock())
 
 
 class MapGovernanceApplication:
@@ -181,6 +221,100 @@ class MapGovernanceApplication:
                 )
         return self.board()
 
+    def transition_map(
+        self,
+        *,
+        map_id: str,
+        expected_stage: str,
+        requested_stage: str,
+    ) -> dict[str, Any]:
+        """Commit a governed stage transition to the tracker, then project it."""
+        with _transition_lock(map_id):
+            return self._transition_map(
+                map_id=map_id,
+                expected_stage=expected_stage,
+                requested_stage=requested_stage,
+            )
+
+    def _transition_map(
+        self,
+        *,
+        map_id: str,
+        expected_stage: str,
+        requested_stage: str,
+    ) -> dict[str, Any]:
+        binding = self._storage.map_binding(map_id)
+        if binding is None:
+            raise MapBindingError(f"Map is not bound: {map_id}")
+        project = self._storage.project_binding(binding["project_id"])
+        if project is None:
+            raise MapBindingError(f'CEO project is not configured: {binding["project_id"]}')
+
+        current_issue = self._tracker.get_issue(binding["issue_url"])
+        if current_issue.id != map_id:
+            raise MapBindingError("Bound GitHub Issue identity changed")
+        current_stage = self._executive_stage(current_issue)
+        if current_stage != expected_stage:
+            raise MapTransitionConflict(
+                current_stage=current_stage,
+                requested_stage=requested_stage,
+                reason="tracker stage changed; refresh and retry",
+            )
+        if requested_stage not in ALLOWED_TRANSITIONS.get(current_stage, ()):
+            raise MapTransitionError(
+                current_stage=current_stage,
+                requested_stage=requested_stage,
+                reason=rejection_reason(current_stage, requested_stage),
+            )
+
+        try:
+            committed_issue = self._tracker.transition_issue_stage(
+                binding["issue_url"],
+                expected_stage=current_stage,
+                requested_stage=requested_stage,
+            )
+        except TrackerConflictError as error:
+            raise MapTransitionConflict(
+                current_stage=error.current_stage,
+                requested_stage=error.requested_stage,
+                reason="tracker stage changed; refresh and retry",
+            ) from error
+        if committed_issue.id != map_id:
+            raise MapBindingError("Bound GitHub Issue identity changed during transition")
+        try:
+            committed_stage = self._executive_stage(committed_issue)
+        except MapBindingError as error:
+            raise MapTransitionConflict(
+                current_stage="invalid",
+                requested_stage=requested_stage,
+                reason="tracker returned an invalid stage set; refresh and retry",
+            ) from error
+        if committed_stage != requested_stage:
+            raise MapTransitionConflict(
+                current_stage=committed_stage,
+                requested_stage=requested_stage,
+                reason="tracker stage changed; refresh and retry",
+            )
+        synchronized_at = self._synchronized_at()
+        card = self._stored_card(
+            committed_issue,
+            project_id=binding["project_id"],
+            synchronized_at=synchronized_at,
+        )
+        competing_stage = self._storage.compare_and_save_map_projection(
+            card,
+            expected_stage=expected_stage,
+        )
+        if competing_stage is not None:
+            raise MapTransitionConflict(
+                current_stage=competing_stage,
+                requested_stage=requested_stage,
+                reason=(
+                    "local projection changed after tracker commit; refresh to reconcile"
+                ),
+            )
+        return self._card_projection(card, project_url=project["project_url"])
+
     def _synchronized_at(self) -> str:
         value = self._clock()
         if value.tzinfo is None:
@@ -219,18 +353,14 @@ class MapGovernanceApplication:
 
     @staticmethod
     def _executive_stage(issue: TrackerIssue) -> str:
-        if issue.state == "closed":
-            return "cancelled" if issue.state_reason == "not_planned" else "done"
-        stage_labels = [
-            label.removeprefix("map-stage/")
-            for label in issue.labels
-            if label.startswith("map-stage/")
-        ]
-        if len(stage_labels) != 1 or stage_labels[0] not in ACTIVE_STAGES:
-            raise MapBindingError(
-                "Open Map Issue must have exactly one supported map-stage/* label"
+        try:
+            return executive_stage(
+                issue_state=issue.state,
+                state_reason=issue.state_reason,
+                labels=issue.labels,
             )
-        return stage_labels[0]
+        except ValueError as error:
+            raise MapBindingError(str(error)) from error
 
     @staticmethod
     def _configured_project(
@@ -291,6 +421,7 @@ class MapGovernanceApplication:
             },
             "title": row["title"],
             "stage": row["stage"],
+            "available_transitions": list(available_transitions(row["stage"])),
             "ceo_session": {"state": row["ceo_session_state"]},
             "last_synchronized_at": row["synchronized_at"],
         }

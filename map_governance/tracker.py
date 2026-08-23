@@ -8,9 +8,23 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 from urllib.parse import urlparse
 
+from .stages import executive_stage
+
 
 class TrackerError(RuntimeError):
     """Raised when tracker data cannot be read or violates the contract."""
+
+
+class TrackerConflictError(TrackerError):
+    """Raised when tracker truth changed after application validation."""
+
+    def __init__(self, *, current_stage: str, requested_stage: str) -> None:
+        self.current_stage = current_stage
+        self.requested_stage = requested_stage
+        super().__init__(
+            f"Tracker stage changed to {current_stage!r} while requesting "
+            f"{requested_stage!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -39,6 +53,14 @@ class TrackerAdapter(Protocol):
     def get_project(self, url: str) -> TrackerProject: ...
 
     def get_issue(self, url: str) -> TrackerIssue: ...
+
+    def transition_issue_stage(
+        self,
+        url: str,
+        *,
+        expected_stage: str,
+        requested_stage: str,
+    ) -> TrackerIssue: ...
 
 
 class CommandRunner(Protocol):
@@ -102,8 +124,41 @@ query MapGovernanceIssue($url: URI!) {
       state
       stateReason
       repository { nameWithOwner }
-      labels(first: 100) { nodes { name } }
+      labels(first: 100) {
+        nodes { name }
+        pageInfo { hasNextPage }
+      }
     }
+  }
+}
+"""
+
+
+_STAGE_TRANSITION_CONTEXT_QUERY = """
+query MapGovernanceStageTransitionContext($url: URI!, $label: String!) {
+  resource(url: $url) {
+    __typename
+    ... on Issue {
+      id
+      state
+      stateReason
+      labels(first: 100) {
+        nodes { id name }
+        pageInfo { hasNextPage }
+      }
+      repository {
+        label(name: $label) { id name }
+      }
+    }
+  }
+}
+"""
+
+
+_UPDATE_ISSUE_LABELS_MUTATION = """
+mutation MapGovernanceUpdateIssueStage($issue: ID!, $labels: [ID!]!) {
+  updateIssue(input: {id: $issue, labelIds: $labels}) {
+    issue { id }
   }
 }
 """
@@ -165,7 +220,16 @@ class GitHubTrackerAdapter:
         resource = self._resource(_ISSUE_QUERY, url)
         if resource.get("__typename") != "Issue":
             raise TrackerError(f"GitHub resource is not an Issue: {url}")
-        labels = resource.get("labels", {}).get("nodes", [])
+        labels = resource.get("labels")
+        if not isinstance(labels, dict):
+            raise TrackerError(f"GitHub Issue labels are incomplete: {url}")
+        if labels.get("pageInfo", {}).get("hasNextPage"):
+            raise TrackerError(
+                "GitHub Issue has more than 100 labels; cannot prove one active stage"
+            )
+        nodes = labels.get("nodes")
+        if not isinstance(nodes, list):
+            raise TrackerError(f"GitHub Issue labels are incomplete: {url}")
         try:
             return TrackerIssue(
                 id=str(resource["id"]),
@@ -179,13 +243,92 @@ class GitHubTrackerAdapter:
                     if resource.get("stateReason") is not None
                     else None
                 ),
-                labels=tuple(str(node["name"]) for node in labels),
+                labels=tuple(str(node["name"]) for node in nodes),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise TrackerError(f"GitHub Issue response is incomplete: {url}") from error
 
-    def _resource(self, query: str, url: str) -> dict:
-        payload = self._graphql(query, url=url)
+    def transition_issue_stage(
+        self,
+        url: str,
+        *,
+        expected_stage: str,
+        requested_stage: str,
+    ) -> TrackerIssue:
+        """Atomically replace the active stage label and verify tracker truth."""
+        requested_label = f"map-stage/{requested_stage}"
+        resource = self._resource(
+            _STAGE_TRANSITION_CONTEXT_QUERY,
+            url,
+            label=requested_label,
+        )
+        if resource.get("__typename") != "Issue":
+            raise TrackerError(f"GitHub resource is not an Issue: {url}")
+        current_stage = self._resource_stage(resource)
+        if current_stage != expected_stage:
+            raise TrackerConflictError(
+                current_stage=current_stage,
+                requested_stage=requested_stage,
+            )
+
+        labels = resource.get("labels")
+        if not isinstance(labels, dict) or labels.get("pageInfo", {}).get(
+            "hasNextPage"
+        ):
+            raise TrackerError(
+                "GitHub Issue has more than 100 labels; refusing a partial replacement"
+            )
+        nodes = labels.get("nodes")
+        if not isinstance(nodes, list):
+            raise TrackerError(f"GitHub Issue labels are incomplete: {url}")
+        try:
+            retained_label_ids = [
+                str(node["id"])
+                for node in nodes
+                if not str(node["name"]).startswith("map-stage/")
+            ]
+            issue_id = str(resource["id"])
+            requested = resource["repository"]["label"]
+            requested_label_id = str(requested["id"])
+            resolved_label_name = str(requested["name"])
+        except (KeyError, TypeError) as error:
+            raise TrackerError(
+                f"GitHub stage transition context is incomplete: {url}"
+            ) from error
+        if resolved_label_name != requested_label:
+            raise TrackerError(
+                f"GitHub repository is missing required label: {requested_label}"
+            )
+
+        payload = self._graphql(
+            _UPDATE_ISSUE_LABELS_MUTATION,
+            issue=issue_id,
+            labels=(*retained_label_ids, requested_label_id),
+        )
+        try:
+            mutated_issue = payload["data"]["updateIssue"]["issue"]
+        except (KeyError, TypeError) as error:
+            raise TrackerError("GitHub stage mutation response is incomplete") from error
+        if not isinstance(mutated_issue, dict) or str(mutated_issue.get("id")) != issue_id:
+            raise TrackerError("GitHub stage mutation did not return the requested Issue")
+
+        committed = self.get_issue(url)
+        if committed.id != issue_id:
+            raise TrackerError("GitHub Issue identity changed after stage mutation")
+        committed_stage = self._stage_or_invalid(
+            issue_state=committed.state,
+            state_reason=committed.state_reason,
+            labels=committed.labels,
+        )
+        if committed_stage != requested_stage:
+            raise TrackerConflictError(
+                current_stage=committed_stage,
+                requested_stage=requested_stage,
+            )
+        return committed
+
+    def _resource(self, query: str, url: str, **variables: str) -> dict:
+        payload = self._graphql(query, url=url, **variables)
         try:
             resource = payload["data"]["resource"]
         except (KeyError, TypeError) as error:
@@ -194,7 +337,11 @@ class GitHubTrackerAdapter:
             raise TrackerError(f"GitHub resource was not found: {url}")
         return resource
 
-    def _graphql(self, query: str, **variables: str) -> dict:
+    def _graphql(
+        self,
+        query: str,
+        **variables: str | Sequence[str],
+    ) -> dict:
         arguments = [
             self._executable,
             "api",
@@ -203,7 +350,11 @@ class GitHubTrackerAdapter:
             f"query={query}",
         ]
         for name, value in variables.items():
-            arguments.extend(("-F", f"{name}={value}"))
+            if isinstance(value, str):
+                arguments.extend(("-F", f"{name}={value}"))
+            else:
+                for item in value:
+                    arguments.extend(("-F", f"{name}[]={item}"))
         output = self._runner.run(
             arguments
         )
@@ -221,6 +372,39 @@ class GitHubTrackerAdapter:
         if not isinstance(payload, dict):
             raise TrackerError("GitHub GraphQL response is incomplete")
         return payload
+
+    @staticmethod
+    def _stage_or_invalid(
+        *,
+        issue_state: str,
+        state_reason: str | None,
+        labels: tuple[str, ...],
+    ) -> str:
+        try:
+            return executive_stage(
+                issue_state=issue_state,
+                state_reason=state_reason,
+                labels=labels,
+            )
+        except ValueError:
+            return "invalid"
+
+    @classmethod
+    def _resource_stage(cls, resource: dict) -> str:
+        label_nodes = resource.get("labels", {}).get("nodes", [])
+        return cls._stage_or_invalid(
+            issue_state=str(resource.get("state", "")).lower(),
+            state_reason=(
+                str(resource["stateReason"]).lower()
+                if resource.get("stateReason") is not None
+                else None
+            ),
+            labels=tuple(
+                str(node.get("name", ""))
+                for node in label_nodes
+                if isinstance(node, dict)
+            ),
+        )
 
     @staticmethod
     def _parse_project_url(url: str) -> tuple[str, str, int]:

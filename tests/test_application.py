@@ -5,8 +5,17 @@ from pathlib import Path
 
 import pytest
 
-from map_governance import MapGovernanceApplication
-from map_governance.tracker import TrackerIssue, TrackerProject
+from map_governance import (
+    MapGovernanceApplication,
+    MapTransitionConflict,
+    MapTransitionError,
+)
+from map_governance.tracker import (
+    TrackerConflictError,
+    TrackerError,
+    TrackerIssue,
+    TrackerProject,
+)
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +23,10 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 class ControllableTracker:
     def __init__(self):
+        self.transition_calls = []
+        self.before_transition = None
+        self.transition_error = None
+        self.after_transition_stage = None
         self.projects = {
             "https://github.com/orgs/acme/projects/7": TrackerProject(
                 id="PVT_acme_7",
@@ -70,6 +83,49 @@ class ControllableTracker:
 
     def get_issue(self, url):
         return self.issues[url]
+
+    def transition_issue_stage(self, url, *, expected_stage, requested_stage):
+        observed_projection = (
+            self.before_transition() if self.before_transition is not None else None
+        )
+        self.transition_calls.append(
+            {
+                "url": url,
+                "expected_stage": expected_stage,
+                "requested_stage": requested_stage,
+                "observed_projection": observed_projection,
+            }
+        )
+        if self.transition_error is not None:
+            raise self.transition_error
+        issue = self.issues[url]
+        current_stages = tuple(
+            label.removeprefix("map-stage/")
+            for label in issue.labels
+            if label.startswith("map-stage/")
+        )
+        if current_stages != (expected_stage,):
+            current_stage = current_stages[0] if len(current_stages) == 1 else "invalid"
+            raise TrackerConflictError(
+                current_stage=current_stage,
+                requested_stage=requested_stage,
+            )
+        labels = tuple(
+            label for label in issue.labels if not label.startswith("map-stage/")
+        ) + (f"map-stage/{requested_stage}",)
+        committed = replace(issue, labels=labels)
+        if self.after_transition_stage is not None:
+            committed = replace(
+                committed,
+                labels=tuple(
+                    label
+                    for label in committed.labels
+                    if not label.startswith("map-stage/")
+                )
+                + (f"map-stage/{self.after_transition_stage}",),
+            )
+        self.issues[url] = committed
+        return committed
 
 
 def _application(tmp_path, tracker):
@@ -158,6 +214,7 @@ def test_operator_binds_an_existing_issue_once_as_a_complete_map_card(tmp_path):
         },
         "title": "Map the Atlas launch",
         "stage": "authorized",
+        "available_transitions": ["delivery", "parked"],
         "ceo_session": {"state": "unbound"},
         "last_synchronized_at": "2026-08-23T07:30:00Z",
     }
@@ -194,6 +251,7 @@ def test_board_groups_multiple_maps_without_mixing_project_identity(tmp_path):
         card["tracker"]["identity"] for card in groups[octocat["id"]]["maps"]
     ] == ["octocat/hello-world#9"]
     assert groups[octocat["id"]]["maps"][0]["stage"] == "cancelled"
+    assert groups[octocat["id"]]["maps"][0]["available_transitions"] == []
     assert all(
         card["project"]["id"] == group["id"]
         for group in groups.values()
@@ -250,3 +308,260 @@ def test_open_map_requires_exactly_one_supported_executive_stage(tmp_path):
         )
 
     assert application.board()["maps"] == []
+
+
+def test_valid_transition_commits_tracker_before_visible_projection(tmp_path):
+    tracker = ControllableTracker()
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+    tracker.before_transition = lambda: application.board()["maps"][0]["stage"]
+
+    transitioned = application.transition_map(
+        map_id=bound["id"],
+        expected_stage="authorized",
+        requested_stage="delivery",
+    )
+
+    assert tracker.transition_calls == [
+        {
+            "url": "https://github.com/acme/atlas/issues/41",
+            "expected_stage": "authorized",
+            "requested_stage": "delivery",
+            "observed_projection": "authorized",
+        }
+    ]
+    assert transitioned["stage"] == "delivery"
+    assert application.board()["maps"][0]["stage"] == "delivery"
+
+
+def test_invalid_transition_reports_policy_context_without_tracker_write(tmp_path):
+    tracker = ControllableTracker()
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+
+    with pytest.raises(MapTransitionError) as raised:
+        application.transition_map(
+            map_id=bound["id"],
+            expected_stage="authorized",
+            requested_stage="acceptance",
+        )
+
+    assert raised.value.current_stage == "authorized"
+    assert raised.value.requested_stage == "acceptance"
+    assert raised.value.reason == "acceptance can only be entered from delivery"
+    assert tracker.transition_calls == []
+    assert application.board()["maps"][0]["stage"] == "authorized"
+
+
+def test_tracker_write_failure_keeps_prior_projection_and_surfaces_cause(tmp_path):
+    tracker = ControllableTracker()
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+    tracker.transition_error = TrackerError(
+        "GitHub rejected the label update; check token issue-write permission"
+    )
+
+    with pytest.raises(TrackerError, match="issue-write permission"):
+        application.transition_map(
+            map_id=bound["id"],
+            expected_stage="authorized",
+            requested_stage="delivery",
+        )
+
+    assert len(tracker.transition_calls) == 1
+    assert application.board()["maps"][0]["stage"] == "authorized"
+
+
+def test_concurrent_transition_surfaces_refreshable_conflict_and_one_stage(tmp_path):
+    tracker = ControllableTracker()
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+
+    def commit_competing_transition():
+        tracker.before_transition = None
+        return application.transition_map(
+            map_id=bound["id"],
+            expected_stage="authorized",
+            requested_stage="parked",
+        )["stage"]
+
+    tracker.before_transition = commit_competing_transition
+
+    with pytest.raises(MapTransitionConflict) as raised:
+        application.transition_map(
+            map_id=bound["id"],
+            expected_stage="authorized",
+            requested_stage="delivery",
+        )
+
+    assert raised.value.current_stage == "parked"
+    assert raised.value.requested_stage == "delivery"
+    assert raised.value.reason == "tracker stage changed; refresh and retry"
+    assert raised.value.as_dict()["retryable"] is True
+    assert application.board()["maps"][0]["stage"] == "parked"
+    assert [
+        label
+        for label in tracker.issues[bound["tracker"]["url"]].labels
+        if label.startswith("map-stage/")
+    ] == ["map-stage/parked"]
+
+
+def test_competing_tracker_write_after_mutation_never_commits_false_projection(tmp_path):
+    tracker = ControllableTracker()
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+    tracker.after_transition_stage = "parked"
+
+    with pytest.raises(MapTransitionConflict) as raised:
+        application.transition_map(
+            map_id=bound["id"],
+            expected_stage="authorized",
+            requested_stage="delivery",
+        )
+
+    assert raised.value.current_stage == "parked"
+    assert raised.value.requested_stage == "delivery"
+    assert application.board()["maps"][0]["stage"] == "authorized"
+    assert tracker.issues[bound["tracker"]["url"]].labels[-1] == "map-stage/parked"
+
+
+def test_stale_requested_stage_conflicts_before_tracker_mutation(tmp_path):
+    tracker = ControllableTracker()
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(
+        project_id=project["id"],
+        issue_url="https://github.com/acme/atlas/issues/41",
+    )
+    issue_url = bound["tracker"]["url"]
+    tracker.issues[issue_url] = replace(
+        tracker.issues[issue_url],
+        labels=("map", "map-stage/delivery"),
+    )
+
+    with pytest.raises(MapTransitionConflict) as raised:
+        application.transition_map(
+            map_id=bound["id"],
+            expected_stage="authorized",
+            requested_stage="parked",
+        )
+
+    assert raised.value.current_stage == "delivery"
+    assert raised.value.requested_stage == "parked"
+    assert tracker.transition_calls == []
+    assert application.board()["maps"][0]["stage"] == "authorized"
+
+
+@pytest.mark.parametrize(
+    ("current_stage", "requested_stage"),
+    [
+        ("discovery", "awaiting-approval"),
+        ("discovery", "parked"),
+        ("awaiting-approval", "discovery"),
+        ("awaiting-approval", "authorized"),
+        ("awaiting-approval", "parked"),
+        ("authorized", "delivery"),
+        ("authorized", "parked"),
+        ("delivery", "decision"),
+        ("delivery", "acceptance"),
+        ("delivery", "parked"),
+        ("decision", "delivery"),
+        ("decision", "parked"),
+        ("acceptance", "delivery"),
+        ("acceptance", "parked"),
+        ("parked", "discovery"),
+    ],
+)
+def test_governance_lifecycle_accepts_each_defined_transition(
+    tmp_path,
+    current_stage,
+    requested_stage,
+):
+    tracker = ControllableTracker()
+    issue_url = "https://github.com/acme/atlas/issues/41"
+    tracker.issues[issue_url] = replace(
+        tracker.issues[issue_url],
+        labels=("map", f"map-stage/{current_stage}"),
+    )
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+    bound = application.bind_map(project_id=project["id"], issue_url=issue_url)
+
+    result = application.transition_map(
+        map_id=bound["id"],
+        expected_stage=current_stage,
+        requested_stage=requested_stage,
+    )
+
+    assert result["stage"] == requested_stage
+    assert [
+        label for label in tracker.issues[issue_url].labels if label.startswith("map-stage/")
+    ] == [f"map-stage/{requested_stage}"]
+
+
+def test_completed_issue_projects_done_without_an_active_stage_label(tmp_path):
+    tracker = ControllableTracker()
+    issue_url = "https://github.com/acme/atlas/issues/41"
+    tracker.issues[issue_url] = replace(
+        tracker.issues[issue_url],
+        state="closed",
+        state_reason="completed",
+        labels=("map",),
+    )
+    application = _application(tmp_path, tracker)
+    project = application.configure_project(
+        project_url="https://github.com/orgs/acme/projects/7"
+    )
+
+    card = application.bind_map(project_id=project["id"], issue_url=issue_url)
+
+    assert card["stage"] == "done"
+    assert card["available_transitions"] == []
+
+    with pytest.raises(MapTransitionError) as raised:
+        application.transition_map(
+            map_id=card["id"],
+            expected_stage="done",
+            requested_stage="delivery",
+        )
+
+    assert raised.value.current_stage == "done"
+    assert raised.value.requested_stage == "delivery"
+    assert raised.value.reason == (
+        "terminal Map stages can only change by reopening the tracker Issue"
+    )
+    assert tracker.transition_calls == []

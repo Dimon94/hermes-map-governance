@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import map_governance.native as native
+from map_governance import MapTransitionError
 
 
 def test_native_health_uses_context_scoped_plugin_storage(tmp_path, capsys):
@@ -59,6 +60,10 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
             calls.append(("board", {}))
             return {"operation": "board"}
 
+        def transition_map(self, **arguments):
+            calls.append(("transition_map", arguments))
+            return {"operation": "transition_map"}
+
     monkeypatch.setattr(native, "application_for_storage", lambda root: ApplicationProbe())
     registrations = []
     context = SimpleNamespace(
@@ -84,15 +89,27 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
             ]
         ),
         parser.parse_args(["refresh", "--project", "PVT_acme_7"]),
+        parser.parse_args(
+            [
+                "transition",
+                "--map",
+                "I_atlas_41",
+                "--from",
+                "authorized",
+                "--stage",
+                "delivery",
+            ]
+        ),
         parser.parse_args(["board"]),
     ]
 
-    assert [command["handler_fn"](args) for args in arguments] == [0, 0, 0, 0]
+    assert [command["handler_fn"](args) for args in arguments] == [0, 0, 0, 0, 0]
     reports = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert reports == [
         {"operation": "configure_project"},
         {"operation": "bind_map"},
         {"operation": "refresh"},
+        {"operation": "transition_map"},
         {"operation": "board"},
     ]
     assert calls == [
@@ -108,5 +125,58 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
             },
         ),
         ("refresh", {"project_id": "PVT_acme_7"}),
+        (
+            "transition_map",
+            {
+                "map_id": "I_atlas_41",
+                "expected_stage": "authorized",
+                "requested_stage": "delivery",
+            },
+        ),
         ("board", {}),
     ]
+
+
+def test_native_transition_prints_structured_policy_failure(tmp_path, monkeypatch, capsys):
+    class ApplicationProbe:
+        def transition_map(self, **arguments):
+            raise MapTransitionError(
+                current_stage="authorized",
+                requested_stage=arguments["requested_stage"],
+                reason="acceptance can only be entered from delivery",
+            )
+
+    monkeypatch.setattr(native, "application_for_storage", lambda root: ApplicationProbe())
+    registrations = []
+    context = SimpleNamespace(
+        state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
+        register_cli_command=lambda **command: registrations.append(command),
+    )
+    native.register(context)
+    parser = ArgumentParser()
+    registrations[0]["setup_fn"](parser)
+
+    result = registrations[0]["handler_fn"](
+        parser.parse_args(
+            [
+                "transition",
+                "--map",
+                "I_atlas_41",
+                "--from",
+                "authorized",
+                "--stage",
+                "acceptance",
+            ]
+        )
+    )
+
+    assert result == 1
+    assert json.loads(capsys.readouterr().err) == {
+        "error": {
+            "type": "invalid_transition",
+            "current_stage": "authorized",
+            "requested_stage": "acceptance",
+            "reason": "acceptance can only be entered from delivery",
+            "retryable": False,
+        }
+    }

@@ -18,7 +18,7 @@ from map_governance.runtime import (  # noqa: E402
     ProfileResolutionError,
     application_for_profile,
 )
-from map_governance import MapBindingError  # noqa: E402
+from map_governance import MapBindingError, MapTransitionError  # noqa: E402
 from map_governance.tracker import TrackerError  # noqa: E402
 
 
@@ -38,6 +38,12 @@ class RefreshRequest(BaseModel):
     project_id: str | None = Field(default=None, min_length=1)
 
 
+class TransitionMapRequest(BaseModel):
+    map_id: str = Field(min_length=1)
+    expected_stage: str = Field(min_length=1)
+    requested_stage: str = Field(min_length=1)
+
+
 def _application(profile: str):
     try:
         return application_for_profile(profile)
@@ -49,6 +55,8 @@ def _operation(profile: str, method: str, **arguments):
     application = _application(profile)
     try:
         return getattr(application, method)(**arguments)
+    except MapTransitionError as error:
+        raise HTTPException(status_code=409, detail=error.as_dict()) from error
     except MapBindingError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except TrackerError as error:
@@ -102,4 +110,19 @@ async def refresh(
         profile,
         "refresh",
         project_id=request.project_id,
+    )
+
+
+@router.post("/transitions")
+async def transition_map(
+    request: TransitionMapRequest,
+    profile: str = Query(min_length=1),
+):
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "transition_map",
+        map_id=request.map_id,
+        expected_stage=request.expected_stage,
+        requested_stage=request.requested_stage,
     )

@@ -8,6 +8,9 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI
 
+from map_governance import MapTransitionError
+from map_governance.tracker import TrackerError
+
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -115,6 +118,10 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
             calls.append(("refresh", arguments))
             return {"operation": "refresh"}
 
+        def transition_map(self, **arguments):
+            calls.append(("transition_map", arguments))
+            return {"operation": "transition_map"}
+
     monkeypatch.setattr(
         adapter,
         "application_for_profile",
@@ -142,17 +149,27 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
                 "/api/plugins/map-governance/refresh?profile=ceo",
                 json={"project_id": "PVT_acme_7"},
             )
-        return configured, bound, refreshed
+            transitioned = await client.post(
+                "/api/plugins/map-governance/transitions?profile=ceo",
+                json={
+                    "map_id": "I_atlas_41",
+                    "expected_stage": "authorized",
+                    "requested_stage": "delivery",
+                },
+            )
+        return configured, bound, refreshed, transitioned
 
-    configured, bound, refreshed = asyncio.run(exercise_routes())
+    configured, bound, refreshed, transitioned = asyncio.run(exercise_routes())
 
     assert configured.status_code == 200
     assert bound.status_code == 200
     assert refreshed.status_code == 200
-    assert [configured.json(), bound.json(), refreshed.json()] == [
+    assert transitioned.status_code == 200
+    assert [configured.json(), bound.json(), refreshed.json(), transitioned.json()] == [
         {"operation": "configure_project"},
         {"operation": "bind_map"},
         {"operation": "refresh"},
+        {"operation": "transition_map"},
     ]
     assert calls == [
         ("profile", "ceo"),
@@ -170,4 +187,74 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
         ),
         ("profile", "ceo"),
         ("refresh", {"project_id": "PVT_acme_7"}),
+        ("profile", "ceo"),
+        (
+            "transition_map",
+            {
+                "map_id": "I_atlas_41",
+                "expected_stage": "authorized",
+                "requested_stage": "delivery",
+            },
+        ),
     ]
+
+
+def test_rest_transition_preserves_policy_and_tracker_failure_details(
+    tmp_path, monkeypatch, hermes_host_root
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    adapter = _load_dashboard_adapter()
+    api = FastAPI()
+    api.include_router(adapter.router, prefix="/api/plugins/map-governance")
+
+    class ApplicationProbe:
+        def transition_map(self, *, map_id, expected_stage, requested_stage):
+            if requested_stage == "acceptance":
+                raise MapTransitionError(
+                    current_stage="authorized",
+                    requested_stage=requested_stage,
+                    reason="acceptance can only be entered from delivery",
+                )
+            raise TrackerError("GitHub write failed; verify issue-write permission")
+
+    monkeypatch.setattr(
+        adapter,
+        "application_for_profile",
+        lambda profile: ApplicationProbe(),
+    )
+
+    async def exercise_routes():
+        transport = httpx.ASGITransport(app=api)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            invalid = await client.post(
+                "/api/plugins/map-governance/transitions?profile=ceo",
+                json={
+                    "map_id": "I_atlas_41",
+                    "expected_stage": "authorized",
+                    "requested_stage": "acceptance",
+                },
+            )
+            failed = await client.post(
+                "/api/plugins/map-governance/transitions?profile=ceo",
+                json={
+                    "map_id": "I_atlas_41",
+                    "expected_stage": "authorized",
+                    "requested_stage": "delivery",
+                },
+            )
+        return invalid, failed
+
+    invalid, failed = asyncio.run(exercise_routes())
+
+    assert invalid.status_code == 409
+    assert invalid.json()["detail"] == {
+        "type": "invalid_transition",
+        "current_stage": "authorized",
+        "requested_stage": "acceptance",
+        "reason": "acceptance can only be entered from delivery",
+        "retryable": False,
+    }
+    assert failed.status_code == 502
+    assert failed.json()["detail"] == (
+        "GitHub write failed; verify issue-write permission"
+    )

@@ -44,6 +44,7 @@
 
   function MapsPage() {
     const [state, setState] = useState({ status: "loading" });
+    const [transitionState, setTransitionState] = useState({ status: "idle" });
 
     const load = useCallback(function () {
       setState({ status: "loading" });
@@ -84,6 +85,39 @@
           setState({
             status: "error",
             message: error && error.message ? error.message : "Unable to refresh Maps",
+          });
+        },
+      );
+    }, [load]);
+
+    const transitionMap = useCallback(function (mapId, expectedStage, requestedStage) {
+      setTransitionState({ status: "pending", mapId: mapId });
+      requestProfile().then(function (profile) {
+        const encodedProfile = encodeURIComponent(profile);
+        return fetchJSON(
+          "/api/plugins/map-governance/transitions?profile=" + encodedProfile,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              map_id: mapId,
+              expected_stage: expectedStage,
+              requested_stage: requestedStage,
+            }),
+          },
+        );
+      }).then(
+        function () {
+          setTransitionState({ status: "idle" });
+          load();
+        },
+        function (error) {
+          setTransitionState({
+            status: "error",
+            mapId: mapId,
+            message: error && error.message
+              ? error.message
+              : "GitHub did not commit the requested transition",
           });
         },
       );
@@ -232,7 +266,7 @@
                 ),
                 React.createElement(
                   CardContent,
-                  { className: "space-y-1 text-xs text-muted-foreground" },
+                  { className: "space-y-3 text-xs text-muted-foreground" },
                   React.createElement(
                     "p",
                     null,
@@ -247,6 +281,31 @@
                       { dateTime: card.last_synchronized_at },
                       card.last_synchronized_at,
                     ),
+                  ),
+                  transitionState.status === "error" && transitionState.mapId === card.id
+                    ? React.createElement(
+                        "p",
+                        { role: "alert", className: "text-sm text-destructive" },
+                        transitionState.message,
+                      )
+                    : null,
+                  React.createElement(
+                    "div",
+                    { className: "flex flex-wrap gap-2", "aria-label": "Available stage transitions" },
+                    (card.available_transitions || []).map(function (stage) {
+                      const pending = transitionState.status === "pending" && transitionState.mapId === card.id;
+                      return React.createElement(
+                        Button,
+                        {
+                          key: stage,
+                          type: "button",
+                          variant: "outline",
+                          disabled: pending,
+                          onClick: function () { transitionMap(card.id, card.stage, stage); },
+                        },
+                        "Move to " + stage,
+                      );
+                    }),
                   ),
                 ),
               );

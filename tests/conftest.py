@@ -65,7 +65,10 @@ else:
         "state": "OPEN",
         "stateReason": None,
         "repository": {"nameWithOwner": "acme/atlas"},
-        "labels": {"nodes": [{"name": "map"}, {"name": "map-stage/authorized"}]},
+        "labels": {
+            "nodes": [{"name": "map"}, {"name": "map-stage/authorized"}],
+            "pageInfo": {"hasNextPage": False},
+        },
     }
     payload = {"data": {"resource": resource}}
 print(json.dumps(payload))
