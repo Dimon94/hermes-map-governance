@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Diff hygiene
+        run: git diff --check
+      - name: Repository automation
+        run: |
+          bash -n tools/github-api.sh tools/github-api.test.sh
+          bash tools/github-api.test.sh
+      - name: Python syntax
+        run: |
+          paths=()
+          for candidate in __init__.py map_governance dashboard tests; do
+            [[ -e "$candidate" ]] && paths+=("$candidate")
+          done
+          ((${#paths[@]} == 0)) || python3 -m compileall -q "${paths[@]}"
+      - name: Dashboard syntax
+        run: |
+          [[ ! -f dashboard/dist/index.js ]] || node --check dashboard/dist/index.js
+          [[ ! -f tests/dashboard_shell_probe.mjs ]] || node --check tests/dashboard_shell_probe.mjs
+
+# Full plugin integration tests require an explicit Hermes checkout and runtime
+# dependencies. Add that job when the repository owns a reproducible dependency
+# setup; the current local verification contract is documented in the System Map.
