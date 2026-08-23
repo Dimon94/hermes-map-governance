@@ -160,6 +160,39 @@ Operator 可用 `hermes maps outbox status --effect EFFECT_ID` 检查 attempt hi
 `hermes maps outbox repair --effect EFFECT_ID --repair-id REPAIR_ID --note NOTE`
 显式重排 terminal intent。Repair 只增加审计记录并重置执行状态，不删除历史或静默吞掉失败。
 
+Maps 页面先读取一次带 cursor 的完整 projection，随后只通过 Hermes plugin WebSocket
+消费 SQLite 中已经提交的 ordered board events，按 project/card/detail reducer 局部更新；
+它不会按卡片轮询，也不会在每个 event 后重新加载 application。Cursor 跨进程和重启有效，
+断线后从最后 cursor catch up。超出 retention 的 cursor 会收到明确的
+`refresh_required`，页面只做一次完整 projection refresh，再从新 cursor 续接。连接资源
+有界，慢 consumer 不持有 writer transaction；落后超过 retention 时同样转为 full refresh。
+
+Event journal 保存在同一 plugin-owned `registry.db`，不是内存 event bus。所有 stage、
+decision、approval、canonical session、PM report/turn 与 Outbox 可见状态都在其本地状态
+transaction commit 后才追加 durable envelope；回滚状态不会产生 event。可用正常 plugin
+settings 调整保留与单批上限：
+
+```yaml
+plugins:
+  entries:
+    map-governance:
+      settings:
+        events:
+          max_events: 10000
+          retention_seconds: 86400
+          batch_size: 200
+          poll_seconds: 0.25
+          send_timeout_seconds: 5
+```
+
+GitHub authority 读取或写入失败只会把受影响 project 标成 stale；最后一次成功 UTC
+projection 仍可读，其他 healthy project 仍可治理。Stale project 的 CLI、REST、Dashboard、
+CEO Tool 与 PM Tool mutation 全部 fail closed，且不会提供 local-only transition。仅 renderer
+WebSocket 断线会显示“live updates disconnected”，不会把 project 标 stale。恢复 GitHub
+连通性后运行 `hermes maps refresh --project PROJECT_NODE_ID`；只有 project、所有 bound
+Issues 及其 decision、approval 与 PM history 完成 authoritative fetch，并在单一 transaction
+reconcile 成功后，stale 才会清除。仅重连或本地 cache 存在不足以恢复写权限。
+
 Authority envelope 使用正常 Hermes plugin settings，不读取进程环境。默认 `product` 与
 `operational` 属于 CEO autonomy；delivery authorization、budget、scope、material
 schedule、security/legal、cancellation、publication 与 final acceptance 要求 chairman。
@@ -204,6 +237,8 @@ plugins:
 - `/api/plugins/map-governance/board` 提供按 GitHub Project 分组的 board 投影；
   `/projects`、`/bindings`、`/refresh`、`/transitions`、approval decision、Map detail 与
   canonical session open routes 是同一应用接口的薄适配器。
+- `/api/plugins/map-governance/events` 使用 Hermes 公共 WebSocket auth/upgrade contract，
+  提供 durable cursor catch-up、live tail 与 cursor-expiry refresh protocol。
 - `registry.db` 属于 `map-governance` 命名空间，由请求中的 profile 选择，且与
   `<PROFILE_HOME>/kanban.db` 隔离。
 

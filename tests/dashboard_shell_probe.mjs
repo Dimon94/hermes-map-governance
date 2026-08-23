@@ -264,6 +264,7 @@ globalThis.window = {
     hooks: {
       useCallback: (callback) => callback,
       useEffect: (effect) => effects.push(effect),
+      useRef: (initialValue) => ({ current: initialValue }),
       useState,
     },
     components: {

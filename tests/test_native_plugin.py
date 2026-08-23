@@ -6,7 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import map_governance.native as native
-from map_governance import CEOSessionRepairRequired, MapTransitionError
+from map_governance import (
+    CEOSessionRepairRequired,
+    MapTransitionError,
+    StaleProjectionError,
+)
 
 
 def test_native_health_uses_context_scoped_plugin_storage(tmp_path, capsys):
@@ -272,6 +276,52 @@ def test_native_transition_prints_structured_policy_failure(
             "retryable": False,
         }
     }
+
+
+def test_native_mutation_prints_structured_stale_interlock(
+    tmp_path, monkeypatch, capsys
+):
+    class ApplicationProbe:
+        def bind_map(self, **_arguments):
+            raise StaleProjectionError(
+                project_id="PVT_acme_7",
+                source="tracker",
+                last_success_at="2026-08-23T07:30:00Z",
+                reason="Tracker authority is unreachable",
+            )
+
+    monkeypatch.setattr(
+        native, "application_for_storage", lambda _root: ApplicationProbe()
+    )
+    registrations = []
+    context = SimpleNamespace(
+        state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
+        register_cli_command=lambda **command: registrations.append(command),
+    )
+    native.register(context)
+    parser = ArgumentParser()
+    registrations[0]["setup_fn"](parser)
+
+    result = registrations[0]["handler_fn"](
+        parser.parse_args(
+            [
+                "bind",
+                "--project",
+                "PVT_acme_7",
+                "--issue",
+                "https://github.com/acme/atlas/issues/41",
+            ]
+        )
+    )
+
+    assert result == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["type"] == "stale_projection"
+    assert "authoritative reconcile" in error["recovery"]
 
 
 def test_native_open_prints_structured_session_repair_failure(

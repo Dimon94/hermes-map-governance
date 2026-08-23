@@ -237,7 +237,12 @@ def test_operator_binds_an_existing_issue_once_as_a_complete_map_card(tmp_path):
         "stage": "authorized",
         "available_transitions": ["delivery", "parked"],
         "decision_summary": {"count": 0, "latest": None},
-        "approval_summary": {"count": 0, "pending_count": 0, "latest": None},
+        "approval_summary": {
+            "count": 0,
+            "pending_count": 0,
+            "latest": None,
+            "statuses": [],
+        },
         "delivery_summary": {"state": "not_reported"},
         "external_effects": {
             "state": "healthy",

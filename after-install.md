@@ -30,6 +30,14 @@ including confirmed decisions, from GitHub and the plugin-owned binding
 registry. The GitHub token needs the relevant Project read and Issue write
 permissions.
 
+The Maps page resumes its committed event cursor after renderer disconnects.
+A renderer-only disconnect does not make governance truth stale. If GitHub
+authority becomes unreachable, the affected project remains readable but all
+governance writes fail closed until `hermes maps refresh --project PROJECT_NODE_ID`
+successfully fetches and reconciles the authoritative Project, Issues, decisions,
+approvals, and PM reports. A reconnect or cached projection alone does not clear
+stale mode.
+
 Open the bound Map from its dashboard card, or resolve the same canonical
 conversation explicitly:
 

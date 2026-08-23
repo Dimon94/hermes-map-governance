@@ -4,7 +4,7 @@ import json
 from types import SimpleNamespace
 
 import map_governance.ceo_tool as ceo_tool
-from map_governance import GovernanceRequestIdentity
+from map_governance import GovernanceRequestIdentity, StaleProjectionError
 
 
 def test_ceo_skill_and_named_toolset_register_with_request_scoped_identity(
@@ -236,3 +236,49 @@ def test_ceo_tool_submits_complete_approval_packet_without_actor_override(
         "ceo", "canonical-live-session"
     )
     assert calls[0]["packet"].request_id == "approval-delivery-001"
+
+
+def test_ceo_tool_returns_structured_stale_interlock(monkeypatch):
+    class ApplicationProbe:
+        def record_decision(self, **_arguments):
+            raise StaleProjectionError(
+                project_id="PVT_acme_7",
+                source="tracker",
+                last_success_at="2026-08-23T07:30:00Z",
+                reason="Tracker authority is unreachable",
+            )
+
+    monkeypatch.setattr(
+        ceo_tool,
+        "application_for_profile",
+        lambda _profile: ApplicationProbe(),
+    )
+    tools = []
+    context = SimpleNamespace(
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: tools.append(kwargs),
+        register_hook=lambda *args: None,
+    )
+    ceo_tool.register_ceo_capabilities(context)
+
+    result = json.loads(
+        tools[0]["handler"](
+            {
+                "action": "record_decision",
+                "map_id": "I_atlas_41",
+                "decision": {
+                    "decision_id": "decision-stale",
+                    "type": "product",
+                    "rationale": "Wait for authority.",
+                    "authority": "ceo",
+                    "affected_stage": "authorized",
+                    "timestamp": "2026-08-23T09:25:00Z",
+                },
+            },
+            session_id="canonical-live-session",
+        )
+    )
+
+    assert result["error"]["type"] == "stale_projection"
+    assert "authoritative reconcile" in result["error"]["recovery"]

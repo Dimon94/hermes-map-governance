@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -632,6 +633,11 @@ def test_chairman_explicit_decision_is_confirmed_before_ledger_projection(
         "requested",
         decision,
     ]
+    assert any(
+        event["type"] == "approval.upserted"
+        and event["payload"]["approval"]["status"] == decision
+        for event in application.board_events(cursor=0, limit=100)["events"]
+    )
 
     replay = application.decide_approval(
         map_id=MAP_ID,
@@ -715,7 +721,7 @@ def test_restart_adopts_tracker_confirmed_request_after_crash_before_ledger_writ
         packet=packet,
     )
 
-    assert recovered["idempotent"] is False
+    assert recovered["idempotent"] is True
     assert recovered["approval"]["requested_at"] == "2026-08-23T08:00:00Z"
     assert recovered["approval"]["tracker"]["request"]["id"] == ("IC_crash_request")
     assert tracker.approval_writes == 0
@@ -765,6 +771,92 @@ def test_restart_adopts_tracker_confirmed_decision_after_crash_before_ledger_upd
     assert recovered["approval"]["expires_at"] == "2026-08-24T09:15:00Z"
     assert recovered["approval"]["tracker"]["decision"]["id"] == ("IC_crash_decision")
     assert tracker.approval_writes == 1
+
+
+def test_bind_rebuilds_approval_ledger_from_authoritative_issue_history(tmp_path):
+    tracker = ApprovalTracker()
+    packet = _packet()
+    tracker.approval_records[ISSUE_URL].extend(
+        [
+            TrackerApprovalRecord(
+                event=ApprovalHistoryEvent(
+                    event_id=f"approval:{packet.request_id}:request",
+                    request_id=packet.request_id,
+                    event_type="requested",
+                    occurred_at="2026-08-23T08:00:00Z",
+                    payload_hash=packet.payload_hash,
+                    details={**packet.payload(), "packet_hash": packet.packet_hash},
+                ),
+                tracker_record_id="IC_rebuild_request",
+                tracker_record_url=f"{ISSUE_URL}#issuecomment-rebuild-request",
+            ),
+            TrackerApprovalRecord(
+                event=ApprovalHistoryEvent(
+                    event_id=f"approval:{packet.request_id}:decision",
+                    request_id=packet.request_id,
+                    event_type="approved",
+                    occurred_at="2026-08-23T08:30:00Z",
+                    payload_hash=packet.payload_hash,
+                    details={
+                        "decision": "approved",
+                        "actor_id": "chairman-1",
+                        "actor_profile": PROFILE,
+                        "note": "Authoritative approval.",
+                        "expires_at": "2026-08-24T08:30:00Z",
+                    },
+                ),
+                tracker_record_id="IC_rebuild_decision",
+                tracker_record_url=f"{ISSUE_URL}#issuecomment-rebuild-decision",
+            ),
+        ]
+    )
+
+    application, _ = _application(tmp_path, tracker)
+
+    approval = application.map_detail(map_id=MAP_ID)["approvals"]["items"][0]
+    assert approval["status"] == "approved"
+    assert approval["decision"]["note"] == "Authoritative approval."
+    assert [event["event_type"] for event in approval["history"]] == [
+        "requested",
+        "approved",
+    ]
+
+
+def test_authoritative_reconcile_repairs_stale_approval_projection(tmp_path):
+    clock = _clock_box()
+    application, tracker = _application(tmp_path, clock=clock)
+    _request_and_approve(application)
+    database = tmp_path / "plugin-data" / "map-governance" / "registry.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE approval_ledger SET status = 'pending', decided_by = NULL, "
+            "decision_note = NULL WHERE request_id = ?",
+            ("approval-delivery-001",),
+        )
+        connection.execute(
+            "DELETE FROM approval_ledger_events WHERE event_type = 'approved'"
+        )
+
+    clock[0] += timedelta(minutes=5)
+    reconciled = application.reconcile_project(project_id="PVT_acme_7")
+
+    approval = reconciled["maps"][0]["approval_summary"]["latest"]
+    assert approval["status"] == "approved"
+    assert approval["decision"]["note"] == ("Approved for the declared delivery scope.")
+    assert application.board()["projects"][0]["authority"]["state"] == "healthy"
+
+
+def test_reconcile_stays_stale_when_authoritative_approval_history_is_incomplete(
+    tmp_path,
+):
+    application, tracker = _application(tmp_path)
+    _request_and_approve(application)
+    tracker.approval_records[ISSUE_URL].clear()
+
+    reconciled = application.reconcile_project(project_id="PVT_acme_7")
+
+    assert reconciled["projects"][0]["authority"]["state"] == "stale"
+    assert reconciled["maps"][0]["approval_summary"]["latest"]["status"] == ("approved")
 
 
 def test_concurrent_chairman_decisions_commit_exactly_one_result(tmp_path):
@@ -1116,6 +1208,7 @@ def test_tracker_transition_failure_keeps_projection_prior_and_reserves_only_sam
     assert approval["consumption"]["mutation_id"] == "transition-recoverable"
 
     tracker.transition_error = None
+    application.reconcile_project(project_id="PVT_acme_7")
     recovered = application.transition_map(
         map_id=MAP_ID,
         expected_stage="awaiting-approval",

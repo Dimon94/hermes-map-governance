@@ -409,6 +409,11 @@ def test_confirmed_decision_appears_in_detail_card_and_executive_state(tmp_path)
         map_id=MAP_ID,
         request_identity=request_identity,
     )["recent_decisions"] == [expected]
+    assert any(
+        event["type"] == "decision.upserted"
+        and event["payload"]["decision"] == expected
+        for event in application.board_events(cursor=0, limit=100)["events"]
+    )
 
 
 def test_decision_tracker_effect_is_durable_before_append_and_operator_visible(

@@ -11,6 +11,14 @@ tags:
   - dashboard
   - maps
 config_schema:
+  events:
+    type: object
+    default:
+      max_events: 10000
+      retention_seconds: 86400
+      batch_size: 200
+      poll_seconds: 0.25
+      send_timeout_seconds: 5
   outbox:
     type: object
     default:

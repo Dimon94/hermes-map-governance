@@ -7,7 +7,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status as http_status,
+)
 from pydantic import BaseModel, Field
 
 
@@ -27,11 +35,21 @@ from map_governance import (  # noqa: E402
     GovernanceAuthorizationError,
     MapBindingError,
     MapTransitionError,
+    StaleProjectionError,
 )
 from map_governance.tracker import TrackerError  # noqa: E402
 
 
 router = APIRouter()
+
+
+def _ws_upgrade_authorized(ws: WebSocket) -> bool:
+    """Delegate every dashboard auth mode to the installed canonical WS gate."""
+    try:
+        from hermes_cli import web_server
+    except Exception:
+        return False
+    return bool(web_server._ws_auth_ok(ws))
 
 
 class ConfigureProjectRequest(BaseModel):
@@ -92,6 +110,8 @@ def _operation(profile: str, method: str, **arguments):
         raise HTTPException(status_code=409, detail=error.as_dict()) from error
     except MapBindingError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    except StaleProjectionError as error:
+        raise HTTPException(status_code=503, detail=error.as_dict()) from error
     except TrackerError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     except ValueError as error:
@@ -128,7 +148,78 @@ async def health(profile: str = Query(min_length=1)):
 
 @router.get("/board")
 async def board(profile: str = Query(min_length=1)):
-    return _application(profile).board()
+    application = _application(profile)
+    snapshot = getattr(application, "board_snapshot", None)
+    return snapshot() if callable(snapshot) else application.board()
+
+
+@router.websocket("/events")
+async def stream_events(ws: WebSocket):
+    """Catch up and tail the committed SQLite journal without an in-memory bus."""
+    if not _ws_upgrade_authorized(ws):
+        await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
+        return
+    profile = ws.query_params.get("profile", "")
+    try:
+        application = _application(profile)
+        cursor = int(ws.query_params.get("cursor", "0"))
+        if cursor < 0:
+            raise ValueError
+    except (ValueError, ProfileResolutionError):
+        await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
+        return
+    settings = application.board_stream_settings
+    send_timeout = float(getattr(settings, "send_timeout_seconds", 5.0))
+    await ws.accept()
+    opened = False
+    try:
+        while True:
+            batch = await asyncio.to_thread(
+                application.board_events,
+                cursor=cursor,
+                limit=settings.batch_size,
+            )
+            if batch["status"] == "refresh_required":
+                await asyncio.wait_for(ws.send_json(batch), timeout=send_timeout)
+                await ws.close(code=http_status.WS_1000_NORMAL_CLOSURE)
+                return
+            if not opened:
+                await asyncio.wait_for(
+                    ws.send_json(
+                        {
+                            "status": "open",
+                            "cursor": cursor,
+                            "latest_cursor": batch["latest_cursor"],
+                        }
+                    ),
+                    timeout=send_timeout,
+                )
+                opened = True
+            if batch["events"]:
+                cursor = int(batch["cursor"])
+                await asyncio.wait_for(ws.send_json(batch), timeout=send_timeout)
+                if batch["has_more"]:
+                    continue
+            try:
+                message = await asyncio.wait_for(
+                    ws.receive(), timeout=float(settings.poll_seconds)
+                )
+                if message["type"] == "websocket.disconnect":
+                    return
+            except asyncio.TimeoutError:
+                pass
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        return
+    except asyncio.TimeoutError:
+        try:
+            await ws.close(code=http_status.WS_1013_TRY_AGAIN_LATER)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            await ws.close(code=http_status.WS_1011_INTERNAL_ERROR)
+        except Exception:
+            pass
 
 
 @router.get("/maps/{map_id}")

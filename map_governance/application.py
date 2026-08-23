@@ -55,6 +55,7 @@ from .outbox import (
     OutboxRuntime,
     OutboxSettings,
 )
+from .events import BoardEventJournal, BoardEventSettings
 from .sessions import (
     CEOSessionRunner,
     CanonicalSession,
@@ -76,6 +77,40 @@ from .tracker import (
 
 class MapBindingError(ValueError):
     """Raised when a requested binding violates governance identity rules."""
+
+
+class StaleProjectionError(PermissionError):
+    """A governance write was blocked until authority is revalidated."""
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        source: str,
+        last_success_at: str,
+        reason: str,
+    ) -> None:
+        self.project_id = project_id
+        self.source = source
+        self.last_success_at = last_success_at
+        self.reason = reason
+        super().__init__(
+            f"{source} authority is stale for {project_id}: {reason}; reconnect "
+            "authority and complete authoritative reconcile before retrying"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "stale_projection",
+            "project_id": self.project_id,
+            "source": self.source,
+            "last_success_at": self.last_success_at,
+            "reason": self.reason,
+            "recovery": (
+                "Reconnect tracker authority and complete authoritative reconcile."
+            ),
+            "retryable": True,
+        }
 
 
 @dataclass(frozen=True)
@@ -267,6 +302,7 @@ class MapGovernanceApplication:
         outbox_owner_id: str | None = None,
         outbox_crash_injector: Callable[[str, OutboxIntent], None] | None = None,
         coordinator_resume: CoordinatorResumeBoundary | None = None,
+        event_settings: BoardEventSettings | None = None,
     ) -> None:
         self._plugin_root = plugin_root.resolve()
         self._storage = PluginStorage(storage_root)
@@ -278,6 +314,12 @@ class MapGovernanceApplication:
             authority_policy or AuthorityEnvelopePolicy.from_settings(None)
         )
         self._outbox = OutboxRepository(storage_root)
+        self._event_settings = event_settings or BoardEventSettings()
+        self._board_events = BoardEventJournal(
+            self._storage.database,
+            settings=self._event_settings,
+            clock=self._clock,
+        )
         self._outbox_settings = outbox_settings or OutboxSettings()
         self._outbox_owner_id = outbox_owner_id or (
             f"map-governance:{os.getpid()}:{uuid.uuid4()}"
@@ -321,6 +363,8 @@ class MapGovernanceApplication:
             clock=self._clock,
             settings=self._outbox_settings,
             completion=self._complete_external_effect,
+            interlock=self._enforce_external_effect_interlock,
+            failure=self._external_effect_failed,
             crash_injector=outbox_crash_injector,
         )
 
@@ -404,6 +448,106 @@ class MapGovernanceApplication:
             },
         }
 
+    def _ensure_project_writable(self, *, project_id: str) -> None:
+        for source in self._storage.project_reachability(project_id):
+            if source["state"] == "healthy":
+                continue
+            raise StaleProjectionError(
+                project_id=project_id,
+                source=str(source["source"]),
+                last_success_at=str(source["last_success_at"]),
+                reason=str(source["reason"] or "authority reconcile is incomplete"),
+            )
+
+    def _ensure_map_writable(self, *, map_id: str) -> dict[str, Any]:
+        binding = self._storage.map_binding(map_id)
+        if binding is None:
+            raise MapBindingError(f"Map is not bound: {map_id}")
+        self._ensure_project_writable(project_id=str(binding["project_id"]))
+        return binding
+
+    def _enforce_external_effect_interlock(self, intent: OutboxIntent) -> None:
+        binding = self._storage.map_binding(intent.map_id)
+        if binding is None:
+            return
+        try:
+            self._ensure_project_writable(project_id=str(binding["project_id"]))
+        except StaleProjectionError as error:
+            raise EffectRetryableError(str(error)) from error
+
+    def _external_effect_failed(self, intent: OutboxIntent, error: Exception) -> None:
+        if not intent.effect_type.startswith("tracker."):
+            return
+        if getattr(error, "retryable", True) is False:
+            return
+        binding = self._storage.map_binding(intent.map_id)
+        if binding is None:
+            return
+        project_id = str(binding["project_id"])
+        if any(
+            source["source"] == "tracker" and source["state"] != "healthy"
+            for source in self._storage.project_reachability(project_id)
+        ):
+            return
+        self._mark_tracker_stale(
+            project_id=project_id,
+            reason=str(error),
+        )
+
+    def _mark_tracker_stale(self, *, project_id: str, reason: str) -> None:
+        reason = self._executive_safe_tracker_reason(reason)
+        self._storage.set_project_reachability(
+            project_id=project_id,
+            source="tracker",
+            state="stale",
+            reason=reason,
+            changed_at=self._synchronized_at(),
+        )
+
+    @staticmethod
+    def _executive_safe_tracker_reason(reason: str) -> str:
+        normalized = " ".join((reason or "").split()).lower()
+        if "unreachable" in normalized or "connection" in normalized:
+            return "Tracker authority is unreachable"
+        if "timed out" in normalized or "timeout" in normalized:
+            return "Tracker authority timed out"
+        if any(marker in normalized for marker in ("401", "403", "auth", "credential")):
+            return "Tracker authority authentication failed"
+        if "rate limit" in normalized:
+            return "Tracker authority rate limit is unavailable"
+        if "identity changed" in normalized:
+            return "Tracker authority identity no longer matches the binding"
+        if "conflict" in normalized or "belongs to another" in normalized:
+            return "Tracker authority history conflicts with the governance binding"
+        return "Tracker authority request failed"
+
+    def _tracker_read(
+        self,
+        *,
+        project_id: str,
+        operation: Callable[[], Any],
+    ) -> Any:
+        """Mark only the affected project stale when authority cannot be read."""
+        try:
+            return operation()
+        except TrackerError as error:
+            self._mark_tracker_stale(project_id=project_id, reason=str(error))
+            raise
+
+    def board_events(self, *, cursor: int, limit: int = 200) -> dict[str, Any]:
+        """Read committed board changes after one durable cursor."""
+        return self._board_events.read(cursor=cursor, limit=limit)
+
+    def board_snapshot(self) -> dict[str, Any]:
+        """Return one full projection plus a safe cursor for catch-up."""
+        cursor = self._board_events.latest_cursor()
+        return {**self.board(), "cursor": cursor}
+
+    @property
+    def board_stream_settings(self) -> BoardEventSettings:
+        """Expose bounded stream settings to the thin transport adapter."""
+        return self._event_settings
+
     def map_detail(self, *, map_id: str) -> dict[str, Any]:
         """Return one Map projection without session-inventory disclosure."""
         for card in self.board()["maps"]:
@@ -479,6 +623,9 @@ class MapGovernanceApplication:
         note: str,
     ) -> dict[str, Any]:
         """Audit an explicit operator repair and requeue a terminal intent."""
+        intent = self._outbox.intent(effect_id)
+        if intent is not None and self._storage.map_binding(intent.map_id) is not None:
+            self._ensure_map_writable(map_id=intent.map_id)
         self._outbox.repair(
             effect_id=effect_id,
             repair_id=repair_id,
@@ -517,6 +664,7 @@ class MapGovernanceApplication:
         """Establish one immutable request-scoped PM assignment."""
         if self._storage.map_binding(map_id) is None:
             raise MapBindingError(f"Map is not bound: {map_id}")
+        self._ensure_map_writable(map_id=map_id)
         if not request_identity.profile_name or not request_identity.session_id:
             self._deny_governance_request(
                 map_id=map_id,
@@ -584,6 +732,7 @@ class MapGovernanceApplication:
         turn_id: str,
     ) -> dict[str, Any]:
         """Resume an assigned PM for one coordinator-controlled turn."""
+        self._ensure_map_writable(map_id=map_id)
         lock_key = f"{self._storage.database}:{map_id}"
         with _operation_lock("pm-turn", lock_key):
             with self._storage.pm_turn_lease(map_id):
@@ -688,6 +837,7 @@ class MapGovernanceApplication:
         dispatch_id: str,
     ) -> dict[str, Any]:
         """Record the coordinator's dispatch boundary and leave the PM idle."""
+        self._ensure_map_writable(map_id=map_id)
         lock_key = f"{self._storage.database}:{map_id}"
         with _operation_lock("pm-turn", lock_key):
             with self._storage.pm_turn_lease(map_id):
@@ -742,6 +892,7 @@ class MapGovernanceApplication:
                 reason="pm_assignment_missing",
             )
         map_id = str(assignment["map_id"])
+        self._ensure_map_writable(map_id=map_id)
         bound_report = report.assign_to(map_id)
         binding = self._storage.map_binding(map_id)
         if binding is None:
@@ -795,7 +946,10 @@ class MapGovernanceApplication:
                         raise ValueError(
                             "PM turn already has a reserved report outcome"
                         )
-                    issue = self._tracker.get_issue(binding["issue_url"])
+                    issue = self._tracker_read(
+                        project_id=str(binding["project_id"]),
+                        operation=lambda: self._tracker.get_issue(binding["issue_url"]),
+                    )
                     if issue.id != map_id:
                         raise MapBindingError("Bound GitHub Issue identity changed")
                     current_stage = self._executive_stage(issue)
@@ -1089,6 +1243,7 @@ class MapGovernanceApplication:
             action="record_decision",
             request_identity=request_identity,
         )
+        self._ensure_map_writable(map_id=map_id)
         if decision.authority != "ceo":
             self._deny_governance_request(
                 map_id=map_id,
@@ -1229,6 +1384,7 @@ class MapGovernanceApplication:
             action="request_approval",
             request_identity=request_identity,
         )
+        self._ensure_map_writable(map_id=map_id)
         decision_authority = self._authority_policy.classify(
             packet.decision_class,
             decision_payload=packet.decision_payload,
@@ -1323,6 +1479,7 @@ class MapGovernanceApplication:
             action=f"approval:{decision}",
             actor_identity=actor_identity,
         )
+        self._ensure_map_writable(map_id=map_id)
         if decision not in APPROVAL_DECISIONS:
             raise ValueError("decision must be approved, rejected, or revision")
         if not isinstance(note, str) or not note.strip():
@@ -1416,6 +1573,7 @@ class MapGovernanceApplication:
             action="approval:revoke",
             actor_identity=actor_identity,
         )
+        self._ensure_map_writable(map_id=map_id)
         if not isinstance(note, str) or not note.strip():
             raise ValueError("approval revocation note must be a non-empty string")
         lock_key = f"{self._storage.database}:{map_id}"
@@ -1568,6 +1726,359 @@ class MapGovernanceApplication:
             by_id.setdefault(record.event.event_id, record)
         return by_id
 
+    def _approval_reconcile_projections(
+        self,
+        *,
+        map_id: str,
+        records: dict[str, TrackerApprovalRecord],
+    ) -> list[dict[str, Any]]:
+        """Validate Issue approval history into rebuildable ledger rows."""
+        grouped: dict[str, list[TrackerApprovalRecord]] = {}
+        for record in records.values():
+            grouped.setdefault(record.event.request_id, []).append(record)
+        projections: list[dict[str, Any]] = []
+        for request_id, history in grouped.items():
+            ordered = sorted(
+                history,
+                key=lambda record: datetime.fromisoformat(
+                    record.event.occurred_at.replace("Z", "+00:00")
+                ),
+            )
+            requests = [
+                record for record in ordered if record.event.event_type == "requested"
+            ]
+            if len(requests) != 1:
+                raise ApprovalRequestConflict(
+                    request_id=request_id,
+                    reason="tracker history must contain exactly one approval request",
+                )
+            requested = requests[0]
+            details = requested.event.details
+            try:
+                packet = ApprovalPacket(
+                    request_id=details["request_id"],
+                    decision_class=details["decision_class"],
+                    proposed_action=details["proposed_action"],
+                    alternatives=tuple(details["alternatives"]),
+                    rationale=details["rationale"],
+                    cost_risk=details["cost_risk"],
+                    evidence=tuple(details["evidence"]),
+                    requested_scope=details["requested_scope"],
+                    decision_payload=details["decision_payload"],
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ApprovalRequestConflict(
+                    request_id=request_id,
+                    reason="tracker approval request packet is malformed",
+                ) from error
+            if (
+                packet.request_id != request_id
+                or packet.requested_scope.get("map_id") != map_id
+                or packet.payload_hash != requested.event.payload_hash
+                or details.get("payload_hash") != packet.payload_hash
+                or details.get("packet_hash") != packet.packet_hash
+            ):
+                raise ApprovalRequestConflict(
+                    request_id=request_id,
+                    reason="tracker approval request packet identity is inconsistent",
+                )
+            if any(
+                record.event.payload_hash != packet.payload_hash for record in ordered
+            ):
+                raise ApprovalRequestConflict(
+                    request_id=request_id,
+                    reason="tracker approval history belongs to another payload",
+                )
+
+            outcomes = [
+                record
+                for record in ordered
+                if record.event.event_type in APPROVAL_DECISIONS
+            ]
+            revocations = [
+                record for record in ordered if record.event.event_type == "revoked"
+            ]
+            if len(outcomes) > 1 or len(revocations) > 1:
+                raise ApprovalRequestConflict(
+                    request_id=request_id,
+                    reason="tracker approval history has multiple terminal outcomes",
+                )
+            if ordered[0] is not requested:
+                raise ApprovalRequestConflict(
+                    request_id=request_id,
+                    reason="tracker approval outcome precedes its request",
+                )
+
+            status = "pending"
+            decided_by = None
+            decided_by_profile = None
+            decision_note = None
+            decided_at = None
+            expires_at = None
+            decision_record: TrackerApprovalRecord | None = None
+            if outcomes:
+                outcome = outcomes[0]
+                outcome_details = outcome.event.details
+                if outcome_details.get("decision") != outcome.event.event_type:
+                    raise ApprovalRequestConflict(
+                        request_id=request_id,
+                        reason="tracker approval decision marker is inconsistent",
+                    )
+                status = outcome.event.event_type
+                decided_by = self._approval_history_text(
+                    outcome_details, "actor_id", request_id
+                )
+                decided_by_profile = self._approval_history_text(
+                    outcome_details, "actor_profile", request_id
+                )
+                decision_note = self._approval_history_text(
+                    outcome_details, "note", request_id
+                )
+                decided_at = outcome.event.occurred_at
+                expires_at = outcome_details.get("expires_at")
+                if status == "approved":
+                    if not isinstance(expires_at, str):
+                        raise ApprovalRequestConflict(
+                            request_id=request_id,
+                            reason="approved tracker history has no expiry",
+                        )
+                    try:
+                        datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    except ValueError as error:
+                        raise ApprovalRequestConflict(
+                            request_id=request_id,
+                            reason="approved tracker history expiry is malformed",
+                        ) from error
+                elif expires_at is not None:
+                    raise ApprovalRequestConflict(
+                        request_id=request_id,
+                        reason="non-approved tracker outcome carries an expiry",
+                    )
+                decision_record = outcome
+            if revocations:
+                revocation = revocations[0]
+                if status != "approved" or ordered.index(revocation) < ordered.index(
+                    outcomes[0]
+                ):
+                    raise ApprovalRequestConflict(
+                        request_id=request_id,
+                        reason="tracker revocation has no preceding approval",
+                    )
+                status = "revoked"
+                decided_by = self._approval_history_text(
+                    revocation.event.details, "actor_id", request_id
+                )
+                decided_by_profile = self._approval_history_text(
+                    revocation.event.details, "actor_profile", request_id
+                )
+                decision_note = self._approval_history_text(
+                    revocation.event.details, "note", request_id
+                )
+                decided_at = revocation.event.occurred_at
+                expires_at = None
+                decision_record = revocation
+
+            existing = self._storage.approval(request_id)
+            if existing is not None and (
+                existing["map_id"] != map_id
+                or existing["packet_hash"] != packet.packet_hash
+            ):
+                raise ApprovalRequestConflict(
+                    request_id=request_id,
+                    reason="local enforcement record belongs to another packet",
+                )
+            local_terminal = existing is not None and existing["status"] in {
+                "expired",
+                "consumed",
+            }
+            if local_terminal and status != "approved":
+                raise ApprovalRequestConflict(
+                    request_id=request_id,
+                    reason="tracker outcome conflicts with local enforcement record",
+                )
+            effective_status = (
+                existing["status"]
+                if local_terminal and existing is not None
+                else status
+            )
+            consumption = None
+            if existing is not None and existing.get("consumed_by_mutation_id"):
+                consumption = {
+                    "mutation_id": existing["consumed_by_mutation_id"],
+                    "consumed_at": existing["consumed_at"],
+                }
+            decision = (
+                {
+                    "actor_id": decided_by,
+                    "actor_profile": decided_by_profile,
+                    "note": decision_note,
+                    "decided_at": decided_at,
+                }
+                if decided_by is not None
+                else None
+            )
+            events = [
+                {
+                    "event_id": record.event.event_id,
+                    "event_type": record.event.event_type,
+                    "occurred_at": record.event.occurred_at,
+                    "actor_id": record.event.details.get("actor_id"),
+                    "actor_profile": record.event.details.get("actor_profile"),
+                    "note": record.event.details.get("note"),
+                    "expires_at": record.event.details.get("expires_at"),
+                    "payload_hash": record.event.payload_hash,
+                    "tracker_record_id": record.tracker_record_id,
+                    "tracker_record_url": record.tracker_record_url,
+                }
+                for record in ordered
+            ]
+            projections.append(
+                {
+                    **packet.payload(),
+                    "map_id": map_id,
+                    "packet_hash": packet.packet_hash,
+                    "status": effective_status,
+                    "requested_by_profile": (
+                        existing["requested_by_profile"]
+                        if existing is not None
+                        else "tracker-reconcile"
+                    ),
+                    "requested_by_session": (
+                        existing["requested_by_session"]
+                        if existing is not None
+                        else "tracker-reconcile"
+                    ),
+                    "requested_at": requested.event.occurred_at,
+                    "tracker_request_id": requested.tracker_record_id,
+                    "tracker_request_url": requested.tracker_record_url,
+                    "decided_by": decided_by,
+                    "decided_by_profile": decided_by_profile,
+                    "decision_note": decision_note,
+                    "decided_at": decided_at,
+                    "expires_at": expires_at,
+                    "tracker_decision_id": (
+                        decision_record.tracker_record_id
+                        if decision_record is not None
+                        else None
+                    ),
+                    "tracker_decision_url": (
+                        decision_record.tracker_record_url
+                        if decision_record is not None
+                        else None
+                    ),
+                    "consumed_by_mutation_id": (
+                        existing.get("consumed_by_mutation_id")
+                        if local_terminal and existing is not None
+                        else None
+                    ),
+                    "consumed_at": (
+                        existing.get("consumed_at")
+                        if local_terminal and existing is not None
+                        else None
+                    ),
+                    "updated_at": (
+                        existing["updated_at"]
+                        if local_terminal and existing is not None
+                        else (decided_at or requested.event.occurred_at)
+                    ),
+                    "events": events,
+                    "public": {
+                        **packet.payload(),
+                        "status": effective_status,
+                        "requested_at": requested.event.occurred_at,
+                        "expires_at": expires_at,
+                        "decision": decision,
+                        "consumption": consumption,
+                        "history": [
+                            {
+                                **event,
+                                "tracker": {
+                                    "id": event["tracker_record_id"],
+                                    "url": event["tracker_record_url"],
+                                },
+                            }
+                            for event in events
+                        ],
+                        "tracker": {
+                            "request": {
+                                "id": requested.tracker_record_id,
+                                "url": requested.tracker_record_url,
+                            },
+                            "decision": (
+                                {
+                                    "id": decision_record.tracker_record_id,
+                                    "url": decision_record.tracker_record_url,
+                                }
+                                if decision_record is not None
+                                else None
+                            ),
+                        },
+                    },
+                }
+            )
+        return projections
+
+    def _authoritative_map_history(
+        self,
+        *,
+        issue: TrackerIssue,
+        synchronized_at: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Load every tracker-backed Map history projection through one seam."""
+        decisions = [
+            self._decision_projection(record, confirmed_at=synchronized_at)
+            for record in self._decision_records_by_id(
+                self._tracker.list_decisions(issue.url)
+            ).values()
+        ]
+        list_reports = getattr(self._tracker, "list_pm_reports", None)
+        if callable(list_reports):
+            reports = []
+            for record in self._pm_report_records_by_id(
+                list_reports(issue.url)
+            ).values():
+                if record.report.assignment_map_id != issue.id:
+                    raise MapBindingError(
+                        "Tracker PM report belongs to another assigned Map"
+                    )
+                reports.append(
+                    self._pm_report_projection(record, confirmed_at=synchronized_at)
+                )
+        elif self._storage.recent_pm_reports(map_id=issue.id, limit=1):
+            raise MapBindingError(
+                "Tracker adapter cannot authoritatively reconcile PM report history"
+            )
+        else:
+            reports = []
+        list_approvals = getattr(self._tracker, "list_approval_events", None)
+        if callable(list_approvals):
+            approval_records = self._approval_records_by_event_id(
+                list_approvals(issue.url)
+            )
+        elif self._storage.approvals(map_id=issue.id):
+            raise MapBindingError(
+                "Tracker adapter cannot authoritatively reconcile approval history"
+            )
+        else:
+            approval_records = {}
+        approvals = self._approval_reconcile_projections(
+            map_id=issue.id,
+            records=approval_records,
+        )
+        return decisions, reports, approvals
+
+    @staticmethod
+    def _approval_history_text(
+        details: dict[str, Any], field: str, request_id: str
+    ) -> str:
+        value = details.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ApprovalRequestConflict(
+                request_id=request_id,
+                reason=f"tracker approval history has no {field}",
+            )
+        return value.strip()
+
     def _authorize_chairman_request(
         self,
         *,
@@ -1655,7 +2166,12 @@ class MapGovernanceApplication:
         )
         raise ApprovalEnforcementError(action=action, map_id=map_id, reason=reason)
 
-    def _current_approval(self, *, request_id: str) -> dict[str, Any] | None:
+    def _current_approval(
+        self,
+        *,
+        request_id: str,
+        persist_expiry: bool = True,
+    ) -> dict[str, Any] | None:
         approval = self._storage.approval(request_id)
         if approval is None:
             return None
@@ -1664,17 +2180,28 @@ class MapGovernanceApplication:
                 str(approval["expires_at"]).replace("Z", "+00:00")
             )
             if expires_at <= self._current_datetime():
-                self._storage.expire_approval(
-                    request_id=request_id,
-                    expired_at=self._synchronized_at(),
-                )
-                approval = self._storage.approval(request_id)
+                if persist_expiry:
+                    self._storage.expire_approval(
+                        request_id=request_id,
+                        expired_at=self._synchronized_at(),
+                    )
+                    approval = self._storage.approval(request_id)
+                else:
+                    approval = {**approval, "status": "expired"}
         return approval
 
     def _approval_collection(self, *, map_id: str) -> dict[str, Any]:
+        persist_expiry = True
+        try:
+            self._ensure_map_writable(map_id=map_id)
+        except StaleProjectionError:
+            persist_expiry = False
         approvals = []
         for row in self._storage.approvals(map_id=map_id):
-            current = self._current_approval(request_id=row["request_id"])
+            current = self._current_approval(
+                request_id=row["request_id"],
+                persist_expiry=persist_expiry,
+            )
             if current is not None:
                 approvals.append(self._approval_projection(current))
         return {"count": len(approvals), "items": approvals}
@@ -1884,6 +2411,7 @@ class MapGovernanceApplication:
 
     def open_map(self, *, map_id: str) -> dict[str, Any]:
         """Resolve, initialize and return the Map's one canonical CEO session."""
+        self._ensure_map_writable(map_id=map_id)
         lock_key = f"{self._storage.database}:{map_id}"
         with _operation_lock("session", lock_key):
             with self._storage.ceo_session_lease(map_id):
@@ -2222,11 +2750,20 @@ class MapGovernanceApplication:
 
     def configure_project(self, *, project_url: str) -> dict[str, Any]:
         """Configure one existing GitHub Project as a CEO project."""
-        project = self._tracker.get_project(project_url)
+        existing = self._storage.project_binding_for_url(project_url)
+        if existing is not None:
+            self._ensure_project_writable(project_id=str(existing["project_id"]))
+        try:
+            project = self._tracker.get_project(project_url)
+        except TrackerError as error:
+            if existing is not None:
+                self._mark_tracker_stale(
+                    project_id=str(existing["project_id"]), reason=str(error)
+                )
+            raise
         synchronized_at = self._synchronized_at()
         stored = self._stored_project(project)
-        self._storage.save_project_binding(stored)
-        self._storage.save_project_projection(
+        self._storage.save_configured_project(
             project=stored,
             synchronized_at=synchronized_at,
         )
@@ -2237,31 +2774,38 @@ class MapGovernanceApplication:
         project_binding = self._storage.project_binding(project_id)
         if project_binding is None:
             raise MapBindingError(f"CEO project is not configured: {project_id}")
-        issue = self._tracker.get_issue(issue_url)
+        self._ensure_project_writable(project_id=project_id)
         synchronized_at = self._synchronized_at()
+        try:
+            issue = self._tracker.get_issue(issue_url)
+            decisions, reports, approvals = self._authoritative_map_history(
+                issue=issue,
+                synchronized_at=synchronized_at,
+            )
+        except TrackerError as error:
+            self._mark_tracker_stale(project_id=project_id, reason=str(error))
+            raise
         card = self._stored_card(
             issue,
             project_id=project_binding["project_id"],
             synchronized_at=synchronized_at,
         )
         try:
-            self._storage.save_map_binding(
-                map_id=issue.id,
-                project_id=project_binding["project_id"],
-                issue_url=issue.url,
-            )
+            self._storage.save_bound_map(card=card, issue_url=issue.url)
         except ValueError as error:
             raise MapBindingError(str(error)) from error
-        self._storage.save_map_projection(card)
-        self._rebuild_decision_projection(
+        self._storage.replace_decision_projections(
             map_id=issue.id,
-            issue_url=issue.url,
-            confirmed_at=synchronized_at,
+            decisions=decisions,
         )
-        self._rebuild_pm_report_projection(
+        self._storage.replace_pm_report_projections(
             map_id=issue.id,
-            issue_url=issue.url,
-            confirmed_at=synchronized_at,
+            reports=reports,
+        )
+        self._storage.replace_approval_projections(
+            map_id=issue.id,
+            approvals=approvals,
+            reconciled_at=synchronized_at,
         )
         return self._card_with_summary(
             card,
@@ -2274,78 +2818,74 @@ class MapGovernanceApplication:
         if project_id is not None and not bindings:
             raise MapBindingError(f"CEO project is not configured: {project_id}")
         for project_binding in bindings:
-            project = self._tracker.get_project(project_binding["project_url"])
-            if project.id != project_binding["project_id"]:
+            self._reconcile_project(project_binding)
+        return self.board()
+
+    def reconcile_project(self, *, project_id: str) -> dict[str, Any]:
+        """Fetch all tracker truth and clear stale only after atomic reconcile."""
+        binding = self._storage.project_binding(project_id)
+        if binding is None:
+            raise MapBindingError(f"CEO project is not configured: {project_id}")
+        self._reconcile_project(binding)
+        return self.board()
+
+    def _reconcile_project(self, binding: dict[str, Any]) -> bool:
+        project_id = str(binding["project_id"])
+        changed_at = self._synchronized_at()
+        self._storage.set_project_reachability(
+            project_id=project_id,
+            source="tracker",
+            state="reconciling",
+            reason=None,
+            changed_at=changed_at,
+        )
+        try:
+            project = self._tracker.get_project(str(binding["project_url"]))
+            if project.id != project_id:
                 raise MapBindingError("Configured GitHub Project identity changed")
             synchronized_at = self._synchronized_at()
-            self._storage.save_project_projection(
-                project=self._stored_project(project),
-                synchronized_at=synchronized_at,
-            )
-            for map_binding in self._storage.map_bindings(project.id):
-                issue = self._tracker.get_issue(map_binding["issue_url"])
+            cards: list[dict[str, Any]] = []
+            decisions: dict[str, list[dict[str, Any]]] = {}
+            reports: dict[str, list[dict[str, Any]]] = {}
+            approvals: dict[str, list[dict[str, Any]]] = {}
+            for map_binding in self._storage.map_bindings(project_id):
+                issue = self._tracker.get_issue(str(map_binding["issue_url"]))
                 if issue.id != map_binding["map_id"]:
                     raise MapBindingError("Bound GitHub Issue identity changed")
-                self._storage.save_map_projection(
+                cards.append(
                     self._stored_card(
                         issue,
-                        project_id=project.id,
+                        project_id=project_id,
                         synchronized_at=synchronized_at,
                     )
                 )
-                self._rebuild_decision_projection(
-                    map_id=issue.id,
-                    issue_url=issue.url,
-                    confirmed_at=synchronized_at,
+                (
+                    decisions[issue.id],
+                    reports[issue.id],
+                    approvals[issue.id],
+                ) = self._authoritative_map_history(
+                    issue=issue,
+                    synchronized_at=synchronized_at,
                 )
-                self._rebuild_pm_report_projection(
-                    map_id=issue.id,
-                    issue_url=issue.url,
-                    confirmed_at=synchronized_at,
-                )
-        return self.board()
-
-    def _rebuild_decision_projection(
-        self,
-        *,
-        map_id: str,
-        issue_url: str,
-        confirmed_at: str,
-    ) -> None:
-        records = self._decision_records_by_id(self._tracker.list_decisions(issue_url))
-        decisions = [
-            self._decision_projection(record, confirmed_at=confirmed_at)
-            for record in records.values()
-        ]
-        self._storage.replace_decision_projections(
-            map_id=map_id,
-            decisions=decisions,
-        )
-
-    def _rebuild_pm_report_projection(
-        self,
-        *,
-        map_id: str,
-        issue_url: str,
-        confirmed_at: str,
-    ) -> None:
-        list_reports = getattr(self._tracker, "list_pm_reports", None)
-        if list_reports is None:
-            return
-        records = self._pm_report_records_by_id(list_reports(issue_url))
-        reports = []
-        for record in records.values():
-            if record.report.assignment_map_id != map_id:
-                raise MapBindingError(
-                    "Tracker PM report belongs to another assigned Map"
-                )
-            reports.append(
-                self._pm_report_projection(record, confirmed_at=confirmed_at)
+            self._storage.apply_project_reconcile(
+                project=self._stored_project(project),
+                cards=cards,
+                decisions=decisions,
+                reports=reports,
+                approvals=approvals,
+                synchronized_at=synchronized_at,
             )
-        self._storage.replace_pm_report_projections(
-            map_id=map_id,
-            reports=reports,
-        )
+        except (
+            TrackerError,
+            MapBindingError,
+            ApprovalRequestConflict,
+            StructuredDecisionConflict,
+            PMReportConflict,
+            ValueError,
+        ) as error:
+            self._mark_tracker_stale(project_id=project_id, reason=str(error))
+            return False
+        return True
 
     def transition_map(
         self,
@@ -2397,6 +2937,7 @@ class MapGovernanceApplication:
             raise MapBindingError(
                 f"CEO project is not configured: {binding['project_id']}"
             )
+        self._ensure_project_writable(project_id=str(binding["project_id"]))
 
         protected = self._transition_requires_approval(requested_stage=requested_stage)
         action = "transition_map"
@@ -2486,7 +3027,10 @@ class MapGovernanceApplication:
                     actor_identity=actor_identity,
                 )
 
-        current_issue = self._tracker.get_issue(binding["issue_url"])
+        current_issue = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.get_issue(binding["issue_url"]),
+        )
         if current_issue.id != map_id:
             raise MapBindingError("Bound GitHub Issue identity changed")
         current_stage = self._executive_stage(current_issue)
@@ -2596,7 +3140,10 @@ class MapGovernanceApplication:
             raise RuntimeError("Stage-transition Outbox intent disappeared")
         if status.state != "succeeded":
             if status.state == "terminal":
-                observed = self._tracker.get_issue(binding["issue_url"])
+                observed = self._tracker_read(
+                    project_id=str(binding["project_id"]),
+                    operation=lambda: self._tracker.get_issue(binding["issue_url"]),
+                )
                 raise MapTransitionConflict(
                     current_stage=self._executive_stage(observed),
                     requested_stage=requested_stage,
@@ -3083,10 +3630,33 @@ class MapGovernanceApplication:
             title=row["title"],
             url=row["project_url"],
         )
-        return cls._configured_project(
+        projection = cls._configured_project(
             project,
             synchronized_at=row["synchronized_at"],
         )
+        state = str(row.get("authority_state") or "healthy")
+        last_success_at = str(
+            row.get("authority_last_success_at") or row["synchronized_at"]
+        )
+        reason = row.get("authority_reason")
+        source = {
+            "source": "tracker",
+            "state": state,
+            "last_success_at": last_success_at,
+            "reason": reason,
+        }
+        projection["authority"] = {
+            "state": state,
+            "last_success_at": last_success_at,
+            "reason": reason,
+            "sources": [source],
+            "recovery": (
+                "Reconnect tracker authority and complete authoritative reconcile."
+                if state != "healthy"
+                else None
+            ),
+        }
+        return projection
 
     @staticmethod
     def _card_projection(
@@ -3131,6 +3701,14 @@ class MapGovernanceApplication:
                 item["status"] == "pending" for item in approvals["items"]
             ),
             "latest": approvals["items"][0] if approvals["items"] else None,
+            "statuses": [
+                {
+                    "request_id": item["request_id"],
+                    "status": item["status"],
+                    "requested_at": item["requested_at"],
+                }
+                for item in approvals["items"]
+            ],
         }
         card["delivery_summary"] = self._storage.pm_delivery_summary(map_id=card["id"])
         card["external_effects"] = self._outbox.map_summary(card["id"])

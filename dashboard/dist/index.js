@@ -8,7 +8,7 @@
   }
 
   const { React, fetchJSON } = SDK;
-  const { useCallback, useEffect, useState } = SDK.hooks;
+  const { useCallback, useEffect, useRef, useState } = SDK.hooks;
   const {
     Badge,
     Button,
@@ -119,30 +119,425 @@
     }
   }
 
+  const STAGE_TRANSITIONS = {
+    discovery: ["awaiting-approval", "parked"],
+    "awaiting-approval": ["authorized", "discovery", "parked"],
+    authorized: ["delivery", "parked"],
+    delivery: ["decision", "acceptance", "parked"],
+    decision: ["delivery", "parked"],
+    acceptance: ["delivery", "done", "parked"],
+    parked: ["discovery", "cancelled"],
+  };
+
+  function updateCard(board, mapId, update) {
+    let updatedCard = null;
+    const maps = (board.maps || []).map(function (card) {
+      if (card.id !== mapId) return card;
+      updatedCard = update(card);
+      return updatedCard;
+    });
+    if (!updatedCard) return board;
+    const projects = (board.projects || []).map(function (project) {
+      if (!(project.maps || []).some(function (card) { return card.id === mapId; })) {
+        return project;
+      }
+      return Object.assign({}, project, {
+        maps: project.maps.map(function (card) {
+          return card.id === mapId ? updatedCard : card;
+        }),
+      });
+    });
+    return Object.assign({}, board, { maps: maps, projects: projects });
+  }
+
+  function eventCard(board, raw) {
+    const current = (board.maps || []).find(function (card) { return card.id === raw.id; });
+    const projectId = raw.project_id || (current && current.project && current.project.id);
+    const project = (board.projects || []).find(function (item) { return item.id === projectId; });
+    const patch = {};
+    if (raw.title !== undefined) patch.title = raw.title;
+    if (raw.stage !== undefined) {
+      patch.stage = raw.stage;
+      patch.available_transitions = raw.available_transitions || STAGE_TRANSITIONS[raw.stage] || [];
+    }
+    if (raw.synchronized_at !== undefined) patch.last_synchronized_at = raw.synchronized_at;
+    return Object.assign({
+      id: raw.id,
+      project: { id: projectId, url: project && project.tracker ? project.tracker.url : "" },
+      tracker: {
+        provider: "github",
+        id: raw.id,
+        identity: raw.repository + "#" + raw.issue_number,
+        url: raw.issue_url,
+      },
+      decision_summary: { count: 0, latest: null },
+      approval_summary: { count: 0, pending_count: 0, latest: null, statuses: [] },
+      delivery_summary: { state: "not_reported" },
+      external_effects: {
+        state: "healthy",
+        pending_count: 0,
+        retry_scheduled_count: 0,
+        leased_count: 0,
+        succeeded_count: 0,
+        terminal_count: 0,
+        latest_terminal: null,
+      },
+      ceo_session: { state: "unbound" },
+    }, current || {}, patch);
+  }
+
+  function pmReportBadges(report) {
+    const key = report.type + ":" + String(
+      report.blocking === undefined ? null : report.blocking,
+    );
+    const badgeType = {
+      "question:false": "non_blocking_question",
+      "question:true": "blocking_question",
+      "blocker:false": "localized_blocker",
+      "blocker:true": "whole_map_blocker",
+      "acceptance:null": "acceptance_request",
+      "failure:null": "terminal_failure",
+    }[key];
+    return badgeType ? [{ type: badgeType, count: 1 }] : [];
+  }
+
+  function reduceBoardEvent(board, event) {
+    const payload = event.payload || {};
+    if (event.type === "map.upserted" && payload.card) {
+      const card = eventCard(board, payload.card);
+      const exists = (board.maps || []).some(function (item) { return item.id === card.id; });
+      if (exists) return updateCard(board, card.id, function () { return card; });
+      const projects = (board.projects || []).map(function (project) {
+        return project.id === card.project.id
+          ? Object.assign({}, project, { maps: (project.maps || []).concat([card]) })
+          : project;
+      });
+      return Object.assign({}, board, { maps: (board.maps || []).concat([card]), projects: projects });
+    }
+    if (event.type === "project.upserted" && payload.project) {
+      const raw = payload.project;
+      const existing = (board.projects || []).find(function (project) { return project.id === raw.id; });
+      const project = Object.assign({
+        id: raw.id,
+        tracker: {
+          provider: "github",
+          id: raw.id,
+          owner: raw.owner,
+          owner_type: raw.owner_type,
+          number: raw.number,
+          url: raw.url,
+        },
+        maps: [],
+      }, existing || {}, { title: raw.title, last_synchronized_at: payload.synchronized_at });
+      const projects = existing
+        ? board.projects.map(function (item) { return item.id === raw.id ? project : item; })
+        : (board.projects || []).concat([project]);
+      return Object.assign({}, board, { projects: projects });
+    }
+    if (event.type === "reachability.updated") {
+      const projects = (board.projects || []).map(function (project) {
+        if (project.id !== event.project_id) return project;
+        const authority = {
+          state: payload.state,
+          last_success_at: payload.last_success_at,
+          reason: payload.reason,
+          sources: [payload],
+          recovery: payload.state === "healthy"
+            ? null
+            : "Reconnect tracker authority and complete authoritative reconcile.",
+        };
+        return Object.assign({}, project, { authority: authority });
+      });
+      return Object.assign({}, board, { projects: projects });
+    }
+    if (event.type === "session.updated" && payload.ceo_session) {
+      return updateCard(board, event.map_id, function (card) {
+        return Object.assign({}, card, { ceo_session: payload.ceo_session });
+      });
+    }
+    if (event.type === "decision.upserted" && payload.decision) {
+      return updateCard(board, event.map_id, function (card) {
+        const prior = card.decision_summary || { count: 0, latest: null };
+        const duplicate = prior.latest && prior.latest.decision_id === payload.decision.decision_id;
+        return Object.assign({}, card, {
+          decision_summary: {
+            count: prior.count + (duplicate ? 0 : 1),
+            latest: payload.decision,
+          },
+        });
+      });
+    }
+    if (event.type === "approval.upserted" && payload.approval) {
+      return updateCard(board, event.map_id, function (card) {
+        const prior = card.approval_summary || {
+          count: 0,
+          pending_count: 0,
+          latest: null,
+          statuses: [],
+        };
+        const statuses = (prior.statuses || []).slice();
+        const statusIndex = statuses.findIndex(function (item) {
+          return item.request_id === payload.approval.request_id;
+        });
+        const status = Object.assign(
+          {},
+          statusIndex >= 0 ? statuses[statusIndex] : {},
+          {
+            request_id: payload.approval.request_id,
+            status: payload.approval.status,
+            requested_at: payload.approval.requested_at
+              || (statusIndex >= 0 ? statuses[statusIndex].requested_at : null),
+          },
+        );
+        if (statusIndex >= 0) statuses[statusIndex] = status;
+        else statuses.push(status);
+        statuses.sort(function (left, right) {
+          return String(right.requested_at || "").localeCompare(
+            String(left.requested_at || ""),
+          );
+        });
+        const latestId = statuses[0] && statuses[0].request_id;
+        let latest = prior.latest;
+        if (latestId === payload.approval.request_id) {
+          latest = Object.assign(
+            {},
+            prior.latest && prior.latest.request_id === latestId ? prior.latest : {},
+            payload.approval,
+          );
+        }
+        return Object.assign({}, card, {
+          approval_summary: {
+            count: statuses.length,
+            pending_count: statuses.filter(function (item) {
+              return item.status === "pending";
+            }).length,
+            latest: latest,
+            statuses: statuses,
+          },
+        });
+      });
+    }
+    if (event.type === "pm-report.upserted" && payload.report) {
+      return updateCard(board, event.map_id, function (card) {
+        const prior = card.delivery_summary || { state: "not_reported", count: 0 };
+        const duplicate = prior.latest && prior.latest.record_id === payload.report.record_id;
+        return Object.assign({}, card, {
+          delivery_summary: {
+            state: "reported",
+            count: (prior.count || 0) + (duplicate ? 0 : 1),
+            latest: payload.report,
+            badges: pmReportBadges(payload.report),
+          },
+        });
+      });
+    }
+    if (event.type === "outbox.updated" && payload.summary) {
+      return updateCard(board, event.map_id, function (card) {
+        return Object.assign({}, card, { external_effects: payload.summary });
+      });
+    }
+    if (event.type === "reconcile.completed") {
+      let next = reduceBoardEvent(board, {
+        type: "reachability.updated",
+        project_id: event.project_id,
+        payload: {
+          source: "tracker",
+          state: "healthy",
+          last_success_at: payload.last_success_at,
+          reason: null,
+        },
+      });
+      (payload.cards || []).forEach(function (card) {
+        next = reduceBoardEvent(next, { type: "map.upserted", payload: { card: card } });
+      });
+      Object.keys(payload.decisions || {}).forEach(function (mapId) {
+        const byId = {};
+        (payload.decisions[mapId] || []).forEach(function (decision) {
+          byId[decision.decision_id] = decision;
+        });
+        const decisions = Object.values(byId).sort(function (left, right) {
+          return String(right.timestamp).localeCompare(String(left.timestamp));
+        });
+        next = updateCard(next, mapId, function (card) {
+          return Object.assign({}, card, {
+            decision_summary: {
+              count: decisions.length,
+              latest: decisions[0] || null,
+            },
+          });
+        });
+      });
+      Object.keys(payload.pm_reports || {}).forEach(function (mapId) {
+        const byId = {};
+        (payload.pm_reports[mapId] || []).forEach(function (report) {
+          byId[report.record_id] = report;
+        });
+        const reports = Object.values(byId).sort(function (left, right) {
+          return String(right.timestamp).localeCompare(String(left.timestamp));
+        });
+        const latest = reports[0] || null;
+        next = updateCard(next, mapId, function (card) {
+          return Object.assign({}, card, {
+            delivery_summary: latest
+              ? {
+                  state: "reported",
+                  count: reports.length,
+                  latest: latest,
+                  badges: pmReportBadges(latest),
+                }
+              : { state: "not_reported" },
+          });
+        });
+      });
+      Object.keys(payload.approvals || {}).forEach(function (mapId) {
+        const byId = {};
+        (payload.approvals[mapId] || []).forEach(function (approval) {
+          byId[approval.request_id] = approval;
+        });
+        const approvals = Object.values(byId).sort(function (left, right) {
+          return String(right.requested_at).localeCompare(String(left.requested_at));
+        });
+        next = updateCard(next, mapId, function (card) {
+          return Object.assign({}, card, {
+            approval_summary: {
+              count: approvals.length,
+              pending_count: approvals.filter(function (approval) {
+                return approval.status === "pending";
+              }).length,
+              latest: approvals[0] || null,
+              statuses: approvals.map(function (approval) {
+                return {
+                  request_id: approval.request_id,
+                  status: approval.status,
+                  requested_at: approval.requested_at,
+                };
+              }),
+            },
+          });
+        });
+      });
+      return next;
+    }
+    return board;
+  }
+
   function MapsPage() {
     const [state, setState] = useState({ status: "loading" });
     const [transitionState, setTransitionState] = useState({ status: "idle" });
     const [sessionState, setSessionState] = useState({ status: "idle" });
     const [detailState, setDetailState] = useState({ status: "idle" });
     const [approvalState, setApprovalState] = useState({ status: "idle" });
+    const [streamState, setStreamState] = useState({ status: "connecting" });
+    const streamRef = useRef({ cursor: 0, socket: null, retry: null, disposed: false });
+
+    const applyEvent = useCallback(function (event) {
+      setState(function (current) {
+        if (current.status !== "ready") return current;
+        return Object.assign({}, current, {
+          board: Object.assign(
+            {},
+            reduceBoardEvent(current.board, event),
+            { cursor: event.cursor || current.board.cursor || 0 },
+          ),
+        });
+      });
+      setDetailState(function (current) {
+        if (current.status !== "ready") return current;
+        const detail = Object.assign({}, current.detail);
+        const payload = event.payload || {};
+        if (event.type === "reconcile.completed") {
+          const card = (payload.cards || []).find(function (item) {
+            return item.id === current.mapId;
+          });
+          if (!card) return current;
+          detail.title = card.title;
+          detail.stage = card.stage;
+          detail.available_transitions = STAGE_TRANSITIONS[card.stage] || [];
+          detail.last_synchronized_at = card.synchronized_at;
+          detail.recent_decisions = (payload.decisions || {})[current.mapId] || [];
+          detail.pm_reports = (payload.pm_reports || {})[current.mapId] || [];
+          const approvals = (payload.approvals || {})[current.mapId] || [];
+          detail.approvals = { count: approvals.length, items: approvals };
+          const latestReport = detail.pm_reports.slice().sort(function (left, right) {
+            return String(right.timestamp).localeCompare(String(left.timestamp));
+          })[0];
+          detail.delivery_summary = latestReport
+            ? {
+                state: "reported",
+                count: detail.pm_reports.length,
+                latest: latestReport,
+                badges: pmReportBadges(latestReport),
+              }
+            : { state: "not_reported" };
+        } else if (current.mapId !== event.map_id) {
+          return current;
+        } else if (event.type === "map.upserted" && payload.card) {
+          detail.title = payload.card.title;
+          detail.stage = payload.card.stage;
+          detail.available_transitions = payload.card.available_transitions
+            || STAGE_TRANSITIONS[payload.card.stage]
+            || [];
+          detail.last_synchronized_at = payload.card.synchronized_at;
+        } else if (event.type === "decision.upserted" && payload.decision) {
+          detail.recent_decisions = [payload.decision].concat(
+            (detail.recent_decisions || []).filter(function (item) {
+              return item.decision_id !== payload.decision.decision_id;
+            }),
+          );
+        } else if (event.type === "approval.upserted" && payload.approval) {
+          const approvals = detail.approvals || { count: 0, items: [] };
+          const existing = approvals.items.find(function (item) {
+            return item.request_id === payload.approval.request_id;
+          });
+          const merged = Object.assign({}, existing || {}, payload.approval);
+          detail.approvals = {
+            count: approvals.count + (existing ? 0 : 1),
+            items: [merged].concat(approvals.items.filter(function (item) {
+              return item.request_id !== merged.request_id;
+            })),
+          };
+        } else if (event.type === "pm-report.upserted" && payload.report) {
+          detail.pm_reports = [payload.report].concat(
+            (detail.pm_reports || []).filter(function (item) {
+              return item.record_id !== payload.report.record_id;
+            }),
+          );
+          detail.delivery_summary = {
+            state: "reported",
+            count: detail.pm_reports.length,
+            latest: payload.report,
+            badges: pmReportBadges(payload.report),
+          };
+        } else if (event.type === "session.updated" && payload.ceo_session) {
+          detail.ceo_session = payload.ceo_session;
+        } else if (event.type === "outbox.updated" && payload.summary) {
+          detail.external_effects = payload.summary;
+        }
+        return Object.assign({}, current, { detail: detail });
+      });
+    }, []);
 
     const load = useCallback(function () {
       setState({ status: "loading" });
-      requestProfile().then(function (profile) {
+      return requestProfile().then(function (profile) {
         const encodedProfile = encodeURIComponent(profile);
         return Promise.all([
           fetchJSON("/api/plugins/map-governance/board?profile=" + encodedProfile),
           fetchJSON("/api/plugins/map-governance/health?profile=" + encodedProfile),
-        ]);
+        ]).then(function (results) {
+          return { profile: profile, results: results };
+        });
       }).then(
-        function (results) {
-          setState({ status: "ready", board: results[0], health: results[1] });
+        function (loaded) {
+          setState({ status: "ready", board: loaded.results[0], health: loaded.results[1] });
+          return { profile: loaded.profile, board: loaded.results[0] };
         },
         function (error) {
           setState({
             status: "error",
             message: error && error.message ? error.message : "Unable to load Maps",
           });
+          throw error;
         },
       );
     }, []);
@@ -220,9 +615,27 @@
           },
         );
       }).then(
-        function () {
+        function (result) {
           setTransitionState({ status: "idle" });
-          load();
+          applyEvent({
+            type: "map.upserted",
+            map_id: mapId,
+            payload: { card: {
+              id: mapId,
+              project_id: result.project && result.project.id,
+              repository: result.tracker && result.tracker.identity
+                ? result.tracker.identity.split("#")[0]
+                : undefined,
+              issue_number: result.tracker && result.tracker.identity
+                ? Number(result.tracker.identity.split("#")[1])
+                : undefined,
+              issue_url: result.tracker && result.tracker.url,
+              title: result.title,
+              stage: result.stage,
+              available_transitions: result.available_transitions,
+              synchronized_at: result.last_synchronized_at,
+            } },
+          });
         },
         function (error) {
           setTransitionState({
@@ -234,7 +647,7 @@
           });
         },
       );
-    }, [detailState, load]);
+    }, [applyEvent, detailState]);
 
     const openCEOSession = useCallback(function (mapId) {
       setSessionState({ status: "pending", mapId: mapId });
@@ -258,11 +671,20 @@
           awaitHydration: true,
           expectHistory: true,
           retryHydrationTimeoutOnce: true,
-        });
+        }).then(function () { return result; });
       }).then(
-        function () {
+        function (result) {
           setSessionState({ status: "idle" });
-          load();
+          applyEvent({
+            type: "session.updated",
+            map_id: mapId,
+            payload: {
+              ceo_session: {
+                state: result.ceo_session.state,
+                last_activity_at: result.ceo_session.last_activity_at,
+              },
+            },
+          });
         },
         function (error) {
           setSessionState({
@@ -272,10 +694,9 @@
               ? error.message
               : "Unable to open the canonical CEO session",
           });
-          load();
         },
       );
-    }, [load]);
+    }, [applyEvent]);
 
     const loadMapDetail = useCallback(function (mapId) {
       setDetailState({ status: "loading", mapId: mapId });
@@ -329,10 +750,18 @@
           },
         );
       }).then(
-        function () {
+        function (result) {
           setApprovalState({ status: "idle" });
-          loadMapDetail(mapId);
-          load();
+          applyEvent({
+            type: "approval.upserted",
+            map_id: mapId,
+            payload: {
+              approval: Object.assign(
+                { request_id: requestId },
+                result.approval || result,
+              ),
+            },
+          });
         },
         function (error) {
           setApprovalState({
@@ -344,11 +773,95 @@
           });
         },
       );
-    }, [load, loadMapDetail]);
+    }, [applyEvent]);
 
     useEffect(function () {
-      load();
-    }, [load]);
+      const control = streamRef.current;
+      control.disposed = false;
+      control.refreshing = false;
+      let reconnectAttempt = 0;
+
+      function schedule(profile) {
+        if (control.disposed || control.refreshing) return;
+        setStreamState({ status: "disconnected" });
+        const delay = Math.min(30000, 500 * Math.pow(2, reconnectAttempt++));
+        control.retry = window.setTimeout(function () {
+          open(profile, control.cursor);
+        }, delay);
+      }
+
+      function refreshExpired(profile) {
+        if (control.refreshing || control.disposed) return;
+        control.refreshing = true;
+        const expiredSocket = control.socket;
+        control.socket = null;
+        if (expiredSocket) expiredSocket.close();
+        setStreamState({ status: "refreshing" });
+        load().then(function (loaded) {
+          control.cursor = Number(loaded.board.cursor || 0);
+          control.refreshing = false;
+          open(loaded.profile || profile, control.cursor);
+        }).catch(function () {
+          control.refreshing = false;
+          schedule(profile);
+        });
+      }
+
+      function open(profile, cursor) {
+        if (control.disposed || !SDK.buildWsUrl || !window.WebSocket) {
+          setStreamState({ status: "disconnected" });
+          return;
+        }
+        setStreamState({ status: "connecting" });
+        SDK.buildWsUrl("/api/plugins/map-governance/events", {
+          profile: profile,
+          cursor: String(cursor),
+        }).then(function (url) {
+          if (control.disposed) return;
+          const socket = new window.WebSocket(url);
+          control.socket = socket;
+          socket.onopen = function () {
+            reconnectAttempt = 0;
+            setStreamState({ status: "live" });
+          };
+          socket.onmessage = function (message) {
+            let frame;
+            try {
+              frame = JSON.parse(String(message.data));
+            } catch (_error) {
+              return;
+            }
+            if (frame.status === "refresh_required") {
+              refreshExpired(profile);
+              return;
+            }
+            (frame.events || []).forEach(applyEvent);
+            if (frame.cursor !== undefined) {
+              control.cursor = Number(frame.cursor);
+            }
+          };
+          socket.onclose = function () {
+            if (control.socket !== socket) return;
+            control.socket = null;
+            schedule(profile);
+          };
+          socket.onerror = function () {
+            socket.close();
+          };
+        }).catch(function () { schedule(profile); });
+      }
+
+      load().then(function (loaded) {
+        control.cursor = Number(loaded.board.cursor || 0);
+        open(loaded.profile, control.cursor);
+      }).catch(function () { setStreamState({ status: "disconnected" }); });
+
+      return function () {
+        control.disposed = true;
+        if (control.retry !== null) window.clearTimeout(control.retry);
+        if (control.socket) control.socket.close();
+      };
+    }, [applyEvent, load]);
 
     if (state.status === "loading") {
       return React.createElement(
@@ -426,10 +939,23 @@
         "header",
         { className: "flex items-center justify-between gap-4" },
         React.createElement("h1", { id: "maps-title", className: "text-xl font-semibold" }, "Maps"),
+        React.createElement(
+          Badge,
+          { variant: "outline", "aria-label": "Board event stream status" },
+          streamState.status === "live"
+            ? "Live updates connected"
+            : streamState.status === "refreshing"
+              ? "Refreshing expired cursor"
+              : streamState.status === "connecting"
+                ? "Live updates connecting"
+                : "Live updates disconnected · reconnecting",
+        ),
         React.createElement(Button, { type: "button", onClick: refresh }, "Refresh"),
       ),
       state.board.projects.map(function (project) {
         const headingId = "project-" + project.id;
+        const authority = project.authority || { state: "healthy" };
+        const stale = authority.state !== "healthy";
         return React.createElement(
           "section",
           { key: project.id, className: "space-y-3", "aria-labelledby": headingId },
@@ -455,6 +981,18 @@
           React.createElement(
             "div",
             { className: "grid gap-3 md:grid-cols-2 xl:grid-cols-3" },
+            stale
+              ? React.createElement(
+                  "div",
+                  {
+                    role: "alert",
+                    className: "rounded-md border p-3 text-sm text-destructive md:col-span-2 xl:col-span-3",
+                  },
+                  "Read-only stale projection · Last authority success: "
+                    + authority.last_success_at + " · " + authority.reason
+                    + " · " + authority.recovery,
+                )
+              : null,
             project.maps.map(function (card) {
               return React.createElement(
                 Card,
@@ -760,7 +1298,7 @@
                                                 key: choice[0],
                                                 type: "button",
                                                 variant: choice[0] === "approved" ? "default" : "outline",
-                                                disabled: pending,
+                                                disabled: pending || stale,
                                                 "aria-label": choice[1] + " " + approval.request_id,
                                                 onClick: function () {
                                                   decideApproval(
@@ -879,7 +1417,7 @@
                       Button,
                       {
                         type: "button",
-                        disabled: card.ceo_session.state === "repair_required"
+                        disabled: stale || card.ceo_session.state === "repair_required"
                           || (sessionState.status === "pending" && sessionState.mapId === card.id),
                         onClick: function () { openCEOSession(card.id); },
                       },
@@ -908,7 +1446,7 @@
                           key: stage,
                           type: "button",
                           variant: "outline",
-                          disabled: pending,
+                          disabled: pending || stale,
                           onClick: function () { transitionMap(card.id, card.stage, stage); },
                         },
                         "Move to " + stage,

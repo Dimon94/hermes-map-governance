@@ -12,6 +12,7 @@ from .application import (
     GovernanceAuthorizationError,
     GovernanceRequestIdentity,
     MapBindingError,
+    StaleProjectionError,
     StructuredDecisionConflict,
     TrackerDecisionConfirmationError,
     TrackerApprovalConfirmationError,
@@ -171,6 +172,7 @@ def register_ceo_capabilities(ctx) -> None:
             ApprovalEnforcementError,
             ApprovalRequestConflict,
             StructuredDecisionConflict,
+            StaleProjectionError,
         ) as error:
             return json.dumps({"error": error.as_dict()}, sort_keys=True)
         except TrackerDecisionConfirmationError as error:

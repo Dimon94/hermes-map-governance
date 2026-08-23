@@ -202,6 +202,18 @@ def test_tracker_confirmed_checkpoint_projects_an_executive_summary_and_ends_idl
     }
     assert "evidence" not in card["delivery_summary"]["latest"]
     assert tracker.reports[0].report.assignment_map_id == MAP_ID
+    events = application.board_events(cursor=0, limit=100)["events"]
+    pm_events = [event for event in events if event["type"] == "pm.updated"]
+    assert pm_events
+    assert all(
+        set(event["payload"]["assignment"]) == {"state", "updated_at"}
+        for event in pm_events
+    )
+    assert any(
+        event["type"] == "pm-report.upserted"
+        and event["payload"]["report"] == result["report"]
+        for event in events
+    )
 
 
 def test_pm_report_intent_is_durable_before_tracker_append(tmp_path):
@@ -702,6 +714,7 @@ def test_retry_reconciles_a_confirmed_report_after_stage_write_failure(tmp_path)
         "state": "not_reported"
     }
     tracker.fail_transitions = False
+    application.reconcile_project(project_id="PVT_acme_7")
 
     recovered = application.report_pm(request_identity=PM_IDENTITY, report=draft)
 

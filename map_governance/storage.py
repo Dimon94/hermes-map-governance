@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .approvals import normalized_json
+from .events import append_board_event, content_event_id
 
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class PluginStorage:
@@ -70,6 +71,18 @@ class PluginStorage:
                 WHERE project_id = ?
                 """,
                 (project_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def project_binding_for_url(self, project_url: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT project_id, project_url, owner_login, owner_type, project_number
+                FROM ceo_projects
+                WHERE project_url = ?
+                """,
+                (project_url,),
             ).fetchone()
         return dict(row) if row is not None else None
 
@@ -255,6 +268,20 @@ class PluginStorage:
                         assigned_at,
                     ),
                 )
+                self._append_map_resource_event(
+                    connection,
+                    map_id=map_id,
+                    event_type="pm.updated",
+                    identity=map_id,
+                    payload={
+                        "assignment": {
+                            "state": "idle",
+                            "updated_at": assigned_at,
+                        }
+                    },
+                    committed_at=assigned_at,
+                    occurrence_id=f"assignment:{session_id}",
+                )
             except sqlite3.IntegrityError as error:
                 raise ValueError(
                     "PM request identity is already assigned to another Map"
@@ -312,6 +339,19 @@ class PluginStorage:
                 """,
                 (turn_id, started_at, map_id),
             )
+            updated = dict(row)
+            updated.update(
+                state="active", active_turn_id=turn_id, updated_at=started_at
+            )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="pm.updated",
+                identity=map_id,
+                payload={"assignment": self._pm_assignment_event(updated)},
+                committed_at=started_at,
+                occurrence_id=f"begin:{turn_id}",
+            )
         return False
 
     def finish_pm_turn(
@@ -349,6 +389,24 @@ class PluginStorage:
                 """,
                 (turn_id, outcome, outcome_id, finished_at, map_id),
             )
+            updated = dict(row)
+            updated.update(
+                state="idle",
+                active_turn_id=None,
+                last_turn_id=turn_id,
+                last_outcome=outcome,
+                last_outcome_id=outcome_id,
+                updated_at=finished_at,
+            )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="pm.updated",
+                identity=map_id,
+                payload={"assignment": self._pm_assignment_event(updated)},
+                committed_at=finished_at,
+                occurrence_id=f"finish:{turn_id}:{outcome}:{outcome_id}",
+            )
         return False
 
     def save_pm_report_projection(
@@ -380,6 +438,14 @@ class PluginStorage:
                 """,
                 self._pm_report_projection_values(map_id, report),
             )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="pm-report.upserted",
+                identity=f"{map_id}:{report['record_id']}",
+                payload={"report": report},
+                committed_at=report["confirmed_at"],
+            )
 
     def replace_pm_report_projections(
         self,
@@ -407,6 +473,15 @@ class PluginStorage:
                     for report in reports
                 ],
             )
+            for report in reports:
+                self._append_map_resource_event(
+                    connection,
+                    map_id=map_id,
+                    event_type="pm-report.upserted",
+                    identity=f"{map_id}:{report['record_id']}",
+                    payload={"report": report},
+                    committed_at=report["confirmed_at"],
+                )
 
     @staticmethod
     def _pm_report_projection_values(
@@ -567,6 +642,22 @@ class PluginStorage:
                     updated_at,
                 ),
             )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="session.updated",
+                identity=map_id,
+                payload={
+                    "ceo_session": {
+                        "state": "ready",
+                        "last_activity_at": last_activity_at,
+                    }
+                },
+                committed_at=updated_at,
+                occurrence_id=(
+                    f"ready:{root_session_id}:{live_session_id}:{updated_at}"
+                ),
+            )
 
     def save_ceo_session_repair_required(
         self,
@@ -608,6 +699,23 @@ class PluginStorage:
                     updated_at,
                 ),
             )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="session.updated",
+                identity=map_id,
+                payload={
+                    "ceo_session": {
+                        "state": "repair_required",
+                        "repair": {
+                            "reason": reason,
+                            "candidate_count": candidate_count,
+                        },
+                    }
+                },
+                committed_at=updated_at,
+                occurrence_id=f"repair:{reason}:{candidate_count}:{updated_at}",
+            )
 
     def save_project_projection(
         self,
@@ -625,6 +733,137 @@ class PluginStorage:
                     synchronized_at = excluded.synchronized_at
                 """,
                 (project["id"], project["title"], synchronized_at),
+            )
+            payload = {"project": project, "synchronized_at": synchronized_at}
+            append_board_event(
+                connection,
+                event_id=content_event_id("project.upserted", project["id"], payload),
+                resource_key=f"project.upserted:{project['id']}",
+                project_id=project["id"],
+                map_id=None,
+                event_type="project.upserted",
+                payload=payload,
+                committed_at=synchronized_at,
+            )
+
+    def save_configured_project(
+        self,
+        *,
+        project: dict[str, Any],
+        synchronized_at: str,
+    ) -> None:
+        """Commit a project binding, projection, and one ordered board event."""
+        payload = {"project": project, "synchronized_at": synchronized_at}
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ceo_projects(
+                    project_id, project_url, owner_login, owner_type, project_number
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    project_url = excluded.project_url,
+                    owner_login = excluded.owner_login,
+                    owner_type = excluded.owner_type,
+                    project_number = excluded.project_number
+                """,
+                (
+                    project["id"],
+                    project["url"],
+                    project["owner"],
+                    project["owner_type"],
+                    project["number"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO project_projections(project_id, title, synchronized_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    title = excluded.title,
+                    synchronized_at = excluded.synchronized_at
+                """,
+                (project["id"], project["title"], synchronized_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO project_reachability(
+                    project_id, source, state, last_success_at, reason, updated_at
+                ) VALUES (?, 'tracker', 'healthy', ?, NULL, ?)
+                ON CONFLICT(project_id, source) DO UPDATE SET
+                    last_success_at = excluded.last_success_at,
+                    updated_at = excluded.updated_at
+                WHERE project_reachability.state = 'healthy'
+                """,
+                (project["id"], synchronized_at, synchronized_at),
+            )
+            append_board_event(
+                connection,
+                event_id=content_event_id("project.upserted", project["id"], payload),
+                resource_key=f"project.upserted:{project['id']}",
+                project_id=project["id"],
+                map_id=None,
+                event_type="project.upserted",
+                payload=payload,
+                committed_at=synchronized_at,
+            )
+
+    def save_bound_map(self, *, card: dict[str, Any], issue_url: str) -> None:
+        """Commit a Map binding, projection, and one ordered board event."""
+        payload = {"card": card}
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT project_id, issue_url FROM map_bindings WHERE map_id = ?",
+                (card["id"],),
+            ).fetchone()
+            if existing is not None and (
+                existing["project_id"] != card["project_id"]
+                or existing["issue_url"] != issue_url
+            ):
+                raise ValueError("Map Issue is already bound to a different project")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO map_bindings(map_id, project_id, issue_url)
+                VALUES (?, ?, ?)
+                """,
+                (card["id"], card["project_id"], issue_url),
+            )
+            connection.execute(
+                """
+                INSERT INTO map_projections(
+                    map_id, project_id, repository, issue_number, issue_url,
+                    title, stage, ceo_session_state, synchronized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(map_id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    repository = excluded.repository,
+                    issue_number = excluded.issue_number,
+                    issue_url = excluded.issue_url,
+                    title = excluded.title,
+                    stage = excluded.stage,
+                    ceo_session_state = excluded.ceo_session_state,
+                    synchronized_at = excluded.synchronized_at
+                """,
+                (
+                    card["id"],
+                    card["project_id"],
+                    card["repository"],
+                    card["issue_number"],
+                    card["issue_url"],
+                    card["title"],
+                    card["stage"],
+                    card["ceo_session_state"],
+                    card["synchronized_at"],
+                ),
+            )
+            append_board_event(
+                connection,
+                event_id=content_event_id("map.upserted", card["id"], payload),
+                resource_key=f"map.upserted:{card['id']}",
+                project_id=card["project_id"],
+                map_id=card["id"],
+                event_type="map.upserted",
+                payload=payload,
+                committed_at=card["synchronized_at"],
             )
 
     def save_map_projection(self, card: dict[str, Any]) -> None:
@@ -656,6 +895,17 @@ class PluginStorage:
                     card["ceo_session_state"],
                     card["synchronized_at"],
                 ),
+            )
+            payload = {"card": card}
+            append_board_event(
+                connection,
+                event_id=content_event_id("map.upserted", card["id"], payload),
+                resource_key=f"map.upserted:{card['id']}",
+                project_id=card["project_id"],
+                map_id=card["id"],
+                event_type="map.upserted",
+                payload=payload,
+                committed_at=card["synchronized_at"],
             )
 
     def compare_and_save_map_projection(
@@ -694,6 +944,17 @@ class PluginStorage:
                 ),
             )
             if cursor.rowcount == 1:
+                payload = {"card": card}
+                append_board_event(
+                    connection,
+                    event_id=content_event_id("map.upserted", card["id"], payload),
+                    resource_key=f"map.upserted:{card['id']}",
+                    project_id=card["project_id"],
+                    map_id=card["id"],
+                    event_type="map.upserted",
+                    payload=payload,
+                    committed_at=card["synchronized_at"],
+                )
                 return None
             row = connection.execute(
                 "SELECT stage FROM map_projections WHERE map_id = ?",
@@ -714,9 +975,15 @@ class PluginStorage:
                         binding.owner_type,
                         binding.project_number,
                         projection.title,
-                        projection.synchronized_at
+                        projection.synchronized_at,
+                        reachability.state AS authority_state,
+                        reachability.last_success_at AS authority_last_success_at,
+                        reachability.reason AS authority_reason
                     FROM project_projections AS projection
                     JOIN ceo_projects AS binding USING(project_id)
+                    LEFT JOIN project_reachability AS reachability
+                      ON reachability.project_id = binding.project_id
+                     AND reachability.source = 'tracker'
                     ORDER BY binding.owner_login, binding.project_number, binding.project_id
                     """
                 )
@@ -749,6 +1016,231 @@ class PluginStorage:
                 )
             ]
         return projects, maps
+
+    def project_reachability(self, project_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT project_id, source, state, last_success_at, reason, updated_at
+                FROM project_reachability
+                WHERE project_id = ?
+                ORDER BY source
+                """,
+                (project_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_project_reachability(
+        self,
+        *,
+        project_id: str,
+        source: str,
+        state: str,
+        reason: str | None,
+        changed_at: str,
+    ) -> None:
+        """Commit one project/source authority state and observable event."""
+        if state not in {"healthy", "stale", "reconciling"}:
+            raise ValueError(f"Unsupported reachability state: {state}")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT state, last_success_at FROM project_reachability
+                WHERE project_id = ? AND source = ?
+                """,
+                (project_id, source),
+            ).fetchone()
+            if row is None:
+                projection = connection.execute(
+                    """
+                    SELECT synchronized_at FROM project_projections
+                    WHERE project_id = ?
+                    """,
+                    (project_id,),
+                ).fetchone()
+                last_success_at = (
+                    str(projection["synchronized_at"])
+                    if projection is not None
+                    else changed_at
+                )
+            else:
+                last_success_at = str(row["last_success_at"])
+            if state == "healthy":
+                last_success_at = changed_at
+                reason = None
+            connection.execute(
+                """
+                INSERT INTO project_reachability(
+                    project_id, source, state, last_success_at, reason, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source) DO UPDATE SET
+                    state = excluded.state,
+                    last_success_at = excluded.last_success_at,
+                    reason = excluded.reason,
+                    updated_at = excluded.updated_at
+                """,
+                (project_id, source, state, last_success_at, reason, changed_at),
+            )
+            payload = {
+                "source": source,
+                "state": state,
+                "previous_state": str(row["state"]) if row is not None else None,
+                "last_success_at": last_success_at,
+                "reason": reason,
+                "updated_at": changed_at,
+            }
+            append_board_event(
+                connection,
+                event_id=content_event_id(
+                    "reachability.updated", f"{project_id}:{source}", payload
+                ),
+                resource_key=f"reachability.updated:{project_id}:{source}",
+                project_id=project_id,
+                map_id=None,
+                event_type="reachability.updated",
+                payload=payload,
+                committed_at=changed_at,
+            )
+
+    def apply_project_reconcile(
+        self,
+        *,
+        project: dict[str, Any],
+        cards: list[dict[str, Any]],
+        decisions: dict[str, list[dict[str, Any]]],
+        reports: dict[str, list[dict[str, Any]]],
+        approvals: dict[str, list[dict[str, Any]]],
+        synchronized_at: str,
+    ) -> None:
+        """Atomically publish one complete authoritative project reconcile."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE ceo_projects
+                SET project_url = ?, owner_login = ?, owner_type = ?, project_number = ?
+                WHERE project_id = ?
+                """,
+                (
+                    project["url"],
+                    project["owner"],
+                    project["owner_type"],
+                    project["number"],
+                    project["id"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO project_projections(project_id, title, synchronized_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    title = excluded.title,
+                    synchronized_at = excluded.synchronized_at
+                """,
+                (project["id"], project["title"], synchronized_at),
+            )
+            for card in cards:
+                connection.execute(
+                    """
+                    INSERT INTO map_projections(
+                        map_id, project_id, repository, issue_number, issue_url,
+                        title, stage, ceo_session_state, synchronized_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(map_id) DO UPDATE SET
+                        project_id = excluded.project_id,
+                        repository = excluded.repository,
+                        issue_number = excluded.issue_number,
+                        issue_url = excluded.issue_url,
+                        title = excluded.title,
+                        stage = excluded.stage,
+                        ceo_session_state = excluded.ceo_session_state,
+                        synchronized_at = excluded.synchronized_at
+                    """,
+                    (
+                        card["id"],
+                        card["project_id"],
+                        card["repository"],
+                        card["issue_number"],
+                        card["issue_url"],
+                        card["title"],
+                        card["stage"],
+                        card["ceo_session_state"],
+                        card["synchronized_at"],
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM decision_projections WHERE map_id = ?",
+                    (card["id"],),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO decision_projections(
+                        map_id, decision_id, decision_type, rationale, authority,
+                        affected_stage, decided_at, tracker_record_id,
+                        tracker_record_url, confirmed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        self._decision_projection_values(card["id"], decision)
+                        for decision in decisions.get(card["id"], [])
+                    ],
+                )
+                connection.execute(
+                    "DELETE FROM pm_report_projections WHERE map_id = ?",
+                    (card["id"],),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO pm_report_projections(
+                        map_id, record_id, report_type, summary, reported_at,
+                        evidence_json, blocking, continuation_requirement,
+                        failure_code, tracker_record_id, tracker_record_url,
+                        confirmed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        self._pm_report_projection_values(card["id"], report)
+                        for report in reports.get(card["id"], [])
+                    ],
+                )
+                self._replace_approval_projections_in_transaction(
+                    connection,
+                    map_id=card["id"],
+                    approvals=approvals.get(card["id"], []),
+                )
+            connection.execute(
+                """
+                INSERT INTO project_reachability(
+                    project_id, source, state, last_success_at, reason, updated_at
+                ) VALUES (?, 'tracker', 'healthy', ?, NULL, ?)
+                ON CONFLICT(project_id, source) DO UPDATE SET
+                    state = 'healthy', last_success_at = excluded.last_success_at,
+                    reason = NULL, updated_at = excluded.updated_at
+                """,
+                (project["id"], synchronized_at, synchronized_at),
+            )
+            payload = {
+                "project": project,
+                "cards": cards,
+                "decisions": decisions,
+                "pm_reports": reports,
+                "approvals": {
+                    map_id: [approval["public"] for approval in map_approvals]
+                    for map_id, map_approvals in approvals.items()
+                },
+                "last_success_at": synchronized_at,
+            }
+            append_board_event(
+                connection,
+                event_id=content_event_id(
+                    "reconcile.completed", project["id"], payload
+                ),
+                resource_key=f"reconcile.completed:{project['id']}",
+                project_id=project["id"],
+                map_id=None,
+                event_type="reconcile.completed",
+                payload=payload,
+                committed_at=synchronized_at,
+            )
 
     def save_authorization_denial(
         self,
@@ -795,6 +1287,176 @@ class PluginStorage:
             ).fetchall()
         return [self._approval_row(dict(row)) for row in rows]
 
+    def replace_approval_projections(
+        self,
+        *,
+        map_id: str,
+        approvals: list[dict[str, Any]],
+        reconciled_at: str,
+    ) -> None:
+        """Rebuild one Map's approval ledger from authoritative Issue history."""
+        with self._connect() as connection:
+            self._replace_approval_projections_in_transaction(
+                connection,
+                map_id=map_id,
+                approvals=approvals,
+            )
+            for approval in approvals:
+                self._append_map_resource_event(
+                    connection,
+                    map_id=map_id,
+                    event_type="approval.upserted",
+                    identity=str(approval["request_id"]),
+                    payload={"approval": approval["public"]},
+                    committed_at=reconciled_at,
+                )
+
+    def _replace_approval_projections_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        map_id: str,
+        approvals: list[dict[str, Any]],
+    ) -> None:
+        requested_ids = {str(approval["request_id"]) for approval in approvals}
+        if len(requested_ids) != len(approvals):
+            raise ValueError("Authoritative approval history has duplicate requests")
+        local_ids = {
+            str(row["request_id"])
+            for row in connection.execute(
+                "SELECT request_id FROM approval_ledger WHERE map_id = ?",
+                (map_id,),
+            ).fetchall()
+        }
+        missing = local_ids - requested_ids
+        if missing:
+            raise ValueError(
+                "Authoritative approval history is missing local enforcement records: "
+                + ", ".join(sorted(missing))
+            )
+        for approval in approvals:
+            if approval["map_id"] != map_id:
+                raise ValueError("Authoritative approval belongs to another Map")
+            request_id = str(approval["request_id"])
+            local_events = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT event_id, request_id, event_type, occurred_at,
+                           actor_id, actor_profile, note, expires_at, payload_hash,
+                           tracker_record_id, tracker_record_url
+                    FROM approval_ledger_events
+                    WHERE request_id = ? AND event_type IN ('expired', 'consumed')
+                    ORDER BY event_sequence
+                    """,
+                    (request_id,),
+                ).fetchall()
+            ]
+            connection.execute(
+                """
+                INSERT INTO approval_ledger(
+                    request_id, map_id, decision_class, proposed_action,
+                    alternatives_json, rationale, cost_risk, evidence_json,
+                    requested_scope_json, decision_payload_json, payload_hash,
+                    packet_hash, status, requested_by_profile,
+                    requested_by_session, requested_at, tracker_request_id,
+                    tracker_request_url, decided_by, decided_by_profile,
+                    decision_note, decided_at, expires_at, tracker_decision_id,
+                    tracker_decision_url, consumed_by_mutation_id, consumed_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(request_id) DO UPDATE SET
+                    map_id = excluded.map_id,
+                    decision_class = excluded.decision_class,
+                    proposed_action = excluded.proposed_action,
+                    alternatives_json = excluded.alternatives_json,
+                    rationale = excluded.rationale,
+                    cost_risk = excluded.cost_risk,
+                    evidence_json = excluded.evidence_json,
+                    requested_scope_json = excluded.requested_scope_json,
+                    decision_payload_json = excluded.decision_payload_json,
+                    payload_hash = excluded.payload_hash,
+                    packet_hash = excluded.packet_hash,
+                    status = excluded.status,
+                    requested_by_profile = excluded.requested_by_profile,
+                    requested_by_session = excluded.requested_by_session,
+                    requested_at = excluded.requested_at,
+                    tracker_request_id = excluded.tracker_request_id,
+                    tracker_request_url = excluded.tracker_request_url,
+                    decided_by = excluded.decided_by,
+                    decided_by_profile = excluded.decided_by_profile,
+                    decision_note = excluded.decision_note,
+                    decided_at = excluded.decided_at,
+                    expires_at = excluded.expires_at,
+                    tracker_decision_id = excluded.tracker_decision_id,
+                    tracker_decision_url = excluded.tracker_decision_url,
+                    consumed_by_mutation_id = excluded.consumed_by_mutation_id,
+                    consumed_at = excluded.consumed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    request_id,
+                    map_id,
+                    approval["decision_class"],
+                    approval["proposed_action"],
+                    normalized_json(approval["alternatives"]),
+                    approval["rationale"],
+                    approval["cost_risk"],
+                    normalized_json(approval["evidence"]),
+                    normalized_json(approval["requested_scope"]),
+                    normalized_json(approval["decision_payload"]),
+                    approval["payload_hash"],
+                    approval["packet_hash"],
+                    approval["status"],
+                    approval["requested_by_profile"],
+                    approval["requested_by_session"],
+                    approval["requested_at"],
+                    approval["tracker_request_id"],
+                    approval["tracker_request_url"],
+                    approval["decided_by"],
+                    approval["decided_by_profile"],
+                    approval["decision_note"],
+                    approval["decided_at"],
+                    approval["expires_at"],
+                    approval["tracker_decision_id"],
+                    approval["tracker_decision_url"],
+                    approval["consumed_by_mutation_id"],
+                    approval["consumed_at"],
+                    approval["updated_at"],
+                ),
+            )
+            connection.execute(
+                "DELETE FROM approval_ledger_events WHERE request_id = ?",
+                (request_id,),
+            )
+            all_events = [*approval["events"], *local_events]
+            connection.executemany(
+                """
+                INSERT INTO approval_ledger_events(
+                    event_id, request_id, event_type, occurred_at, actor_id,
+                    actor_profile, note, expires_at, payload_hash,
+                    tracker_record_id, tracker_record_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        event["event_id"],
+                        request_id,
+                        event["event_type"],
+                        event["occurred_at"],
+                        event.get("actor_id"),
+                        event.get("actor_profile"),
+                        event.get("note"),
+                        event.get("expires_at"),
+                        event["payload_hash"],
+                        event.get("tracker_record_id"),
+                        event.get("tracker_record_url"),
+                    )
+                    for event in all_events
+                ],
+            )
+
     def save_approval_request(
         self,
         *,
@@ -840,6 +1502,21 @@ class PluginStorage:
                     tracker_record_url,
                     requested_at,
                 ),
+            )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="approval.upserted",
+                identity=packet["request_id"],
+                payload={
+                    "approval": {
+                        **packet,
+                        "status": "pending",
+                        "requested_at": requested_at,
+                        "expires_at": None,
+                    }
+                },
+                committed_at=requested_at,
             )
             connection.execute(
                 """
@@ -921,6 +1598,31 @@ class PluginStorage:
                     request_id,
                 ),
             )
+            approval = connection.execute(
+                "SELECT map_id, request_id, status, expires_at FROM approval_ledger WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if approval is not None:
+                self._append_map_resource_event(
+                    connection,
+                    map_id=str(approval["map_id"]),
+                    event_type="approval.upserted",
+                    identity=request_id,
+                    payload={
+                        "approval": {
+                            "request_id": request_id,
+                            "status": decision,
+                            "expires_at": expires_at,
+                            "decision": {
+                                "actor_id": actor_id,
+                                "actor_profile": actor_profile,
+                                "note": note,
+                                "decided_at": decided_at,
+                            },
+                        }
+                    },
+                    committed_at=decided_at,
+                )
 
     def revoke_approval(
         self,
@@ -977,6 +1679,31 @@ class PluginStorage:
                     request_id,
                 ),
             )
+            approval = connection.execute(
+                "SELECT map_id FROM approval_ledger WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if approval is not None:
+                self._append_map_resource_event(
+                    connection,
+                    map_id=str(approval["map_id"]),
+                    event_type="approval.upserted",
+                    identity=request_id,
+                    payload={
+                        "approval": {
+                            "request_id": request_id,
+                            "status": "revoked",
+                            "expires_at": None,
+                            "decision": {
+                                "actor_id": actor_id,
+                                "actor_profile": actor_profile,
+                                "note": note,
+                                "decided_at": revoked_at,
+                            },
+                        }
+                    },
+                    committed_at=revoked_at,
+                )
 
     def expire_approval(self, *, request_id: str, expired_at: str) -> bool:
         with self._connect() as connection:
@@ -999,6 +1726,25 @@ class PluginStorage:
                     """,
                     (f"approval:{request_id}:expired", expired_at, request_id),
                 )
+                approval = connection.execute(
+                    "SELECT map_id FROM approval_ledger WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                if approval is not None:
+                    self._append_map_resource_event(
+                        connection,
+                        map_id=str(approval["map_id"]),
+                        event_type="approval.upserted",
+                        identity=request_id,
+                        payload={
+                            "approval": {
+                                "request_id": request_id,
+                                "status": "expired",
+                                "expires_at": expired_at,
+                            }
+                        },
+                        committed_at=expired_at,
+                    )
         return cursor.rowcount == 1
 
     def approval_history(self, *, request_id: str) -> list[dict[str, Any]]:
@@ -1132,6 +1878,23 @@ class PluginStorage:
                 reserved_at,
             ),
         )
+        self._append_map_resource_event(
+            connection,
+            map_id=map_id,
+            event_type="approval.upserted",
+            identity=request_id,
+            payload={
+                "approval": {
+                    "request_id": request_id,
+                    "status": "consumed",
+                    "consumption": {
+                        "mutation_id": mutation_id,
+                        "consumed_at": reserved_at,
+                    },
+                }
+            },
+            committed_at=reserved_at,
+        )
         connection.execute(
             """
             INSERT INTO approval_ledger_events(
@@ -1208,6 +1971,14 @@ class PluginStorage:
                 """,
                 self._decision_projection_values(map_id, decision),
             )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="decision.upserted",
+                identity=f"{map_id}:{decision['decision_id']}",
+                payload={"decision": decision},
+                committed_at=decision["confirmed_at"],
+            )
 
     def replace_decision_projections(
         self,
@@ -1234,6 +2005,15 @@ class PluginStorage:
                     for decision in decisions
                 ],
             )
+            for decision in decisions:
+                self._append_map_resource_event(
+                    connection,
+                    map_id=map_id,
+                    event_type="decision.upserted",
+                    identity=f"{map_id}:{decision['decision_id']}",
+                    payload={"decision": decision},
+                    committed_at=decision["confirmed_at"],
+                )
 
     @staticmethod
     def _decision_projection_values(
@@ -1317,6 +2097,52 @@ class PluginStorage:
         with self._connect() as connection:
             return [dict(row) for row in connection.execute(query, parameters)]
 
+    @staticmethod
+    def _pm_assignment_event(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "state": row["state"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _append_map_resource_event(
+        connection: sqlite3.Connection,
+        *,
+        map_id: str,
+        event_type: str,
+        identity: str,
+        payload: dict[str, Any],
+        committed_at: str,
+        occurrence_id: str | None = None,
+    ) -> None:
+        binding = connection.execute(
+            "SELECT project_id FROM map_bindings WHERE map_id = ?", (map_id,)
+        ).fetchone()
+        if binding is None:
+            raise ValueError(f"Map is not bound: {map_id}")
+        append_board_event(
+            connection,
+            event_id=content_event_id(
+                event_type,
+                (
+                    identity
+                    if occurrence_id is None
+                    else (
+                        identity
+                        + ":occurrence:"
+                        + hashlib.sha256(occurrence_id.encode()).hexdigest()[:24]
+                    )
+                ),
+                payload,
+            ),
+            resource_key=f"{event_type}:{identity}",
+            project_id=str(binding["project_id"]),
+            map_id=map_id,
+            event_type=event_type,
+            payload=payload,
+            committed_at=committed_at,
+        )
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1388,6 +2214,29 @@ class PluginStorage:
                 title TEXT NOT NULL,
                 synchronized_at TEXT NOT NULL
             )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS project_reachability (
+                project_id TEXT NOT NULL REFERENCES ceo_projects(project_id),
+                source TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('healthy', 'stale', 'reconciling')),
+                last_success_at TEXT NOT NULL,
+                reason TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(project_id, source)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO project_reachability(
+                project_id, source, state, last_success_at, reason, updated_at
+            )
+            SELECT project_id, 'tracker', 'healthy', synchronized_at, NULL,
+                   synchronized_at
+            FROM project_projections
             """
         )
         connection.execute(
@@ -1619,6 +2468,100 @@ class PluginStorage:
                 requested_at TEXT NOT NULL,
                 prior_terminal_reason TEXT NOT NULL,
                 prior_attempt_count INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS board_event_identities (
+                event_id TEXT PRIMARY KEY,
+                resource_key TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                map_id TEXT,
+                event_type TEXT NOT NULL,
+                payload_hash TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS board_events (
+                cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                resource_key TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                map_id TEXT,
+                event_type TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                committed_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS board_event_resource_heads (
+                resource_key TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS board_events_project_cursor
+            ON board_events(project_id, cursor)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS board_events_resource_cursor
+            ON board_events(resource_key, cursor)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS board_event_meta (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                retained_after_cursor INTEGER NOT NULL DEFAULT 0,
+                latest_cursor INTEGER NOT NULL DEFAULT 0,
+                max_events INTEGER NOT NULL DEFAULT 10000,
+                retention_seconds INTEGER NOT NULL DEFAULT 86400
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO board_event_meta(
+                singleton, retained_after_cursor, latest_cursor,
+                max_events, retention_seconds
+            ) VALUES (1, 0, 0, 10000, 86400)
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO board_event_identities(
+                event_id, resource_key, project_id, map_id, event_type,
+                payload_hash
+            )
+            SELECT event_id, resource_key, project_id, map_id, event_type,
+                   payload_hash
+            FROM board_events
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO board_event_resource_heads(
+                resource_key, event_id, payload_hash, payload_json
+            )
+            SELECT event.resource_key, event.event_id, event.payload_hash,
+                   event.payload_json
+            FROM board_events AS event
+            WHERE event.cursor = (
+                SELECT MAX(latest.cursor)
+                FROM board_events AS latest
+                WHERE latest.resource_key = event.resource_key
             )
             """
         )

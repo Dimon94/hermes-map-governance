@@ -10,6 +10,15 @@ import pytest
 hermes_agent_root = os.environ.get("HERMES_AGENT_ROOT")
 if hermes_agent_root:
     resolved_root = Path(hermes_agent_root).expanduser().resolve()
+    runtime_packages = next(
+        iter(sorted((resolved_root / "venv" / "lib").glob("python*/site-packages"))),
+        None,
+    )
+    if runtime_packages is not None and str(runtime_packages) not in sys.path:
+        # REST/WebSocket contracts must use Hermes' own mutually compatible
+        # FastAPI/Starlette/httpx runtime, never whichever user-site versions
+        # happen to be importable by the outer pytest executable.
+        sys.path.insert(0, str(runtime_packages))
     if str(resolved_root) not in sys.path:
         sys.path.insert(0, str(resolved_root))
 

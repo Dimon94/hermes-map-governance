@@ -302,6 +302,11 @@ def test_unique_exact_session_is_adopted_before_mint(tmp_path):
         "state": "ready",
         "last_activity_at": "2026-08-23T08:01:00Z",
     }
+    assert any(
+        event["type"] == "session.updated"
+        and event["payload"]["ceo_session"] == projected
+        for event in application.board_events(cursor=0, limit=100)["events"]
+    )
 
 
 class SimulatedSessionProcessCrash(BaseException):

@@ -4,7 +4,7 @@ import json
 from types import SimpleNamespace
 
 import map_governance.pm_tool as pm_tool
-from map_governance import GovernanceRequestIdentity
+from map_governance import GovernanceRequestIdentity, StaleProjectionError
 
 
 def test_pm_skill_and_named_toolset_are_separate_and_hide_authority_coordinates(
@@ -165,3 +165,46 @@ def test_pm_report_handler_injects_request_identity_and_cannot_select_a_map(
         )
         is None
     )
+
+
+def test_pm_tool_returns_structured_stale_interlock(monkeypatch):
+    class ApplicationProbe:
+        def report_pm(self, **_arguments):
+            raise StaleProjectionError(
+                project_id="PVT_acme_7",
+                source="tracker",
+                last_success_at="2026-08-23T07:30:00Z",
+                reason="Tracker authority is unreachable",
+            )
+
+    monkeypatch.setattr(
+        pm_tool,
+        "application_for_profile",
+        lambda _profile: ApplicationProbe(),
+    )
+    tools = []
+    context = SimpleNamespace(
+        profile_name="pm",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: tools.append(kwargs),
+        register_hook=lambda *args: None,
+    )
+    pm_tool.register_pm_capabilities(context)
+
+    result = json.loads(
+        tools[0]["handler"](
+            {
+                "action": "report",
+                "report": {
+                    "record_id": "pm-stale",
+                    "type": "checkpoint",
+                    "summary": "Wait for authority.",
+                    "timestamp": "2026-08-23T10:20:00Z",
+                },
+            },
+            session_id="pm-session-atlas",
+        )
+    )
+
+    assert result["error"]["type"] == "stale_projection"
+    assert "authoritative reconcile" in result["error"]["recovery"]

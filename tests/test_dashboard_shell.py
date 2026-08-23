@@ -49,6 +49,38 @@ def test_maps_dashboard_groups_complete_cards_by_project():
     assert result.stdout == "dashboard board ready\n"
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "live-update",
+        "disconnect",
+        "reconnect",
+        "cursor-expiry",
+        "slow-consumer",
+        "independent-stale",
+    ],
+)
+def test_maps_dashboard_reduces_live_stream_without_full_reload(mode, hermes_host_root):
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail("Node.js is required to exercise the dashboard plugin bundle")
+    result = subprocess.run(
+        [
+            node,
+            str(PLUGIN_ROOT / "tests" / "dashboard_live_probe.mjs"),
+            str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
+            mode,
+            str(hermes_host_root),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == f"dashboard {mode} ready\n"
+
+
 def test_ready_map_opens_the_canonical_session_through_the_desktop_sdk():
     node = shutil.which("node")
     if node is None:

@@ -13,6 +13,7 @@ from threading import Event, Thread
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from .approvals import normalized_hash, normalized_json
+from .events import append_board_event, content_event_id
 from .storage import PluginStorage
 
 
@@ -172,6 +173,8 @@ class OutboxDispatcher:
         clock: Callable[[], str | datetime],
         settings: OutboxSettings | None = None,
         completion: Callable[[OutboxIntent, EffectConfirmation], None] | None = None,
+        interlock: Callable[[OutboxIntent], None] | None = None,
+        failure: Callable[[OutboxIntent, Exception], None] | None = None,
         crash_injector: Callable[[str, OutboxIntent], None] | None = None,
     ) -> None:
         self._repository = repository
@@ -179,6 +182,8 @@ class OutboxDispatcher:
         self._clock = clock
         self._settings = settings or OutboxSettings()
         self._completion = completion or (lambda _intent, _confirmation: None)
+        self._interlock = interlock or (lambda _intent: None)
+        self._failure = failure or (lambda _intent, _error: None)
         self._crash_injector = crash_injector
 
     def dispatch_next(
@@ -248,6 +253,7 @@ class OutboxDispatcher:
         heartbeat.start()
         try:
             try:
+                self._interlock(intent)
                 adapter = self._adapters[intent.effect_type]
             except KeyError as error:
                 raise EffectTerminalError(
@@ -299,6 +305,7 @@ class OutboxDispatcher:
         failed_at = self._now()
         error_type = type(error).__name__
         error_message = str(error) or error_type
+        self._failure(claim.intent, error)
         retryable = getattr(error, "retryable", True) is not False
         if retryable and claim.attempt_in_cycle < self._settings.max_attempts:
             delay = min(
@@ -676,6 +683,7 @@ class OutboxRepository:
         ).fetchone()
         if row is None:  # pragma: no cover - SQLite contract guard
             raise RuntimeError("Outbox intent disappeared after commit")
+        self._emit_update(connection, row)
         return EnqueuedIntent(intent=self._intent(row), created=True)
 
     def intent(self, effect_id: str) -> OutboxIntent | None:
@@ -723,7 +731,7 @@ class OutboxRepository:
         """Make a scheduled retry due after an explicit synchronous user retry."""
         timestamp = self._format_timestamp(self._timestamp(now, name="now"))
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE outbox_intents
                 SET next_attempt_at = ?, updated_at = ?
@@ -731,6 +739,13 @@ class OutboxRepository:
                 """,
                 (timestamp, timestamp, effect_id),
             )
+            if cursor.rowcount:
+                row = connection.execute(
+                    "SELECT * FROM outbox_intents WHERE effect_id = ?",
+                    (effect_id,),
+                ).fetchone()
+                if row is not None:
+                    self._emit_update(connection, row)
             connection.commit()
 
     def claim_next(
@@ -910,6 +925,8 @@ class OutboxRepository:
                 "SELECT * FROM outbox_intents WHERE effect_id = ?",
                 (claimed_effect_id,),
             ).fetchone()
+            if claimed_row is not None:
+                self._emit_update(connection, claimed_row)
             connection.commit()
         if claimed_row is None:  # pragma: no cover - SQLite contract guard
             raise RuntimeError("Claimed Outbox intent disappeared")
@@ -974,6 +991,8 @@ class OutboxRepository:
                 "SELECT * FROM outbox_intents WHERE effect_id = ?",
                 (effect_id,),
             ).fetchone()
+            if succeeded is not None:
+                self._emit_update(connection, succeeded)
             connection.commit()
         if succeeded is None:  # pragma: no cover
             raise RuntimeError("Acknowledged Outbox intent disappeared")
@@ -1037,6 +1056,8 @@ class OutboxRepository:
                 "SELECT * FROM outbox_intents WHERE effect_id = ?",
                 (effect_id,),
             ).fetchone()
+            if renewed is not None:
+                self._emit_update(connection, renewed)
             connection.commit()
         if renewed is None:  # pragma: no cover
             raise RuntimeError("Renewed Outbox intent disappeared")
@@ -1094,6 +1115,8 @@ class OutboxRepository:
                 "SELECT * FROM outbox_intents WHERE effect_id = ?",
                 (effect_id,),
             ).fetchone()
+            if released is not None:
+                self._emit_update(connection, released)
             connection.commit()
         if released is None:  # pragma: no cover
             raise RuntimeError("Released Outbox intent disappeared")
@@ -1214,6 +1237,8 @@ class OutboxRepository:
                 "SELECT * FROM outbox_intents WHERE effect_id = ?",
                 (effect_id,),
             ).fetchone()
+            if failed is not None:
+                self._emit_update(connection, failed)
             connection.commit()
         if failed is None:  # pragma: no cover
             raise RuntimeError("Failed Outbox intent disappeared")
@@ -1320,6 +1345,8 @@ class OutboxRepository:
                 "SELECT * FROM outbox_intents WHERE effect_id = ?",
                 (effect_id,),
             ).fetchone()
+            if repaired is not None:
+                self._emit_update(connection, repaired)
             connection.commit()
         if repaired is None:  # pragma: no cover
             raise RuntimeError("Repaired Outbox intent disappeared")
@@ -1470,6 +1497,87 @@ class OutboxRepository:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _emit_update(connection: sqlite3.Connection, row: sqlite3.Row) -> None:
+        """Append one absolute Outbox resource version in the same commit."""
+        map_id = str(row["map_id"])
+        binding = connection.execute(
+            "SELECT project_id FROM map_bindings WHERE map_id = ?", (map_id,)
+        ).fetchone()
+        project_id = str(binding["project_id"]) if binding is not None else "unbound"
+        effect = {
+            "effect_id": str(row["effect_id"]),
+            "effect_type": str(row["effect_type"]),
+            "map_id": map_id,
+            "state": str(row["state"]),
+            "attempt_count": int(row["attempt_count"]),
+            "next_attempt_at": row["next_attempt_at"],
+            "acknowledged_at": row["acknowledged_at"],
+            "last_error_type": row["last_error_type"],
+            "last_error_message": row["last_error_message"],
+            "terminal_reason": row["terminal_reason"],
+            "updated_at": str(row["updated_at"]),
+        }
+        counts = {
+            str(item["state"]): int(item["count"])
+            for item in connection.execute(
+                """
+                SELECT state, COUNT(*) AS count
+                FROM outbox_intents WHERE map_id = ? GROUP BY state
+                """,
+                (map_id,),
+            ).fetchall()
+        }
+        terminal = connection.execute(
+            """
+            SELECT effect_id, effect_type, terminal_reason, updated_at
+            FROM outbox_intents
+            WHERE map_id = ? AND state = 'terminal'
+            ORDER BY updated_at DESC, effect_id DESC LIMIT 1
+            """,
+            (map_id,),
+        ).fetchone()
+        summary_state = (
+            "needs_repair"
+            if counts.get("terminal", 0)
+            else "retrying"
+            if counts.get("retry_scheduled", 0)
+            else "in_progress"
+            if counts.get("pending", 0) or counts.get("leased", 0)
+            else "healthy"
+        )
+        summary = {
+            "state": summary_state,
+            "pending_count": counts.get("pending", 0),
+            "retry_scheduled_count": counts.get("retry_scheduled", 0),
+            "leased_count": counts.get("leased", 0),
+            "succeeded_count": counts.get("succeeded", 0),
+            "terminal_count": counts.get("terminal", 0),
+            "latest_terminal": (
+                {
+                    "effect_id": str(terminal["effect_id"]),
+                    "effect_type": str(terminal["effect_type"]),
+                    "terminal_outcome": {
+                        "message": str(terminal["terminal_reason"]),
+                    },
+                    "updated_at": str(terminal["updated_at"]),
+                }
+                if terminal is not None
+                else None
+            ),
+        }
+        payload = {"effect": effect, "summary": summary}
+        append_board_event(
+            connection,
+            event_id=content_event_id("outbox.updated", str(row["effect_id"]), payload),
+            resource_key=f"outbox.updated:{row['effect_id']}",
+            project_id=project_id,
+            map_id=map_id,
+            event_type="outbox.updated",
+            payload=payload,
+            committed_at=str(row["updated_at"]),
+        )
 
     @staticmethod
     def _intent(row: sqlite3.Row) -> OutboxIntent:

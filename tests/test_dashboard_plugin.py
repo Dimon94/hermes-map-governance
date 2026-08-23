@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,11 @@ from types import SimpleNamespace
 import httpx
 from fastapi import FastAPI
 
-from map_governance import CEOSessionRepairRequired, MapTransitionError
+from map_governance import (
+    CEOSessionRepairRequired,
+    MapTransitionError,
+    StaleProjectionError,
+)
 from map_governance.tracker import TrackerError
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +74,72 @@ def test_rest_health_and_board_delegate_with_explicit_profile(
     assert board_response.json() == {"operation": "board"}
     assert unscoped_response.status_code == 422
     assert requested_profiles == ["ceo", "ceo"]
+
+
+def test_event_stream_contract_uses_hermes_isolated_dependencies(hermes_host_root):
+    runtime = hermes_host_root / "venv" / "bin" / "python"
+    assert runtime.is_file(), "Hermes isolated Python runtime is required"
+    for mode in ("catch-up", "expired", "reconnect", "slow"):
+        result = subprocess.run(
+            [
+                str(runtime),
+                str(PLUGIN_ROOT / "tests" / "dashboard_stream_probe.py"),
+                str(PLUGIN_ROOT),
+                mode,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout == f"dashboard stream {mode} ready\n"
+
+
+def test_event_stream_disconnects_a_blocked_consumer_without_holding_a_writer(
+    monkeypatch,
+):
+    adapter = _load_dashboard_adapter()
+
+    class ApplicationProbe:
+        board_stream_settings = SimpleNamespace(
+            batch_size=1,
+            poll_seconds=0.01,
+            send_timeout_seconds=0.001,
+        )
+
+        def board_events(self, *, cursor, limit):
+            return {
+                "status": "open",
+                "events": [],
+                "cursor": cursor,
+                "latest_cursor": cursor,
+                "has_more": False,
+            }
+
+    class BlockedWebSocket:
+        query_params = {"profile": "ceo", "cursor": "0"}
+
+        def __init__(self):
+            self.close_code = None
+
+        async def accept(self):
+            return None
+
+        async def send_json(self, _payload):
+            await asyncio.Event().wait()
+
+        async def close(self, *, code):
+            self.close_code = code
+
+    monkeypatch.setattr(adapter, "_ws_upgrade_authorized", lambda _ws: True)
+    monkeypatch.setattr(
+        adapter, "application_for_profile", lambda _profile: ApplicationProbe()
+    )
+    socket = BlockedWebSocket()
+
+    asyncio.run(adapter.stream_events(socket))
+
+    assert socket.close_code == 1013
 
 
 def test_profile_scoped_applications_use_isolated_storage(
@@ -305,6 +376,13 @@ def test_rest_transition_preserves_policy_and_tracker_failure_details(
                     requested_stage=requested_stage,
                     reason="acceptance can only be entered from delivery",
                 )
+            if requested_stage == "parked":
+                raise StaleProjectionError(
+                    project_id="PVT_acme_7",
+                    source="tracker",
+                    last_success_at="2026-08-23T07:30:00Z",
+                    reason="Tracker authority is unreachable",
+                )
             raise TrackerError("GitHub write failed; verify issue-write permission")
 
     monkeypatch.setattr(
@@ -334,9 +412,17 @@ def test_rest_transition_preserves_policy_and_tracker_failure_details(
                     "requested_stage": "delivery",
                 },
             )
-        return invalid, failed
+            stale = await client.post(
+                "/api/plugins/map-governance/transitions?profile=ceo",
+                json={
+                    "map_id": "I_atlas_41",
+                    "expected_stage": "authorized",
+                    "requested_stage": "parked",
+                },
+            )
+        return invalid, failed, stale
 
-    invalid, failed = asyncio.run(exercise_routes())
+    invalid, failed, stale = asyncio.run(exercise_routes())
 
     assert invalid.status_code == 409
     assert invalid.json()["detail"] == {
@@ -350,6 +436,18 @@ def test_rest_transition_preserves_policy_and_tracker_failure_details(
     assert failed.json()["detail"] == (
         "GitHub write failed; verify issue-write permission"
     )
+    assert stale.status_code == 503
+    assert stale.json()["detail"] == {
+        "type": "stale_projection",
+        "project_id": "PVT_acme_7",
+        "source": "tracker",
+        "last_success_at": "2026-08-23T07:30:00Z",
+        "reason": "Tracker authority is unreachable",
+        "recovery": (
+            "Reconnect tracker authority and complete authoritative reconcile."
+        ),
+        "retryable": True,
+    }
 
 
 def test_rest_session_open_preserves_repair_required_detail(

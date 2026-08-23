@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from .application import MapGovernanceApplication
 from .approvals import AuthorityEnvelopePolicy
 from .outbox import OutboxSettings
+from .events import BoardEventSettings
 from .sessions import HermesSessionAdapter, HermesSessionDatabaseBackend
 
 
@@ -30,6 +31,7 @@ def application_for_storage(
     authority_settings: Mapping[str, Any] | None = None,
     outbox_settings: Mapping[str, Any] | None = None,
     recover_pending: bool = True,
+    event_settings: Mapping[str, Any] | None = None,
 ) -> MapGovernanceApplication:
     """Build the application for an explicitly selected storage directory."""
     session_runner = (
@@ -44,6 +46,7 @@ def application_for_storage(
         profile_name=profile_name,
         authority_policy=AuthorityEnvelopePolicy.from_settings(authority_settings),
         outbox_settings=OutboxSettings(**dict(outbox_settings or {})),
+        event_settings=BoardEventSettings(**dict(event_settings or {})),
     )
     if recover_pending:
         application.recover_outbox()
@@ -85,6 +88,7 @@ def application_for_profile(profile: str) -> MapGovernanceApplication:
             settings.get("authority") if isinstance(settings, dict) else None
         )
         outbox_settings = settings.get("outbox") if isinstance(settings, dict) else None
+        event_settings = settings.get("events") if isinstance(settings, dict) else None
     finally:
         reset_hermes_home_override(token)
 
@@ -102,6 +106,9 @@ def application_for_profile(profile: str) -> MapGovernanceApplication:
             ),
             outbox_settings=(
                 outbox_settings if isinstance(outbox_settings, dict) else None
+            ),
+            event_settings=(
+                event_settings if isinstance(event_settings, dict) else None
             ),
         )
         application.start_outbox_runtime()

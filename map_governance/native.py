@@ -12,6 +12,7 @@ from .application import (
     CEOSessionRepairRequired,
     MapBindingError,
     MapTransitionError,
+    StaleProjectionError,
 )
 from .ceo_tool import register_ceo_capabilities
 from .pm_tool import register_pm_capabilities
@@ -88,20 +89,22 @@ def register(ctx) -> None:
     get_config = getattr(ctx, "get_config", lambda _key, default=None: default)
     authority_settings = get_config("authority", {})
     outbox_settings = get_config("outbox", {})
+    event_settings = get_config("events", {})
     application = (
         application_for_storage(
             ctx.state.data_dir,
             authority_settings=authority_settings,
             outbox_settings=outbox_settings,
+            event_settings=event_settings,
         )
-        if authority_settings or outbox_settings
+        if authority_settings or outbox_settings or event_settings
         else application_for_storage(ctx.state.data_dir)
     )
     start_outbox_runtime = getattr(application, "start_outbox_runtime", None)
     if callable(start_outbox_runtime):
         start_outbox_runtime()
 
-    def handle_maps_command(args: Namespace) -> int:
+    def _handle_maps_command(args: Namespace) -> int:
         if args.maps_command == "health":
             print(json.dumps(application.health(), sort_keys=True))
             return 0
@@ -226,6 +229,16 @@ def register(ctx) -> None:
             print(json.dumps(report, sort_keys=True))
             return 0
         return 2
+
+    def handle_maps_command(args: Namespace) -> int:
+        try:
+            return _handle_maps_command(args)
+        except StaleProjectionError as error:
+            print(
+                json.dumps({"error": error.as_dict()}, sort_keys=True),
+                file=sys.stderr,
+            )
+            return 1
 
     ctx.register_cli_command(
         name="maps",

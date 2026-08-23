@@ -11,6 +11,7 @@ from .application import (
     GovernanceRequestIdentity,
     MapBindingError,
     PMReportConflict,
+    StaleProjectionError,
     TrackerPMReportConfirmationError,
 )
 from .reports import PMReportDraft
@@ -104,7 +105,11 @@ def register_pm_capabilities(ctx) -> None:
             else:
                 raise ValueError("action must be inspect or report")
             return json.dumps(result, ensure_ascii=False, sort_keys=True)
-        except (GovernanceAuthorizationError, PMReportConflict) as error:
+        except (
+            GovernanceAuthorizationError,
+            PMReportConflict,
+            StaleProjectionError,
+        ) as error:
             return json.dumps({"error": error.as_dict()}, sort_keys=True)
         except TrackerPMReportConfirmationError as error:
             return json.dumps(
