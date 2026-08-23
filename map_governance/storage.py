@@ -16,7 +16,7 @@ from .events import append_board_event, content_event_id
 
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 15
 
 
 class PluginStorage:
@@ -704,6 +704,277 @@ class PluginStorage:
             )
         return False
 
+    def save_pm_decision_acknowledgment(
+        self,
+        *,
+        map_id: str,
+        correlation_id: str,
+        turn_id: str,
+        outcome: str,
+        tracker_record_id: str,
+        tracker_record_url: str,
+        acknowledged_at: str,
+    ) -> bool:
+        """Persist the PM transport acknowledgment for one authoritative answer."""
+        values = (
+            map_id,
+            correlation_id,
+            turn_id,
+            outcome,
+            tracker_record_id,
+            tracker_record_url,
+            acknowledged_at,
+        )
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM pm_decision_acknowledgments
+                WHERE map_id = ? AND correlation_id = ?
+                """,
+                (map_id, correlation_id),
+            ).fetchone()
+            if existing is not None:
+                stable = (
+                    existing["map_id"],
+                    existing["correlation_id"],
+                    existing["turn_id"],
+                    existing["outcome"],
+                    existing["tracker_record_id"],
+                    existing["tracker_record_url"],
+                    existing["acknowledged_at"],
+                )
+                if stable != values:
+                    raise ValueError(
+                        "PM decision correlation has a different acknowledgment"
+                    )
+                return True
+            connection.execute(
+                """
+                INSERT INTO pm_decision_acknowledgments(
+                    map_id, correlation_id, turn_id, outcome, tracker_record_id,
+                    tracker_record_url, acknowledged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            acknowledgment = {
+                "correlation_id": correlation_id,
+                "outcome": outcome,
+                "turn_id": turn_id,
+                "tracker": {
+                    "id": tracker_record_id,
+                    "url": tracker_record_url,
+                },
+                "acknowledged_at": acknowledged_at,
+            }
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="decision-ack.updated",
+                identity=f"{map_id}:{correlation_id}",
+                payload={"acknowledgment": acknowledgment},
+                committed_at=acknowledged_at,
+            )
+        return False
+
+    def pm_decision_acknowledgments(self, *, map_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM pm_decision_acknowledgments
+                WHERE map_id = ?
+                ORDER BY julianday(acknowledged_at), correlation_id
+                """,
+                (map_id,),
+            ).fetchall()
+        return [
+            {
+                "correlation_id": row["correlation_id"],
+                "outcome": row["outcome"],
+                "turn_id": row["turn_id"],
+                "tracker": {
+                    "id": row["tracker_record_id"],
+                    "url": row["tracker_record_url"],
+                },
+                "acknowledged_at": row["acknowledged_at"],
+            }
+            for row in rows
+        ]
+
+    def pm_resume_receipt(self, *, map_id: str, turn_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pm_resume_receipts
+                WHERE map_id = ? AND turn_id = ?
+                """,
+                (map_id, turn_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def prepare_pm_resume_receipt(
+        self,
+        *,
+        map_id: str,
+        turn_id: str,
+        profile_name: str,
+        session_id: str,
+        coordinator_id: str,
+        content_hash: str,
+        turn_marker: str,
+        prepared_at: str,
+    ) -> bool:
+        values = (
+            map_id,
+            turn_id,
+            profile_name,
+            session_id,
+            coordinator_id,
+            content_hash,
+            turn_marker,
+        )
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM pm_resume_receipts
+                WHERE map_id = ? AND turn_id = ?
+                """,
+                (map_id, turn_id),
+            ).fetchone()
+            if existing is not None:
+                stable = tuple(
+                    existing[name]
+                    for name in (
+                        "map_id",
+                        "turn_id",
+                        "profile_name",
+                        "session_id",
+                        "coordinator_id",
+                        "content_hash",
+                        "turn_marker",
+                    )
+                )
+                if stable != values:
+                    raise ValueError("PM resume turn has a different receipt")
+                if existing["retry_allowed"]:
+                    connection.execute(
+                        """
+                        UPDATE pm_resume_receipts
+                        SET delivery_rejected = 0, retry_allowed = 0,
+                            prepared_at = ?, prompted_at = ?
+                        WHERE map_id = ? AND turn_id = ?
+                          AND state = 'dispatching' AND retry_allowed = 1
+                        """,
+                        (prepared_at, prepared_at, map_id, turn_id),
+                    )
+                return True
+            connection.execute(
+                """
+                INSERT INTO pm_resume_receipts(
+                    map_id, turn_id, profile_name, session_id, coordinator_id,
+                    content_hash, turn_marker, state, prepared_at, prompted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)
+                """,
+                (*values, prepared_at, prepared_at),
+            )
+        return False
+
+    def mark_pm_resume_delivery_rejected(
+        self,
+        *,
+        map_id: str,
+        turn_id: str,
+        content_hash: str,
+    ) -> None:
+        """Record an explicit pre-acceptance command rejection for readback."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT state, content_hash FROM pm_resume_receipts
+                WHERE map_id = ? AND turn_id = ?
+                """,
+                (map_id, turn_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "dispatching"
+                or row["content_hash"] != content_hash
+            ):
+                raise ValueError("PM resume rejection has no matching dispatch")
+            connection.execute(
+                """
+                UPDATE pm_resume_receipts
+                SET delivery_rejected = 1, retry_allowed = 0
+                WHERE map_id = ? AND turn_id = ? AND state = 'dispatching'
+                """,
+                (map_id, turn_id),
+            )
+
+    def allow_pm_resume_retry(
+        self,
+        *,
+        map_id: str,
+        turn_id: str,
+        content_hash: str,
+    ) -> None:
+        """Re-arm only a rejected dispatch whose marker is authoritatively absent."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT state, content_hash, delivery_rejected
+                FROM pm_resume_receipts
+                WHERE map_id = ? AND turn_id = ?
+                """,
+                (map_id, turn_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "dispatching"
+                or row["content_hash"] != content_hash
+                or not row["delivery_rejected"]
+            ):
+                raise ValueError("PM resume dispatch is not safe to retry")
+            connection.execute(
+                """
+                UPDATE pm_resume_receipts
+                SET retry_allowed = 1
+                WHERE map_id = ? AND turn_id = ? AND state = 'dispatching'
+                """,
+                (map_id, turn_id),
+            )
+
+    def confirm_pm_resume_receipt(
+        self,
+        *,
+        map_id: str,
+        turn_id: str,
+        content_hash: str,
+        prompted_at: str,
+    ) -> bool:
+        """Confirm a prepared exact prompt after apply or owned-agent readback."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pm_resume_receipts
+                WHERE map_id = ? AND turn_id = ?
+                """,
+                (map_id, turn_id),
+            ).fetchone()
+            if row is None or row["content_hash"] != content_hash:
+                raise ValueError("PM resume receipt was not prepared for this content")
+            if row["state"] == "prompted":
+                return True
+            connection.execute(
+                """
+                UPDATE pm_resume_receipts
+                SET state = 'prompted', prompted_at = ?,
+                    delivery_rejected = 0, retry_allowed = 0
+                WHERE map_id = ? AND turn_id = ? AND state = 'dispatching'
+                """,
+                (prompted_at, map_id, turn_id),
+            )
+        return False
+
     def save_pm_report_projection(
         self,
         *,
@@ -716,9 +987,9 @@ class PluginStorage:
                 INSERT INTO pm_report_projections(
                     map_id, record_id, report_type, summary, reported_at,
                     evidence_json, blocking, continuation_requirement,
-                    failure_code, tracker_record_id, tracker_record_url,
-                    confirmed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    failure_code, correlation_id, decision_class, scope_json,
+                    options_json, tracker_record_id, tracker_record_url, confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(map_id, record_id) DO UPDATE SET
                     report_type = excluded.report_type,
                     summary = excluded.summary,
@@ -727,6 +998,10 @@ class PluginStorage:
                     blocking = excluded.blocking,
                     continuation_requirement = excluded.continuation_requirement,
                     failure_code = excluded.failure_code,
+                    correlation_id = excluded.correlation_id,
+                    decision_class = excluded.decision_class,
+                    scope_json = excluded.scope_json,
+                    options_json = excluded.options_json,
                     tracker_record_id = excluded.tracker_record_id,
                     tracker_record_url = excluded.tracker_record_url,
                     confirmed_at = excluded.confirmed_at
@@ -759,9 +1034,9 @@ class PluginStorage:
                 INSERT INTO pm_report_projections(
                     map_id, record_id, report_type, summary, reported_at,
                     evidence_json, blocking, continuation_requirement,
-                    failure_code, tracker_record_id, tracker_record_url,
-                    confirmed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    failure_code, correlation_id, decision_class, scope_json,
+                    options_json, tracker_record_id, tracker_record_url, confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     self._pm_report_projection_values(map_id, report)
@@ -793,6 +1068,18 @@ class PluginStorage:
             (int(report["blocking"]) if report.get("blocking") is not None else None),
             report.get("continuation_requirement"),
             report.get("failure_code"),
+            report.get("correlation_id"),
+            report.get("decision_class"),
+            (
+                json.dumps(report["scope"], ensure_ascii=False, sort_keys=True)
+                if report.get("scope") is not None
+                else None
+            ),
+            (
+                json.dumps(report.get("options", []), ensure_ascii=False)
+                if report.get("correlation_id") is not None
+                else None
+            ),
             report["tracker"]["id"],
             report["tracker"]["url"],
             report["confirmed_at"],
@@ -835,6 +1122,11 @@ class PluginStorage:
                 report["continuation_requirement"] = row["continuation_requirement"]
             if row["failure_code"] is not None:
                 report["failure_code"] = row["failure_code"]
+            if row["correlation_id"] is not None:
+                report["correlation_id"] = row["correlation_id"]
+                report["decision_class"] = row["decision_class"]
+                report["scope"] = json.loads(row["scope_json"])
+                report["options"] = json.loads(row["options_json"])
             reports.append(report)
         return reports
 
@@ -1488,9 +1780,10 @@ class PluginStorage:
                     INSERT INTO pm_report_projections(
                         map_id, record_id, report_type, summary, reported_at,
                         evidence_json, blocking, continuation_requirement,
-                        failure_code, tracker_record_id, tracker_record_url,
+                        failure_code, correlation_id, decision_class, scope_json,
+                        options_json, tracker_record_id, tracker_record_url,
                         confirmed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         self._pm_report_projection_values(card["id"], report)
@@ -2705,6 +2998,74 @@ class PluginStorage:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS pm_decision_acknowledgments (
+                map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
+                correlation_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('continue', 'blocked')),
+                tracker_record_id TEXT NOT NULL,
+                tracker_record_url TEXT NOT NULL,
+                acknowledged_at TEXT NOT NULL,
+                PRIMARY KEY(map_id, correlation_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pm_resume_receipts (
+                map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
+                turn_id TEXT NOT NULL,
+                profile_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                coordinator_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                turn_marker TEXT NOT NULL,
+                delivery_rejected INTEGER NOT NULL DEFAULT 0
+                    CHECK(delivery_rejected IN (0, 1)),
+                retry_allowed INTEGER NOT NULL DEFAULT 0
+                    CHECK(retry_allowed IN (0, 1)),
+                state TEXT NOT NULL CHECK(state IN ('dispatching', 'prompted')),
+                prepared_at TEXT NOT NULL,
+                prompted_at TEXT NOT NULL,
+                PRIMARY KEY(map_id, turn_id)
+            )
+            """
+        )
+        pm_resume_columns = {
+            str(column[1])
+            for column in connection.execute(
+                "PRAGMA table_info(pm_resume_receipts)"
+            ).fetchall()
+        }
+        if "state" not in pm_resume_columns:
+            connection.execute(
+                "ALTER TABLE pm_resume_receipts "
+                "ADD COLUMN state TEXT NOT NULL DEFAULT 'prompted'"
+            )
+        if "prepared_at" not in pm_resume_columns:
+            connection.execute(
+                "ALTER TABLE pm_resume_receipts ADD COLUMN prepared_at TEXT"
+            )
+            connection.execute(
+                "UPDATE pm_resume_receipts SET prepared_at = prompted_at "
+                "WHERE prepared_at IS NULL"
+            )
+        if "turn_marker" not in pm_resume_columns:
+            connection.execute(
+                "ALTER TABLE pm_resume_receipts ADD COLUMN turn_marker TEXT"
+            )
+        if "delivery_rejected" not in pm_resume_columns:
+            connection.execute(
+                "ALTER TABLE pm_resume_receipts "
+                "ADD COLUMN delivery_rejected INTEGER NOT NULL DEFAULT 0"
+            )
+        if "retry_allowed" not in pm_resume_columns:
+            connection.execute(
+                "ALTER TABLE pm_resume_receipts "
+                "ADD COLUMN retry_allowed INTEGER NOT NULL DEFAULT 0"
+            )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS pm_report_projections (
                 map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
                 record_id TEXT NOT NULL,
@@ -2715,6 +3076,10 @@ class PluginStorage:
                 blocking INTEGER,
                 continuation_requirement TEXT,
                 failure_code TEXT,
+                correlation_id TEXT,
+                decision_class TEXT,
+                scope_json TEXT,
+                options_json TEXT,
                 tracker_record_id TEXT NOT NULL,
                 tracker_record_url TEXT NOT NULL,
                 confirmed_at TEXT NOT NULL,
@@ -2722,6 +3087,22 @@ class PluginStorage:
             )
             """
         )
+        pm_report_columns = {
+            str(column[1])
+            for column in connection.execute(
+                "PRAGMA table_info(pm_report_projections)"
+            ).fetchall()
+        }
+        for name, declaration in (
+            ("correlation_id", "TEXT"),
+            ("decision_class", "TEXT"),
+            ("scope_json", "TEXT"),
+            ("options_json", "TEXT"),
+        ):
+            if name not in pm_report_columns:
+                connection.execute(
+                    f"ALTER TABLE pm_report_projections ADD COLUMN {name} {declaration}"
+                )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS coordinator_lifecycle (

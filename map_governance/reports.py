@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from typing import Any
 
 
@@ -38,6 +39,18 @@ def _evidence(value: Any) -> tuple[str, ...]:
     return tuple(_text(item, name="evidence item") for item in value)
 
 
+def _scope(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("PM question scope must be a non-empty object")
+    try:
+        normalized = json.loads(
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("PM question scope must be JSON serializable") from error
+    return normalized
+
+
 @dataclass(frozen=True)
 class PMReportDraft:
     """Model-supplied report content before request identity assigns its Map."""
@@ -50,6 +63,10 @@ class PMReportDraft:
     blocking: bool | None = None
     continuation_requirement: str | None = None
     failure_code: str | None = None
+    correlation_id: str | None = None
+    decision_class: str | None = None
+    scope: dict[str, Any] | None = None
+    options: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -62,8 +79,10 @@ class PMReportDraft:
         object.__setattr__(self, "summary", _text(self.summary, name="summary"))
         object.__setattr__(self, "timestamp", _timestamp(self.timestamp))
         object.__setattr__(self, "evidence", _evidence(self.evidence))
-        if self.report_type != "acceptance" and self.evidence:
-            raise ValueError("Only a PM acceptance report may include evidence")
+        if self.report_type not in {"question", "acceptance"} and self.evidence:
+            raise ValueError(
+                "Only a PM question or acceptance report may include evidence"
+            )
         if self.report_type in {"question", "blocker"}:
             if not isinstance(self.blocking, bool):
                 raise ValueError(
@@ -83,6 +102,34 @@ class PMReportDraft:
             )
         if self.report_type == "acceptance" and not self.evidence:
             raise ValueError("PM acceptance report must include evidence")
+        if self.report_type == "question":
+            object.__setattr__(
+                self,
+                "correlation_id",
+                _text(self.correlation_id, name="correlation_id", maximum=128),
+            )
+            object.__setattr__(
+                self,
+                "decision_class",
+                _text(self.decision_class, name="decision_class", maximum=128),
+            )
+            object.__setattr__(self, "scope", _scope(self.scope))
+            object.__setattr__(self, "options", _evidence(self.options))
+            if not self.evidence:
+                raise ValueError("PM question must include decision evidence")
+            if len(self.options) < 2:
+                raise ValueError("PM question must include at least two options")
+        elif (
+            any(
+                value is not None
+                for value in (self.correlation_id, self.decision_class, self.scope)
+            )
+            or self.options
+        ):
+            raise ValueError(
+                "Only a PM question may declare correlation, decision class, scope, "
+                "or options"
+            )
         if self.report_type == "failure":
             object.__setattr__(
                 self,
@@ -110,6 +157,11 @@ class PMReportDraft:
             payload["continuation_requirement"] = self.continuation_requirement
         if self.failure_code is not None:
             payload["failure_code"] = self.failure_code
+        if self.correlation_id is not None:
+            payload["correlation_id"] = self.correlation_id
+            payload["decision_class"] = self.decision_class
+            payload["scope"] = self.scope
+            payload["options"] = list(self.options)
         return payload
 
 
@@ -150,3 +202,45 @@ class TrackerPMReportRecord:
     report: PMReport
     tracker_record_id: str
     tracker_record_url: str
+
+
+@dataclass(frozen=True)
+class PMDecisionResponse:
+    """One CEO recommendation bound to a tracker-confirmed PM question."""
+
+    correlation_id: str
+    recommendation: str
+    rationale: str
+    cost_risk: str
+    decision_payload: dict[str, Any]
+    outcome: str
+    timestamp: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "correlation_id",
+            _text(self.correlation_id, name="correlation_id", maximum=128),
+        )
+        object.__setattr__(
+            self,
+            "recommendation",
+            _text(self.recommendation, name="recommendation", maximum=128),
+        )
+        object.__setattr__(self, "rationale", _text(self.rationale, name="rationale"))
+        object.__setattr__(self, "cost_risk", _text(self.cost_risk, name="cost_risk"))
+        object.__setattr__(self, "decision_payload", _scope(self.decision_payload))
+        if self.outcome not in {"continue", "blocked"}:
+            raise ValueError("PM decision response outcome must be continue or blocked")
+        object.__setattr__(self, "timestamp", _timestamp(self.timestamp))
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "correlation_id": self.correlation_id,
+            "recommendation": self.recommendation,
+            "rationale": self.rationale,
+            "cost_risk": self.cost_risk,
+            "decision_payload": self.decision_payload,
+            "outcome": self.outcome,
+            "timestamp": self.timestamp,
+        }

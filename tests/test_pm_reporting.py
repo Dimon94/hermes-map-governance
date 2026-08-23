@@ -16,6 +16,7 @@ from map_governance import (
     TrackerPMReportConfirmationError,
 )
 from map_governance.reports import PMReport, PMReportDraft, TrackerPMReportRecord
+from map_governance.sessions import CanonicalSession
 from map_governance.tracker import TrackerError, TrackerIssue, TrackerProject
 
 
@@ -114,6 +115,7 @@ class ControllableCoordinatorResume:
     def __init__(self) -> None:
         self.markers = {}
         self.calls = []
+        self.contents = []
         self.before_resume = None
 
     def readback(self, *, map_id: str, turn_id: str):
@@ -127,10 +129,12 @@ class ControllableCoordinatorResume:
         session_id: str,
         coordinator_id: str,
         turn_id: str,
+        content: str = "",
     ) -> None:
         if self.before_resume is not None:
             self.before_resume(map_id, turn_id)
         self.calls.append((map_id, turn_id))
+        self.contents.append(content)
         self.markers[(map_id, turn_id)] = {
             "map_id": map_id,
             "turn_id": turn_id,
@@ -146,6 +150,52 @@ class SimulatedCoordinatorProcessCrash(BaseException):
 
 class SimulatedPMReportProcessCrash(BaseException):
     pass
+
+
+class QuestionSessionRunner:
+    def __init__(self) -> None:
+        self.session = CanonicalSession(
+            root_session_id="ceo-root-atlas",
+            live_session_id="ceo-root-atlas",
+            title="Atlas CEO",
+            last_activity_at="2026-08-23T09:00:00Z",
+        )
+        self.markers: set[str] = set()
+        self.resume_calls: list[dict] = []
+        self.before_resume = None
+
+    def find_exact(self, *, title):
+        return [self.session] if self.session.title == title else []
+
+    def initialize(self, session, *, bootstrap, idempotency_key):
+        return session
+
+    def mint(self, **kwargs):
+        self.session = replace(self.session, title=kwargs["title"])
+        return self.session
+
+    def resolve(self, *, root_session_id):
+        return self.session if root_session_id == self.session.root_session_id else None
+
+    def load_skill(self, session, *, content, idempotency_key):
+        return session
+
+    def has_resume_marker(self, *, root_session_id, idempotency_key):
+        return idempotency_key in self.markers
+
+    def resume_once(self, *, root_session_id, content, idempotency_key):
+        if self.before_resume is not None:
+            self.before_resume(content)
+        if idempotency_key not in self.markers:
+            self.resume_calls.append(
+                {
+                    "root_session_id": root_session_id,
+                    "content": content,
+                    "idempotency_key": idempotency_key,
+                }
+            )
+            self.markers.add(idempotency_key)
+        return self.session
 
 
 def _application(tmp_path, tracker: PMTracker) -> MapGovernanceApplication:
@@ -241,6 +291,89 @@ def test_pm_report_intent_is_durable_before_tracker_append(tmp_path):
     assert status["state"] == "succeeded"
 
 
+def test_question_commits_complete_contract_before_one_canonical_ceo_turn(tmp_path):
+    tracker = PMTracker()
+    sessions = QuestionSessionRunner()
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data" / "map-governance",
+        tracker=tracker,
+        session_runner=sessions,
+        profile_name="ceo",
+        clock=lambda: datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc),
+    )
+    project = application.configure_project(project_url=PROJECT_URL)
+    application.bind_map(project_id=project["id"], issue_url=ISSUE_URL)
+    application.open_map(map_id=MAP_ID)
+    sessions.resume_calls.clear()
+    application.assign_pm(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="turn-question-001",
+    )
+    observed = []
+    sessions.before_resume = lambda content: observed.append(
+        {
+            "tracker_reports": len(tracker.reports),
+            "stage": next(
+                label.removeprefix("map-stage/")
+                for label in tracker.issue.labels
+                if label.startswith("map-stage/")
+            ),
+            "pm_state": application.pm_state(request_identity=PM_IDENTITY)[
+                "assignment"
+            ]["coordinator"]["state"],
+            "content": content,
+        }
+    )
+    question = PMReportDraft(
+        record_id="question-report-001",
+        report_type="question",
+        summary="Choose the supported compatibility behavior.",
+        timestamp="2026-08-23T10:00:00Z",
+        blocking=True,
+        continuation_requirement="Select one compatibility option.",
+        correlation_id="decision-correlation-001",
+        decision_class="product",
+        scope={"map_id": MAP_ID, "area": "compatibility"},
+        evidence=("Legacy clients still send the alias.",),
+        options=("Keep the alias", "Remove the alias"),
+    )
+
+    first = application.report_pm(request_identity=PM_IDENTITY, report=question)
+    repeated = application.report_pm(request_identity=PM_IDENTITY, report=question)
+
+    assert first["report"]["correlation_id"] == "decision-correlation-001"
+    assert repeated["idempotent"] is True
+    assert tracker.report_writes == 1
+    assert len(sessions.resume_calls) == 1
+    assert observed == [
+        {
+            "tracker_reports": 1,
+            "stage": "decision",
+            "pm_state": "idle",
+            "content": sessions.resume_calls[0]["content"],
+        }
+    ]
+    assert "decision-correlation-001" in sessions.resume_calls[0]["content"]
+    assert "Keep the alias" in sessions.resume_calls[0]["content"]
+    detail = application.map_detail(map_id=MAP_ID)
+    assert detail["pm_reports"][0]["scope"] == {
+        "map_id": MAP_ID,
+        "area": "compatibility",
+    }
+    assert detail["pm_reports"][0]["options"] == [
+        "Keep the alias",
+        "Remove the alias",
+    ]
+
+
 @pytest.mark.parametrize(
     "report",
     (
@@ -251,6 +384,11 @@ def test_pm_report_intent_is_durable_before_tracker_append(tmp_path):
             timestamp="2026-08-23T10:00:00Z",
             blocking=False,
             continuation_requirement="A yes/no answer about legacy aliases.",
+            correlation_id="question-correlation-1",
+            decision_class="product",
+            scope={"map_id": MAP_ID, "area": "compatibility"},
+            evidence=("Legacy clients still send aliases.",),
+            options=("Keep aliases", "Remove aliases"),
         ),
         PMReportDraft(
             record_id="blocker-1",
@@ -342,6 +480,11 @@ def test_controllable_coordinator_runs_every_report_type_without_lane_leakage(
             timestamp="2026-08-23T10:02:00Z",
             blocking=False,
             continuation_requirement="A yes/no answer about legacy aliases.",
+            correlation_id="question-scenario-correlation",
+            decision_class="product",
+            scope={"map_id": MAP_ID, "area": "compatibility"},
+            evidence=("Legacy clients still send aliases.",),
+            options=("Keep aliases", "Remove aliases"),
         ),
         PMReportDraft(
             record_id="blocker-scenario",
@@ -476,6 +619,10 @@ def test_coordinator_resume_restarts_from_marker_without_duplicate_call(tmp_path
 
     assert observed == ["leased"]
     assert coordinator.calls == [(MAP_ID, "turn-durable-resume")]
+    assert coordinator.contents == [
+        "Resume the assigned PM turn. Re-read authoritative Map state before "
+        "continuing."
+    ]
     assert recovered["coordinator"]["state"] == "active"
     status = restarted.outbox_status(effect_id=effect_id)
     assert status["state"] == "succeeded"
@@ -679,6 +826,17 @@ def test_question_and_blocker_impact_controls_stage_without_overstating_the_map(
             timestamp="2026-08-23T10:06:00Z",
             blocking=blocking,
             continuation_requirement="A specific answer or evidence item.",
+            **(
+                {
+                    "correlation_id": f"impact-correlation-{blocking}",
+                    "decision_class": "product",
+                    "scope": {"map_id": MAP_ID, "area": "compatibility"},
+                    "evidence": ("The compatibility contract is ambiguous.",),
+                    "options": ("Keep compatibility", "Remove compatibility"),
+                }
+                if report_type == "question"
+                else {}
+            ),
         ),
     )
 
@@ -697,6 +855,11 @@ def test_retry_reconciles_a_confirmed_report_after_stage_write_failure(tmp_path)
         timestamp="2026-08-23T10:07:00Z",
         blocking=True,
         continuation_requirement="Choose the supported compatibility behavior.",
+        correlation_id="blocking-question-stage-retry-correlation",
+        decision_class="product",
+        scope={"map_id": MAP_ID, "area": "compatibility"},
+        evidence=("The compatibility contract is ambiguous.",),
+        options=("Keep compatibility", "Remove compatibility"),
     )
     tracker.fail_transitions = True
 

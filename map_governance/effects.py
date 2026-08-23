@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Mapping, Protocol
 
 from .approvals import (
@@ -66,6 +67,7 @@ class CoordinatorResumeBoundary(Protocol):
         session_id: str,
         coordinator_id: str,
         turn_id: str,
+        content: str = "",
     ) -> None: ...
 
 
@@ -112,6 +114,15 @@ class CoordinatorResumeEffectAdapter(EffectAdapter):
             map_id=intent.map_id,
             turn_id=str(payload["turn_id"]),
         )
+        if acknowledgment and acknowledgment.get("content_hash") is not None:
+            expected = (
+                "sha256:"
+                + hashlib.sha256(str(payload.get("content") or "").encode()).hexdigest()
+            )
+            if acknowledgment.get("content_hash") != expected:
+                raise EffectTerminalError(
+                    "Coordinator resume marker belongs to different content"
+                )
         return EffectConfirmation(acknowledgment) if acknowledgment else None
 
     def apply(self, intent: OutboxIntent) -> None:
@@ -122,6 +133,7 @@ class CoordinatorResumeEffectAdapter(EffectAdapter):
             session_id=str(payload["session_id"]),
             coordinator_id=str(payload["coordinator_id"]),
             turn_id=str(payload["turn_id"]),
+            content=str(payload.get("content") or ""),
         )
 
 

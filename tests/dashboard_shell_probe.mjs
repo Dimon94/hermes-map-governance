@@ -144,6 +144,20 @@ function fetchJSON(path, options) {
           timestamp: "2026-08-23T10:02:00Z",
           blocking: false,
           continuation_requirement: "A yes/no answer about legacy aliases.",
+          correlation_id: "compatibility-choice-001",
+          decision_class: "product",
+          scope: { map_id: "I_atlas_41", area: "compatibility" },
+          evidence: ["Two supported clients still send aliases."],
+          options: ["Keep aliases", "Remove aliases"],
+        },
+      ] : [],
+      decision_acknowledgments: mode === "pm-report" ? [
+        {
+          correlation_id: "compatibility-choice-001",
+          outcome: "continue",
+          turn_id: "decision:compatibility-choice-001:continue",
+          tracker: { id: "IC_decision_1", url: "https://github.com/acme/atlas/issues/41#issuecomment-1" },
+          acknowledged_at: "2026-08-23T10:04:00Z",
         },
       ] : [],
     });
@@ -464,6 +478,14 @@ if (mode !== "empty") {
     assert.match(detailText, /failure-dashboard-001/);
     assert.match(detailText, /question-dashboard-001/);
     assert.match(detailText, /A yes\/no answer about legacy aliases/);
+    assert.match(detailText, /compatibility-choice-001/);
+    assert.match(detailText, /"area":"compatibility"/);
+    assert.match(detailText, /Keep aliases/);
+    assert.match(detailText, /Remove aliases/);
+    assert.match(detailText, /Two supported clients still send aliases/);
+    assert.match(detailText, /PM decision acknowledgments/);
+    assert.match(detailText, /compatibility-choice-001 · continue/);
+    assert.match(detailText, /Committed record: IC_decision_1/);
     assert.doesNotMatch(detailText, /worker lane|worktree|pane log|implementation ticket/i);
   }
   if (mode === "outbox-terminal") {

@@ -910,9 +910,20 @@ class GitHubTrackerAdapter:
             lines.append(f"- Blocking: {'yes' if content.blocking else 'no'}")
         if content.continuation_requirement is not None:
             lines.append(f"- Needed to continue: {content.continuation_requirement}")
+        if content.correlation_id is not None:
+            lines.extend(
+                (
+                    f"- Correlation: {content.correlation_id}",
+                    f"- Decision class: {content.decision_class}",
+                    "- Scope: `" + normalized_json(content.scope) + "`",
+                )
+            )
         if content.failure_code is not None:
             lines.append(f"- Failure code: {content.failure_code}")
         lines.extend(("", content.summary))
+        if content.options:
+            lines.extend(("", "### Options"))
+            lines.extend(f"- {item}" for item in content.options)
         if content.evidence:
             lines.extend(("", "### Executive evidence"))
             lines.extend(f"- {item}" for item in content.evidence)

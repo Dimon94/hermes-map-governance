@@ -481,6 +481,11 @@ def test_github_pm_report_is_human_readable_and_round_trips_its_machine_marker()
             continuation_requirement=(
                 "An explicit yes/no answer about legacy aliases."
             ),
+            correlation_id="pm-question-correlation-001",
+            decision_class="product",
+            scope={"map_id": "I_atlas_41", "area": "compatibility"},
+            evidence=("Legacy clients still send aliases.",),
+            options=("Keep aliases", "Remove aliases"),
         ),
     )
     runner = ScriptedRunner()

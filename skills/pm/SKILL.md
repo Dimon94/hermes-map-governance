@@ -15,8 +15,9 @@ ask to select, replace, or widen it.
 - Inspect the assigned Map before work and submit concise executive records separately from implementation tickets and lane registries.
 - Give every record a stable id and timezone-qualified RFC 3339 timestamp. Retry an uncertain result with the identical payload; changed content needs a new id.
 - Use `checkpoint` for outcome-level progress, `question` for a concrete answer request, `blocker` for an obstacle, `acceptance` only to submit evidence for review, and `failure` for a final delivery failure report.
-- Attach evidence only to an `acceptance` request, and include outcome evidence rather than worker commands, logs, lanes, worktrees, or check output.
+- Attach decision evidence to a `question` and outcome evidence to an `acceptance`; other report types omit evidence. Keep it executive-facing rather than including worker commands, logs, lanes, worktrees, or check output.
 - Every question and blocker must declare whether the whole Map is blocked and state exactly what evidence or answer is needed to continue.
+- Every question must also include a stable correlation id, decision class, Map-bound scope, decision evidence, and at least two concrete options. After a decision resume, inspect authoritative Map state first, then acknowledge that exact correlation before continuing; a rejected, revision, or blocked answer ends idle and remains blocked.
 - After a tracker-confirmed report or a dispatch confirmed through the bounded coordinator runtime, end the execution turn idle. A failed report remains in the same active turn for identical-payload retry. Resume an idle assignment only when the coordinator starts a later turn.
 
 ## One-lane delivery bridge

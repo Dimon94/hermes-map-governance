@@ -32,11 +32,18 @@ PM_SKILL = Path(__file__).resolve().parents[1] / "skills" / "pm" / "SKILL.md"
 
 PM_TOOL_SCHEMA = {
     "name": PM_TOOL_NAME,
-    "description": "Inspect the assigned initiative or submit one executive report.",
+    "description": (
+        "Inspect the assigned initiative, submit one executive report, or acknowledge "
+        "a committed decision correlation."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["inspect", "report"]},
+            "action": {
+                "type": "string",
+                "enum": ["inspect", "report", "acknowledge_decision"],
+            },
+            "correlation_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "report": {
                 "type": "object",
                 "properties": {
@@ -66,6 +73,22 @@ PM_TOOL_SCHEMA = {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 128,
+                    },
+                    "correlation_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                    },
+                    "decision_class": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                    },
+                    "scope": {"type": "object"},
+                    "options": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": {"type": "string", "minLength": 1},
                     },
                 },
                 "required": ["record_id", "type", "summary", "timestamp"],
@@ -278,8 +301,20 @@ def register_pm_capabilities(ctx) -> None:
                     request_identity=identity,
                     report=PMReportDraft(**draft),
                 )
+            elif action == "acknowledge_decision":
+                correlation_id = arguments.get("correlation_id")
+                if not isinstance(correlation_id, str):
+                    raise ValueError(
+                        "correlation_id is required for acknowledge_decision"
+                    )
+                result = application.acknowledge_pm_decision(
+                    request_identity=identity,
+                    correlation_id=correlation_id,
+                )
             else:
-                raise ValueError("action must be inspect or report")
+                raise ValueError(
+                    "action must be inspect, report, or acknowledge_decision"
+                )
             return json.dumps(result, ensure_ascii=False, sort_keys=True)
         except (
             GovernanceAuthorizationError,

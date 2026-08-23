@@ -55,6 +55,7 @@ def test_pm_skill_and_named_toolset_are_separate_and_hide_authority_coordinates(
     assert registered["schema"]["parameters"]["properties"]["action"]["enum"] == [
         "inspect",
         "report",
+        "acknowledge_decision",
     ]
     schema_text = json.dumps(registered["schema"], sort_keys=True).lower()
     for forbidden in (
@@ -90,6 +91,50 @@ def test_pm_skill_and_named_toolset_are_separate_and_hide_authority_coordinates(
         },
     ]
     assert hooks[0][0] == "pre_tool_call"
+
+
+def test_pm_tool_acknowledges_only_a_correlation_from_request_scope(monkeypatch):
+    calls = []
+
+    class ApplicationProbe:
+        def acknowledge_pm_decision(self, **arguments):
+            calls.append(arguments)
+            return {"continuation": "continue"}
+
+        def enforce_assigned_pm_toolset(self, **_arguments):
+            return True
+
+    monkeypatch.setattr(
+        pm_tool,
+        "application_for_pm_request",
+        lambda _profile, **_identity: ApplicationProbe(),
+    )
+    tools = []
+    context = SimpleNamespace(
+        profile_name="pm",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: tools.append(kwargs),
+        register_hook=lambda *args: None,
+    )
+    pm_tool.register_pm_capabilities(context)
+
+    result = json.loads(
+        tools[0]["handler"](
+            {
+                "action": "acknowledge_decision",
+                "correlation_id": "compatibility-choice-001",
+            },
+            session_id="pm-session-atlas",
+        )
+    )
+
+    assert result == {"continuation": "continue"}
+    assert calls == [
+        {
+            "request_identity": GovernanceRequestIdentity("pm", "pm-session-atlas"),
+            "correlation_id": "compatibility-choice-001",
+        }
+    ]
 
 
 def test_pm_report_handler_injects_request_identity_and_cannot_select_a_map(

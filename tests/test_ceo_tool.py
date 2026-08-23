@@ -51,6 +51,7 @@ def test_ceo_skill_and_named_toolset_register_with_request_scoped_identity(
     assert registered["schema"]["parameters"]["properties"]["action"]["enum"] == [
         "inspect",
         "record_decision",
+        "answer_question",
         "request_approval",
         "commission",
         "resume",
@@ -85,6 +86,54 @@ def test_ceo_skill_and_named_toolset_register_with_request_scoped_identity(
             ),
         },
     ]
+
+
+def test_ceo_tool_delegates_one_policy_routed_question_response(monkeypatch):
+    calls = []
+
+    class ApplicationProbe:
+        def answer_pm_question(self, **arguments):
+            calls.append(arguments)
+            return {"route": "ceo_decision"}
+
+    monkeypatch.setattr(
+        ceo_tool,
+        "application_for_profile",
+        lambda _profile: ApplicationProbe(),
+    )
+    tools = []
+    context = SimpleNamespace(
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: tools.append(kwargs),
+        register_hook=lambda *args: None,
+    )
+    ceo_tool.register_ceo_capabilities(context)
+
+    result = json.loads(
+        tools[0]["handler"](
+            {
+                "action": "answer_question",
+                "map_id": "I_atlas_41",
+                "question_response": {
+                    "correlation_id": "compatibility-choice-001",
+                    "recommendation": "Keep aliases",
+                    "rationale": "Compatibility remains material.",
+                    "cost_risk": "One release of maintenance.",
+                    "decision_payload": {"selected_option": "Keep aliases"},
+                    "outcome": "continue",
+                    "timestamp": "2026-08-23T10:01:00Z",
+                },
+            },
+            session_id="canonical-live-session",
+        )
+    )
+
+    assert result == {"route": "ceo_decision"}
+    assert calls[0]["request_identity"] == GovernanceRequestIdentity(
+        "ceo", "canonical-live-session"
+    )
+    assert calls[0]["response"].correlation_id == "compatibility-choice-001"
 
 
 def test_ceo_tool_exposes_explicit_commission_resume_and_status(monkeypatch):

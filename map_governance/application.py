@@ -64,7 +64,12 @@ from .sessions import (
     canonical_session_identity,
     canonical_session_title,
 )
-from .reports import PMReport, PMReportDraft, TrackerPMReportRecord
+from .reports import (
+    PMDecisionResponse,
+    PMReport,
+    PMReportDraft,
+    TrackerPMReportRecord,
+)
 from .coordinator import (
     DELIVERY_TRANSPORT_RECOVERY_LIMITATION,
     CommissioningAuthorizationError,
@@ -183,6 +188,21 @@ class TrackerApprovalConfirmationError(TrackerError):
 
 class TrackerPMReportConfirmationError(TrackerError):
     """Raised when a PM report is not visible in tracker Issue history."""
+
+
+class DecisionResumePendingError(RuntimeError):
+    """A committed decision is waiting for retry-safe delivery to its PM."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "decision_resume_pending",
+            "reason": self.reason,
+            "retryable": True,
+        }
 
 
 class PMReportConflict(ValueError):
@@ -574,6 +594,9 @@ class MapGovernanceApplication:
                 card["recent_decisions"] = self._storage.recent_decisions(map_id=map_id)
                 card["approvals"] = self._approval_collection(map_id=map_id)
                 card["pm_reports"] = self._storage.recent_pm_reports(map_id=map_id)
+                card["decision_acknowledgments"] = (
+                    self._storage.pm_decision_acknowledgments(map_id=map_id)
+                )
                 card["external_effects"] = self._outbox.map_summary(map_id)
                 return card
         raise MapBindingError(f"Map is not bound: {map_id}")
@@ -864,12 +887,13 @@ class MapGovernanceApplication:
             )
         if ready_record is None:
             try:
-                self.begin_pm_turn(
-                    map_id=map_id,
-                    request_identity=pm_identity,
-                    coordinator_id=coordinator_id,
-                    turn_id=f"commission-ready:{map_id}",
-                )
+                with self._storage.pm_turn_lease(map_id):
+                    self._reserve_pm_turn(
+                        map_id=map_id,
+                        request_identity=pm_identity,
+                        coordinator_id=coordinator_id,
+                        turn_id=f"commission-ready:{map_id}",
+                    )
             except (
                 GovernanceAuthorizationError,
                 RuntimeError,
@@ -932,6 +956,30 @@ class MapGovernanceApplication:
                 confirmed_at=self._synchronized_at(),
             ),
         )
+        try:
+            with self._storage.pm_turn_lease(map_id):
+                self._storage.finish_pm_turn(
+                    map_id=map_id,
+                    turn_id=f"commission-ready:{map_id}",
+                    outcome="report",
+                    outcome_id=ready_draft.record_id,
+                    finished_at=self._synchronized_at(),
+                )
+        except (ValueError, sqlite3.Error):
+            runtime = coordinator_runtime.record_failure(
+                map_id=map_id,
+                reason="pm_ready_turn_completion_conflict",
+                retryable=False,
+                repair_required=True,
+            )
+            return {
+                **self._runtime_projection(runtime),
+                "checkpoint": {
+                    "state": "runtime_verification_failed",
+                    "record_id": ready_draft.record_id,
+                },
+                "idempotent": False,
+            }
         runtime = coordinator_runtime.confirm_ready(
             map_id=map_id,
             record_id=ready_draft.record_id,
@@ -1313,29 +1361,13 @@ class MapGovernanceApplication:
         coordinator_id: str,
         turn_id: str,
     ) -> dict[str, Any]:
-        assignment = self._authorize_pm_coordinator(
+        assignment, normalized_turn_id = self._validate_pm_turn_start(
             map_id=map_id,
-            action="pm:begin_turn",
             request_identity=request_identity,
             coordinator_id=coordinator_id,
+            turn_id=turn_id,
         )
-        if not isinstance(turn_id, str) or not turn_id.strip():
-            raise ValueError("PM turn requires a stable turn identity")
-        normalized_turn_id = turn_id.strip()
-        if (
-            assignment["state"] == "active"
-            and assignment["active_turn_id"] != normalized_turn_id
-        ):
-            raise ValueError("PM assignment already has an active turn")
-        unresolved_turns = {
-            str(intent.payload.get("turn_id", ""))
-            for intent in self._outbox.unfinished_intents(
-                map_id=map_id,
-                effect_type=COORDINATOR_RESUME,
-            )
-        }
-        if unresolved_turns - {normalized_turn_id}:
-            raise ValueError("PM assignment already has an unresolved coordinator turn")
+
         if self._coordinator_resume is not None:
             effect_id = f"coordinator-resume:{map_id}:{normalized_turn_id}"
             try:
@@ -1348,6 +1380,10 @@ class MapGovernanceApplication:
                         "session_id": request_identity.session_id,
                         "coordinator_id": coordinator_id,
                         "turn_id": normalized_turn_id,
+                        "content": (
+                            "Resume the assigned PM turn. Re-read authoritative Map "
+                            "state before continuing."
+                        ),
                     },
                     created_at=self._synchronized_at(),
                 )
@@ -1380,7 +1416,7 @@ class MapGovernanceApplication:
         idempotent = self._storage.begin_pm_turn(
             map_id=map_id,
             coordinator_id=coordinator_id,
-            turn_id=turn_id.strip(),
+            turn_id=normalized_turn_id,
             started_at=self._synchronized_at(),
         )
         assignment = self._storage.pm_assignment(map_id)
@@ -1388,6 +1424,61 @@ class MapGovernanceApplication:
             "coordinator": self._pm_assignment_projection(assignment),
             "idempotent": idempotent,
         }
+
+    def _validate_pm_turn_start(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        coordinator_id: str,
+        turn_id: str,
+    ) -> tuple[dict[str, Any], str]:
+        assignment = self._authorize_pm_coordinator(
+            map_id=map_id,
+            action="pm:begin_turn",
+            request_identity=request_identity,
+            coordinator_id=coordinator_id,
+        )
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("PM turn requires a stable turn identity")
+        normalized_turn_id = turn_id.strip()
+        if (
+            assignment["state"] == "active"
+            and assignment["active_turn_id"] != normalized_turn_id
+        ):
+            raise ValueError("PM assignment already has an active turn")
+        unresolved_turns = {
+            str(intent.payload.get("turn_id", ""))
+            for intent in self._outbox.unfinished_intents(
+                map_id=map_id,
+                effect_type=COORDINATOR_RESUME,
+            )
+        }
+        if unresolved_turns - {normalized_turn_id}:
+            raise ValueError("PM assignment already has an unresolved coordinator turn")
+        return assignment, normalized_turn_id
+
+    def _reserve_pm_turn(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        coordinator_id: str,
+        turn_id: str,
+    ) -> bool:
+        _, normalized_turn_id = self._validate_pm_turn_start(
+            map_id=map_id,
+            request_identity=request_identity,
+            coordinator_id=coordinator_id,
+            turn_id=turn_id,
+        )
+        idempotent = self._storage.begin_pm_turn(
+            map_id=map_id,
+            coordinator_id=coordinator_id,
+            turn_id=normalized_turn_id,
+            started_at=self._synchronized_at(),
+        )
+        return idempotent
 
     def complete_pm_dispatch(
         self,
@@ -2285,6 +2376,12 @@ class MapGovernanceApplication:
         map_id = str(assignment["map_id"])
         self._ensure_map_writable(map_id=map_id)
         bound_report = report.assign_to(map_id)
+        if (
+            report.report_type == "question"
+            and report.scope is not None
+            and report.scope.get("map_id") != map_id
+        ):
+            raise ValueError("PM question scope must match the assigned Map")
         binding = self._storage.map_binding(map_id)
         if binding is None:
             raise MapBindingError(f"Map is not bound: {map_id}")
@@ -2343,6 +2440,23 @@ class MapGovernanceApplication:
                     )
                     if issue.id != map_id:
                         raise MapBindingError("Bound GitHub Issue identity changed")
+                    if bound_report.content.report_type == "question":
+                        authoritative_reports = self._tracker_read(
+                            project_id=str(binding["project_id"]),
+                            operation=lambda: self._tracker.list_pm_reports(
+                                str(binding["issue_url"])
+                            ),
+                        )
+                        if any(
+                            record.report.content.correlation_id
+                            == bound_report.content.correlation_id
+                            and record.report.content.record_id
+                            != bound_report.content.record_id
+                            for record in authoritative_reports
+                        ):
+                            raise PMReportConflict(
+                                record_id=bound_report.content.record_id
+                            )
                     current_stage = self._executive_stage(issue)
                     requested_stage = self._pm_report_requested_stage(
                         current_stage=current_stage,
@@ -2485,7 +2599,486 @@ class MapGovernanceApplication:
             },
             "delivery_summary": detail["delivery_summary"],
             "recent_decisions": detail["recent_decisions"],
+            "decision_acknowledgments": self._storage.pm_decision_acknowledgments(
+                map_id=map_id
+            ),
         }
+
+    def acknowledge_pm_decision(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+        correlation_id: str,
+    ) -> dict[str, Any]:
+        """Re-read one committed answer, acknowledge it, then continue or park."""
+        if not isinstance(correlation_id, str) or not correlation_id.strip():
+            raise ValueError("PM decision acknowledgment requires a correlation id")
+        correlation_id = correlation_id.strip()
+        assignment = self._storage.pm_assignment_for_request(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+        )
+        if assignment is None:
+            self._deny_governance_request(
+                map_id="unassigned",
+                action="pm:acknowledge_decision",
+                request_identity=request_identity,
+                reason="pm_assignment_missing",
+            )
+        map_id = str(assignment["map_id"])
+        existing = next(
+            (
+                item
+                for item in self._storage.pm_decision_acknowledgments(map_id=map_id)
+                if item["correlation_id"] == correlation_id
+            ),
+            None,
+        )
+        binding = self._ensure_map_writable(map_id=map_id)
+        question_record = self._authoritative_pm_question(
+            map_id=map_id,
+            binding=binding,
+            correlation_id=correlation_id,
+        )
+        answer = self._authoritative_pm_answer(
+            map_id=map_id,
+            binding=binding,
+            correlation_id=correlation_id,
+        )
+        if existing is None:
+            if assignment["state"] != "active" or not assignment.get("active_turn_id"):
+                raise ValueError("PM decision acknowledgment requires its resumed turn")
+            matching_resumes = [
+                intent
+                for intent in self._outbox.effect_intents(
+                    map_id=map_id,
+                    effect_type=COORDINATOR_RESUME,
+                )
+                if intent.state == "succeeded"
+                and intent.payload.get("correlation_id") == correlation_id
+                and intent.payload.get("turn_id") == assignment["active_turn_id"]
+            ]
+            if len(matching_resumes) != 1:
+                raise ValueError(
+                    "PM decision correlation does not match the active resumed turn"
+                )
+            turn_id = str(assignment["active_turn_id"])
+            acknowledged_at = self._synchronized_at()
+            idempotent = self._storage.save_pm_decision_acknowledgment(
+                map_id=map_id,
+                correlation_id=correlation_id,
+                turn_id=turn_id,
+                outcome=str(answer["outcome"]),
+                tracker_record_id=str(answer["tracker"]["id"]),
+                tracker_record_url=str(answer["tracker"]["url"]),
+                acknowledged_at=acknowledged_at,
+            )
+        else:
+            if (
+                existing["outcome"] != answer["outcome"]
+                or existing["tracker"] != answer["tracker"]
+            ):
+                raise ValueError(
+                    "Committed PM acknowledgment conflicts with authoritative answer"
+                )
+            turn_id = str(existing["turn_id"])
+            acknowledged_at = str(existing["acknowledged_at"])
+            idempotent = True
+        if (
+            assignment["state"] == "active"
+            and assignment.get("active_turn_id") != turn_id
+        ):
+            raise ValueError("Another PM turn is active during decision acknowledgment")
+        if answer["outcome"] == "continue" and question_record.report.content.blocking:
+            issue = self._tracker_read(
+                project_id=str(binding["project_id"]),
+                operation=lambda: self._tracker.get_issue(str(binding["issue_url"])),
+            )
+            stage = self._executive_stage(issue)
+            if stage == "decision":
+                self.transition_map(
+                    map_id=map_id,
+                    expected_stage="decision",
+                    requested_stage="delivery",
+                )
+            elif stage != "delivery":
+                raise ValueError(
+                    "PM decision continuation conflicts with authoritative Map stage"
+                )
+        elif answer["outcome"] == "blocked":
+            self._storage.finish_pm_turn(
+                map_id=map_id,
+                turn_id=turn_id,
+                outcome="decision_acknowledgment",
+                outcome_id=correlation_id,
+                finished_at=acknowledged_at,
+            )
+        return {
+            "map_id": map_id,
+            "correlation_id": correlation_id,
+            "continuation": answer["outcome"],
+            "tracker": answer["tracker"],
+            "acknowledged_at": acknowledged_at,
+            "idempotent": idempotent,
+        }
+
+    def _authoritative_pm_answer(
+        self,
+        *,
+        map_id: str,
+        binding: dict[str, Any],
+        correlation_id: str,
+    ) -> dict[str, Any]:
+        approval = self._current_approval(request_id=correlation_id)
+        if approval is not None:
+            if approval["map_id"] != map_id:
+                raise ValueError("PM decision approval ledger belongs to another Map")
+            approval_records = self._tracker_read(
+                project_id=str(binding["project_id"]),
+                operation=lambda: self._tracker.list_approval_events(
+                    str(binding["issue_url"])
+                ),
+            )
+            decision_events = [
+                record
+                for record in approval_records
+                if record.event.request_id == correlation_id
+                and record.event.event_type in APPROVAL_DECISIONS
+            ]
+            if len(decision_events) != 1:
+                raise ValueError(
+                    "PM decision correlation has no single authoritative answer"
+                )
+            outcome = (
+                approval["decision_payload"].get("outcome")
+                if approval["status"] == "approved"
+                else "blocked"
+            )
+            if outcome not in {"continue", "blocked"}:
+                raise ValueError(
+                    "Committed chairman decision has no correlation outcome"
+                )
+            record = decision_events[0]
+            return {
+                "outcome": outcome,
+                "tracker": {
+                    "id": record.tracker_record_id,
+                    "url": record.tracker_record_url,
+                },
+            }
+        decisions = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.list_decisions(str(binding["issue_url"])),
+        )
+        matching_decisions = [
+            record
+            for record in decisions
+            if record.decision.decision_id == correlation_id
+        ]
+        if len(matching_decisions) != 1:
+            raise ValueError(
+                "PM decision correlation has no single authoritative answer"
+            )
+        record = matching_decisions[0]
+        context = record.decision.authority_context or {}
+        payload = context.get("decision_payload")
+        outcome = payload.get("outcome") if isinstance(payload, dict) else None
+        if outcome not in {"continue", "blocked"}:
+            raise ValueError("Committed CEO decision has no correlation outcome")
+        return {
+            "outcome": outcome,
+            "tracker": {
+                "id": record.tracker_record_id,
+                "url": record.tracker_record_url,
+            },
+        }
+
+    def answer_pm_question(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        response: PMDecisionResponse,
+    ) -> dict[str, Any]:
+        """Route one correlation-bound CEO answer through policy and durable truth."""
+        self._authorize_ceo_request(
+            map_id=map_id,
+            action="answer_question",
+            request_identity=request_identity,
+        )
+        binding = self._ensure_map_writable(map_id=map_id)
+        question_record = self._authoritative_pm_question(
+            map_id=map_id,
+            binding=binding,
+            correlation_id=response.correlation_id,
+        )
+        question = question_record.report.content
+        if response.recommendation not in question.options:
+            raise ValueError("CEO recommendation must select one recorded PM option")
+        authority = self._authority_policy.classify(
+            str(question.decision_class),
+            decision_payload=response.decision_payload,
+            requested_scope=question.scope,
+        )
+        if authority == "unconfigured":
+            self._deny_governance_request(
+                map_id=map_id,
+                action="answer_question",
+                request_identity=request_identity,
+                reason="decision_class_not_configured",
+            )
+        if authority == "chairman":
+            requested_scope = dict(question.scope or {})
+            requested_scope.update(
+                map_id=map_id,
+                correlation_id=response.correlation_id,
+                blocking=bool(question.blocking),
+            )
+            decision_payload = {
+                **response.decision_payload,
+                "correlation_id": response.correlation_id,
+                "outcome": response.outcome,
+            }
+            approval = self.request_approval(
+                map_id=map_id,
+                request_identity=request_identity,
+                packet=ApprovalPacket(
+                    request_id=response.correlation_id,
+                    decision_class=str(question.decision_class),
+                    proposed_action=response.recommendation,
+                    alternatives=question.options,
+                    rationale=response.rationale,
+                    cost_risk=response.cost_risk,
+                    evidence=question.evidence,
+                    requested_scope=requested_scope,
+                    decision_payload=decision_payload,
+                ),
+            )
+            return {
+                **approval,
+                "route": "chairman_approval",
+                "correlation_id": response.correlation_id,
+            }
+
+        affected_stage = (
+            "decision"
+            if question.blocking is True and response.outcome == "blocked"
+            else "delivery"
+        )
+        decision = StructuredDecision(
+            decision_id=response.correlation_id,
+            type=str(question.decision_class),
+            rationale=response.rationale,
+            authority="ceo",
+            affected_stage=affected_stage,
+            timestamp=response.timestamp,
+            authority_context={
+                "decision_payload": {
+                    **response.decision_payload,
+                    "recommendation": response.recommendation,
+                    "outcome": response.outcome,
+                    "correlation_id": response.correlation_id,
+                },
+                "requested_scope": dict(question.scope or {}),
+            },
+        )
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("decision", lock_key):
+            with self._storage.decision_lease(map_id):
+                decision_result = self._record_decision(
+                    map_id=map_id,
+                    decision=decision,
+                    pm_decision_resume={
+                        "correlation_id": response.correlation_id,
+                        "blocking": bool(question.blocking),
+                        "outcome": response.outcome,
+                        "record_kind": "CEO decision",
+                    },
+                )
+        resume = self._resume_pm_after_committed_answer(
+            map_id=map_id,
+            correlation_id=response.correlation_id,
+            blocking=bool(question.blocking),
+            outcome=response.outcome,
+            record_kind="CEO decision",
+            tracker=decision_result["decision"]["tracker"],
+        )
+        return {
+            **decision_result,
+            "route": "ceo_decision",
+            "correlation_id": response.correlation_id,
+            "resume": resume,
+            "idempotent": bool(decision_result["idempotent"] and resume["idempotent"]),
+        }
+
+    def _authoritative_pm_question(
+        self,
+        *,
+        map_id: str,
+        binding: dict[str, Any],
+        correlation_id: str,
+    ) -> TrackerPMReportRecord:
+        records = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.list_pm_reports(str(binding["issue_url"])),
+        )
+        matches = [
+            record
+            for record in records
+            if record.report.assignment_map_id == map_id
+            and record.report.content.report_type == "question"
+            and record.report.content.correlation_id == correlation_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "PM question correlation must resolve to exactly one authoritative record"
+            )
+        return matches[0]
+
+    def _resume_pm_after_committed_answer(
+        self,
+        *,
+        map_id: str,
+        correlation_id: str,
+        blocking: bool,
+        outcome: str,
+        record_kind: str,
+        tracker: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        effect_id = self._pm_decision_resume_effect_id(
+            map_id=map_id,
+            correlation_id=correlation_id,
+            outcome=outcome,
+        )
+        assignment = self._storage.pm_assignment(map_id)
+        existing = self._outbox.intent(effect_id)
+        if assignment is None or existing is None:
+            raise DecisionResumePendingError(
+                "PM decision resume intent is not durably linked"
+            )
+        expected_payload = self._pm_decision_resume_payload(
+            assignment=assignment,
+            correlation_id=correlation_id,
+            blocking=blocking,
+            outcome=outcome,
+            record_kind=record_kind,
+            tracker=tracker,
+        )
+        if existing.payload != expected_payload:
+            raise EffectTerminalError(
+                "PM decision resume identity belongs to another committed answer"
+            )
+        if assignment["state"] != "idle" and existing.state != "succeeded":
+            raise DecisionResumePendingError(
+                "PM assignment is not idle for decision resume"
+            )
+        dispatched = self._outbox_dispatcher.dispatch_effect(
+            effect_id=effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=existing.state == "retry_scheduled",
+        )
+        status = self._outbox.intent(effect_id)
+        if status is None:  # pragma: no cover
+            raise DecisionResumePendingError("PM decision resume disappeared")
+        if status.state != "succeeded":
+            raise DecisionResumePendingError(
+                status.last_error_message
+                or status.terminal_reason
+                or "PM decision resume is pending"
+            )
+        return {
+            "effect_id": effect_id,
+            "state": status.state,
+            "turn_id": str(existing.payload["turn_id"]),
+            "idempotent": (
+                existing.state == "succeeded"
+                or (dispatched is not None and dispatched.reconciled_by_readback)
+            ),
+        }
+
+    def _enqueue_pm_decision_resume(
+        self,
+        *,
+        map_id: str,
+        correlation_id: str,
+        blocking: bool,
+        outcome: str,
+        record_kind: str,
+        tracker: Mapping[str, Any],
+    ) -> str:
+        assignment = self._storage.pm_assignment(map_id)
+        if assignment is None:
+            raise EffectRetryableError(
+                "PM assignment is unavailable for decision resume"
+            )
+        effect_id = self._pm_decision_resume_effect_id(
+            map_id=map_id,
+            correlation_id=correlation_id,
+            outcome=outcome,
+        )
+        try:
+            self._outbox.enqueue(
+                effect_id=effect_id,
+                effect_type=COORDINATOR_RESUME,
+                map_id=map_id,
+                payload=self._pm_decision_resume_payload(
+                    assignment=assignment,
+                    correlation_id=correlation_id,
+                    blocking=blocking,
+                    outcome=outcome,
+                    record_kind=record_kind,
+                    tracker=tracker,
+                ),
+                created_at=self._synchronized_at(),
+            )
+        except OutboxConflictError as error:
+            raise EffectTerminalError(
+                "PM decision resume identity belongs to another committed answer"
+            ) from error
+        return effect_id
+
+    @staticmethod
+    def _pm_decision_resume_payload(
+        *,
+        assignment: Mapping[str, Any],
+        correlation_id: str,
+        blocking: bool,
+        outcome: str,
+        record_kind: str,
+        tracker: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        record_id = str(tracker["id"])
+        record_url = str(tracker["url"])
+        turn_id = f"decision:{correlation_id}:{outcome}"
+        content = (
+            f"Decision {correlation_id} is committed as {record_kind} {record_id}: "
+            f"{record_url}. Re-read authoritative Map state with map_governance_pm "
+            f"inspect, then acknowledge correlation {correlation_id}. "
+            + (
+                "Continue only after acknowledgment."
+                if outcome == "continue"
+                else "Remain blocked after acknowledgment."
+            )
+        )
+        return {
+            "profile_name": str(assignment["profile_name"]),
+            "session_id": str(assignment["session_id"]),
+            "coordinator_id": str(assignment["coordinator_id"]),
+            "turn_id": turn_id,
+            "content": content,
+            "correlation_id": correlation_id,
+            "blocking": blocking,
+            "outcome": outcome,
+            "record_kind": record_kind,
+            "tracker_record_id": record_id,
+            "tracker_record_url": record_url,
+        }
+
+    @staticmethod
+    def _pm_decision_resume_effect_id(
+        *, map_id: str, correlation_id: str, outcome: str
+    ) -> str:
+        return f"coordinator-resume:{map_id}:decision:{correlation_id}:{outcome}"
 
     def enforce_assigned_pm_toolset(
         self,
@@ -2634,7 +3227,22 @@ class MapGovernanceApplication:
             action="record_decision",
             request_identity=request_identity,
         )
-        self._ensure_map_writable(map_id=map_id)
+        binding = self._ensure_map_writable(map_id=map_id)
+        pm_reports = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.list_pm_reports(str(binding["issue_url"])),
+        )
+        if any(
+            record.report.content.report_type == "question"
+            and record.report.content.correlation_id == decision.decision_id
+            for record in pm_reports
+        ):
+            self._deny_governance_request(
+                map_id=map_id,
+                action="record_decision",
+                request_identity=request_identity,
+                reason="pm_question_requires_answer_action",
+            )
         if decision.authority != "ceo":
             self._deny_governance_request(
                 map_id=map_id,
@@ -2669,6 +3277,7 @@ class MapGovernanceApplication:
         *,
         map_id: str,
         decision: StructuredDecision,
+        pm_decision_resume: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         binding = self._storage.map_binding(map_id)
         if binding is None:
@@ -2683,6 +3292,11 @@ class MapGovernanceApplication:
                     "issue_url": binding["issue_url"],
                     "issue_id": map_id,
                     "decision": decision.payload(),
+                    **(
+                        {"pm_decision_resume": dict(pm_decision_resume)}
+                        if pm_decision_resume is not None
+                        else {}
+                    ),
                 },
                 created_at=self._synchronized_at(),
             )
@@ -2893,11 +3507,15 @@ class MapGovernanceApplication:
                         == actor_identity.profile_name
                         and approval["decision_note"] == note.strip()
                     ):
-                        return {
+                        result = {
                             "map_id": map_id,
                             "approval": self._approval_projection(approval),
                             "idempotent": True,
                         }
+                        return self._resume_correlated_approval_decision(
+                            result=result,
+                            row=approval,
+                        )
                     raise ApprovalRequestConflict(
                         request_id=request_id,
                         reason="chairman decision identity has different content",
@@ -2944,11 +3562,86 @@ class MapGovernanceApplication:
                 stored = self._storage.approval(request_id)
                 if stored is None:  # pragma: no cover - SQLite contract guard
                     raise RuntimeError("Approval ledger lost the decision")
-                return {
+                result = {
                     "map_id": map_id,
                     "approval": self._approval_projection(stored),
                     "idempotent": False,
                 }
+                return self._resume_correlated_approval_decision(
+                    result=result,
+                    row=stored,
+                )
+
+    def _resume_correlated_approval_decision(
+        self,
+        *,
+        result: dict[str, Any],
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        tracker = result["approval"]["tracker"].get("decision")
+        if not isinstance(tracker, dict):
+            return result
+        resume_parameters = self._enqueue_correlated_approval_resume(
+            row=row,
+            tracker=tracker,
+        )
+        if resume_parameters is None:
+            return result
+        resume = self._resume_pm_after_committed_answer(
+            map_id=str(resume_parameters["map_id"]),
+            correlation_id=str(resume_parameters["correlation_id"]),
+            blocking=bool(resume_parameters["blocking"]),
+            outcome=str(resume_parameters["outcome"]),
+            record_kind=str(resume_parameters["record_kind"]),
+            tracker=tracker,
+        )
+        return {
+            **result,
+            "correlation_id": resume_parameters["correlation_id"],
+            "resume": resume,
+        }
+
+    def _enqueue_correlated_approval_resume(
+        self,
+        *,
+        row: Mapping[str, Any],
+        tracker: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        scope = row.get("requested_scope")
+        payload = row.get("decision_payload")
+        correlation_id = (
+            scope.get("correlation_id") if isinstance(scope, dict) else None
+        )
+        if (
+            not isinstance(scope, dict)
+            or not isinstance(correlation_id, str)
+            or not correlation_id
+            or not isinstance(payload, dict)
+        ):
+            return None
+        status = str(row["status"])
+        outcome = (
+            str(payload.get("outcome"))
+            if status == "approved"
+            and payload.get("outcome") in {"continue", "blocked"}
+            else "blocked"
+        )
+        parameters = {
+            "map_id": str(row["map_id"]),
+            "correlation_id": correlation_id,
+            "blocking": bool(scope.get("blocking")),
+            "outcome": outcome,
+            "record_kind": f"chairman {status}",
+        }
+        self._enqueue_pm_decision_resume(
+            map_id=str(parameters["map_id"]),
+            correlation_id=str(parameters["correlation_id"]),
+            blocking=bool(parameters["blocking"]),
+            outcome=str(parameters["outcome"]),
+            record_kind=str(parameters["record_kind"]),
+            tracker=tracker,
+        )
+        return parameters
 
     def revoke_approval(
         self,
@@ -4713,6 +5406,19 @@ class MapGovernanceApplication:
                     confirmed_at=self._synchronized_at(),
                 ),
             )
+            resume = intent.payload.get("pm_decision_resume")
+            if isinstance(resume, dict):
+                self._enqueue_pm_decision_resume(
+                    map_id=intent.map_id,
+                    correlation_id=str(resume["correlation_id"]),
+                    blocking=bool(resume["blocking"]),
+                    outcome=str(resume["outcome"]),
+                    record_kind=str(resume["record_kind"]),
+                    tracker={
+                        "id": record.tracker_record_id,
+                        "url": record.tracker_record_url,
+                    },
+                )
             return
         if intent.effect_type != TRACKER_STAGE_TRANSITION:
             raise EffectRetryableError(
@@ -4828,6 +5534,92 @@ class MapGovernanceApplication:
             )
         except ValueError as error:
             raise EffectTerminalError(str(error)) from error
+        if report.content.report_type == "question":
+            self._route_pm_question_to_ceo(map_id=map_id, report=record)
+
+    def _route_pm_question_to_ceo(
+        self,
+        *,
+        map_id: str,
+        report: TrackerPMReportRecord,
+    ) -> None:
+        """Wake the canonical CEO once, after the question is tracker-confirmed."""
+        question = report.report.content
+        correlation_id = question.correlation_id
+        if correlation_id is None or not self._session_resume_outbox:
+            return
+        session = self._storage.ceo_session_binding(map_id)
+        if (
+            session is None
+            or session.get("state") != "ready"
+            or not session.get("root_session_id")
+        ):
+            raise EffectRetryableError(
+                "Canonical CEO session is not ready for the PM question"
+            )
+        content = "\n".join(
+            (
+                "A tracker-confirmed Hermes PM decision request is ready.",
+                f"Correlation: {correlation_id}",
+                f"Committed question: {report.tracker_record_url}",
+                "Use exactly one map_governance_ceo answer_question action for this correlation.",
+                json.dumps(
+                    {
+                        "map_id": map_id,
+                        "correlation_id": correlation_id,
+                        "decision_class": question.decision_class,
+                        "scope": question.scope,
+                        "blocking": question.blocking,
+                        "question": question.summary,
+                        "evidence": list(question.evidence),
+                        "options": list(question.options),
+                        "continuation_requirement": question.continuation_requirement,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        idempotency_key = f"map-governance:pm-question:{map_id}:{correlation_id}"
+        effect_id = f"session-resume:{map_id}:pm-question:{correlation_id}"
+        payload = {
+            "root_session_id": str(session["root_session_id"]),
+            "content": content,
+            "idempotency_key": idempotency_key,
+            "profile_name": str(session["profile_name"]),
+            "canonical_identity": str(session["canonical_identity"]),
+            "canonical_title": str(session["canonical_title"]),
+            "bootstrap_hash": str(session["bootstrap_hash"]),
+            "correlation_id": correlation_id,
+            "tracker_record_url": report.tracker_record_url,
+        }
+        try:
+            enqueued = self._outbox.enqueue(
+                effect_id=effect_id,
+                effect_type=SESSION_RESUME,
+                map_id=map_id,
+                payload=payload,
+                created_at=self._synchronized_at(),
+            )
+        except OutboxConflictError as error:
+            raise EffectTerminalError(
+                "PM question correlation belongs to another CEO turn"
+            ) from error
+        self._outbox_dispatcher.dispatch_effect(
+            effect_id=effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=not enqueued.created,
+        )
+        status = self._outbox.intent(effect_id)
+        if status is None:  # pragma: no cover
+            raise EffectRetryableError("PM question CEO turn disappeared")
+        if status.state != "succeeded":
+            raise EffectRetryableError(
+                status.last_error_message
+                or status.terminal_reason
+                or "PM question CEO turn is pending"
+            )
 
     def _complete_approval_effect(
         self,
@@ -4876,31 +5668,40 @@ class MapGovernanceApplication:
         details = event.details
         if operation == "decision":
             if approval["status"] == event.event_type:
-                if (
+                if not (
                     approval["decided_by"] == details.get("actor_id")
                     and approval["decided_by_profile"] == details.get("actor_profile")
                     and approval["decision_note"] == details.get("note")
                 ):
-                    return
-                raise TrackerEffectPayloadConflict(
-                    "approval decision projection has different content"
-                )
-            if approval["status"] != "pending":
+                    raise TrackerEffectPayloadConflict(
+                        "approval decision projection has different content"
+                    )
+            elif approval["status"] != "pending":
                 raise TrackerEffectPayloadConflict(
                     "approval projection is no longer pending"
                 )
-            self._storage.apply_approval_decision(
-                request_id=event.request_id,
-                decision=event.event_type,
-                actor_id=str(details["actor_id"]),
-                actor_profile=str(details["actor_profile"]),
-                note=str(details["note"]),
-                decided_at=event.occurred_at,
-                expires_at=(
-                    str(details["expires_at"]) if details.get("expires_at") else None
-                ),
-                tracker_record_id=tracker_record_id,
-                tracker_record_url=tracker_record_url,
+            else:
+                self._storage.apply_approval_decision(
+                    request_id=event.request_id,
+                    decision=event.event_type,
+                    actor_id=str(details["actor_id"]),
+                    actor_profile=str(details["actor_profile"]),
+                    note=str(details["note"]),
+                    decided_at=event.occurred_at,
+                    expires_at=(
+                        str(details["expires_at"])
+                        if details.get("expires_at")
+                        else None
+                    ),
+                    tracker_record_id=tracker_record_id,
+                    tracker_record_url=tracker_record_url,
+                )
+            stored = self._storage.approval(event.request_id)
+            if stored is None:  # pragma: no cover
+                raise EffectRetryableError("Approval decision projection disappeared")
+            self._enqueue_correlated_approval_resume(
+                row=stored,
+                tracker={"id": tracker_record_id, "url": tracker_record_url},
             )
             return
         if operation == "revocation":

@@ -9,6 +9,7 @@ from typing import Any
 from .application import (
     ApprovalEnforcementError,
     ApprovalRequestConflict,
+    DecisionResumePendingError,
     GovernanceAuthorizationError,
     GovernanceRequestIdentity,
     MapBindingError,
@@ -24,6 +25,7 @@ from .coordinator import (
     CoordinatorRuntimeError,
 )
 from .runtime import application_for_profile
+from .reports import PMDecisionResponse
 from .tracker import StructuredDecision, TrackerError
 
 
@@ -35,8 +37,9 @@ CEO_SKILL = Path(__file__).resolve().parents[1] / "skills" / "ceo" / "SKILL.md"
 CEO_TOOL_SCHEMA = {
     "name": CEO_TOOL_NAME,
     "description": (
-        "Inspect one governed Map, record an autonomous CEO decision, submit "
-        "a content-bound chairman approval request, or explicitly commission its PM."
+        "Inspect one governed Map, answer a correlated PM question through policy, "
+        "record an autonomous CEO decision, submit a content-bound chairman approval "
+        "request, or explicitly commission its PM."
     ),
     "parameters": {
         "type": "object",
@@ -46,6 +49,7 @@ CEO_TOOL_SCHEMA = {
                 "enum": [
                     "inspect",
                     "record_decision",
+                    "answer_question",
                     "request_approval",
                     "commission",
                     "resume",
@@ -122,6 +126,39 @@ CEO_TOOL_SCHEMA = {
                 ],
                 "additionalProperties": False,
             },
+            "question_response": {
+                "type": "object",
+                "properties": {
+                    "correlation_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                    },
+                    "recommendation": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                    },
+                    "rationale": {"type": "string", "minLength": 1},
+                    "cost_risk": {"type": "string", "minLength": 1},
+                    "decision_payload": {"type": "object"},
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["continue", "blocked"],
+                    },
+                    "timestamp": {"type": "string", "format": "date-time"},
+                },
+                "required": [
+                    "correlation_id",
+                    "recommendation",
+                    "rationale",
+                    "cost_risk",
+                    "decision_payload",
+                    "outcome",
+                    "timestamp",
+                ],
+                "additionalProperties": False,
+            },
         },
         "required": ["action", "map_id"],
         "additionalProperties": False,
@@ -165,6 +202,17 @@ def register_ceo_capabilities(ctx) -> None:
                     request_identity=identity,
                     decision=StructuredDecision(**raw_decision),
                 )
+            elif action == "answer_question":
+                raw_response = arguments.get("question_response")
+                if not isinstance(raw_response, dict):
+                    raise ValueError(
+                        "question_response is required for answer_question"
+                    )
+                result = application.answer_pm_question(
+                    map_id=map_id,
+                    request_identity=identity,
+                    response=PMDecisionResponse(**raw_response),
+                )
             elif action == "request_approval":
                 raw_packet = arguments.get("approval_packet")
                 if not isinstance(raw_packet, dict):
@@ -186,8 +234,8 @@ def register_ceo_capabilities(ctx) -> None:
                 )
             else:
                 raise ValueError(
-                    "action must be inspect, record_decision, request_approval, "
-                    "commission, resume, or runtime_status"
+                    "action must be inspect, record_decision, answer_question, "
+                    "request_approval, commission, resume, or runtime_status"
                 )
             return json.dumps(result, ensure_ascii=False, sort_keys=True)
         except (
@@ -223,6 +271,8 @@ def register_ceo_capabilities(ctx) -> None:
                 },
                 sort_keys=True,
             )
+        except DecisionResumePendingError as error:
+            return json.dumps({"error": error.as_dict()}, sort_keys=True)
         except TrackerError as error:
             return json.dumps(
                 {

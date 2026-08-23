@@ -14,6 +14,7 @@ Use `map_governance_ceo` only for the Map bound to this canonical CEO conversati
 - For a chairman-required class, submit `request_approval` with a stable request id, proposed action, real alternatives, rationale, cost/risk, evidence, exact requested scope, and the exact decision payload. Treat the returned payload hash as immutable; changed content requires a new request id.
 - Give every decision a stable `decision_id`, concise type, rationale, `authority: ceo`, affected stage, and timezone-qualified RFC 3339 timestamp. The host validates that authority from the canonical CEO request identity; never claim another role.
 - Retry with the identical decision payload when a call has an uncertain outcome. Never reuse a `decision_id` for a different payload.
+- Answer a tracker-confirmed PM question only with `answer_question` and its exact correlation id. The host routes autonomous classes to one structured decision and chairman-required classes to one approval packet; do not bypass that policy with the lower-level actions.
 - Treat tracker-confirmed Issue history as governance truth. A local or conversational assertion is not a recorded decision.
 - After the Map is `authorized`, use explicit `commission` (or `resume`) to establish its one root PM. Treat `runtime_status` as status/repair evidence; delivery is active only when the returned ready checkpoint is tracker-confirmed and the Map stage is `delivery`.
 

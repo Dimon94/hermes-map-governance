@@ -206,6 +206,14 @@ whole-Map question/blocker 才可投影 `decision`，terminal failure 只形成�
 状态；后续 checkpoint、acceptance 或 failure 会取代已处理 question/blocker 的 pending badge，
 完整历史仍由 Issue comment 与 Map detail 保留。
 
+PM question 还会持久化 Map-bound scope、blocking impact、evidence、options、decision class
+与 stable correlation id。tracker（以及 whole-Map blocker 的 stage）确认后，Outbox 才向该 Map
+canonical CEO session 投递一次 correlation-bound turn。CEO 通过同一 application seam 回答：
+authority envelope 内写一次 structured decision，外部决策自动形成 chairman packet；approve、
+reject 或 revision 都先写回 Issue 并更新 approval ledger，才向经过 ownership 验证的 idle PM
+root 投递引用 committed record 的 concise resume。PM resume 后重新读取 tracker history，ack
+同一 correlation；continue 才解除 whole-Map `decision`，rejected/revision/blocked 继续保持阻塞。
+
 PM assignment 固定绑定 request-scoped profile/session 与一个 Map，不读取 process env。
 受控 coordinator application seam 以 `idle → active → idle` 运行；tracker-confirmed report
 或确认的 dispatch 结束后必须 idle，失败的 report 保持同一 active turn 供同 payload 重试，

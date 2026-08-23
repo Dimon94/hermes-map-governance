@@ -366,6 +366,7 @@ elif command[:2] == ["agent", "start"]:
         "name": name, "agent": "hermes",
         "workspace_id": workspace["workspace_id"],
         "tab_id": workspace["tab_id"], "pane_id": pane,
+        "agent_status": "idle",
         "agent_session": {"source": "herdr:hermes", "agent": "hermes",
                           "kind": "id", "value": "hermes-test-session"},
     }

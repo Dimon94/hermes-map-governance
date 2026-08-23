@@ -103,6 +103,9 @@ class ApprovalTracker:
     def list_decisions(self, url: str):
         return list(self.decision_records[url])
 
+    def list_pm_reports(self, url: str):
+        return []
+
     def append_decision(self, url: str, *, issue_id: str, decision):
         self.decision_writes += 1
         record = TrackerDecisionRecord(

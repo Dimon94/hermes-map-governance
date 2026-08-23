@@ -88,10 +88,30 @@
             "Needed to continue: " + report.continuation_requirement,
           )
         : null,
+      report.correlation_id
+        ? React.createElement(
+            "p",
+            null,
+            "Correlation: " + report.correlation_id + " · " + report.decision_class,
+          )
+        : null,
+      report.scope
+        ? React.createElement("code", null, JSON.stringify(report.scope))
+        : null,
+      (report.options || []).length
+        ? React.createElement(
+            "ul",
+            { className: "list-disc space-y-1 pl-5", "aria-label": "Decision options" },
+            report.options.map(function (item, index) {
+              return React.createElement("li", { key: index }, item);
+            }),
+          )
+        : null,
       report.failure_code
         ? React.createElement("p", null, "Failure code: " + report.failure_code)
         : null,
-      report.type === "acceptance" && (report.evidence || []).length
+      (report.type === "question" || report.type === "acceptance")
+        && (report.evidence || []).length
         ? React.createElement(
             "ul",
             { className: "list-disc space-y-1 pl-5", "aria-label": "Executive evidence" },
@@ -648,6 +668,15 @@
           detail.recent_decisions = [payload.decision].concat(
             (detail.recent_decisions || []).filter(function (item) {
               return item.decision_id !== payload.decision.decision_id;
+            }),
+          );
+        } else if (
+          event.type === "decision-ack.updated"
+          && payload.acknowledgment
+        ) {
+          detail.decision_acknowledgments = [payload.acknowledgment].concat(
+            (detail.decision_acknowledgments || []).filter(function (item) {
+              return item.correlation_id !== payload.acknowledgment.correlation_id;
             }),
           );
         } else if (event.type === "approval.upserted" && payload.approval) {
@@ -1536,6 +1565,43 @@
                                 );
                               },
                             ),
+                        React.createElement(
+                          "section",
+                          {
+                            className: "space-y-2",
+                            "aria-label": "PM decision acknowledgments",
+                          },
+                          React.createElement(
+                            "h3",
+                            { className: "font-medium text-foreground" },
+                            "PM decision acknowledgments",
+                          ),
+                          (detailState.detail.decision_acknowledgments || []).length === 0
+                            ? React.createElement("p", null, "No PM acknowledgments")
+                            : detailState.detail.decision_acknowledgments.map(
+                                function (acknowledgment) {
+                                  return React.createElement(
+                                    "article",
+                                    {
+                                      key: acknowledgment.correlation_id,
+                                      className: "space-y-1 rounded-md border p-2",
+                                    },
+                                    React.createElement(
+                                      "p",
+                                      null,
+                                      acknowledgment.correlation_id
+                                        + " · " + acknowledgment.outcome,
+                                    ),
+                                    React.createElement(
+                                      "p",
+                                      null,
+                                      "Committed record: "
+                                        + acknowledgment.tracker.id,
+                                    ),
+                                  );
+                                },
+                              ),
+                        ),
                         React.createElement(
                           "section",
                           { className: "space-y-2", "aria-label": "Chairman approval packets" },

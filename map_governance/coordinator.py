@@ -312,6 +312,19 @@ class CoordinatorRuntimeBoundary(Protocol):
 
     def collect_lane(self, request: DeliveryRuntimeRequest) -> dict[str, Any]: ...
 
+    def readback(self, *, map_id: str, turn_id: str) -> Mapping[str, Any] | None: ...
+
+    def resume(
+        self,
+        *,
+        map_id: str,
+        profile_name: str,
+        session_id: str,
+        coordinator_id: str,
+        turn_id: str,
+        content: str = "",
+    ) -> None: ...
+
 
 @dataclass(frozen=True)
 class CoordinatorCommandResult:
@@ -716,9 +729,17 @@ class CoordinatorRuntime:
     ) -> dict[str, Any]:
         """Prompt the verified PM root with one structured commissioning packet."""
         self._validate_payload(payload)
+        turn_id = f"commission-ready:{map_id}"
+        content = json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         with self._storage.pm_runtime_lease(map_id):
             record = self._storage.pm_runtime(map_id)
-            if record is None:
+            assignment = self._storage.pm_assignment(map_id)
+            if record is None or assignment is None:
                 raise CoordinatorRuntimeError(
                     reason="runtime_not_reserved",
                     retryable=False,
@@ -726,31 +747,146 @@ class CoordinatorRuntime:
                 )
             self._validate_owned_record(record)
             try:
-                agent = self._validate_live_runtime(record)
-                result = self._command_json(
-                    [
-                        record["herdr_executable"]
-                        if "herdr_executable" in record
-                        else str(payload.get("herdr_executable") or "herdr"),
-                        "--session",
-                        record["session_namespace"],
-                        "agent",
-                        "prompt",
-                        record["agent_id"],
-                        json.dumps(
-                            dict(payload),
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            sort_keys=True,
-                        ),
-                        "--wait",
-                        "--timeout",
-                        "30000",
-                    ]
+                self._validate_resume_identity(
+                    assignment=assignment,
+                    record=record,
+                    profile_name=str(assignment["profile_name"]),
+                    session_id=str(assignment["session_id"]),
+                    coordinator_id=str(assignment["coordinator_id"]),
+                    require_idle=False,
                 )
-                prompted = self._agent_from(result)
-                self._assert_agent_coordinates(record, prompted)
-                self._assert_agent_coordinates(record, agent)
+                if (
+                    assignment["state"] != "active"
+                    or assignment.get("active_turn_id") != turn_id
+                ):
+                    raise CoordinatorRuntimeError(
+                        reason="pm_ready_turn_mismatch",
+                        retryable=False,
+                        repair_required=True,
+                    )
+                content_hash = self.resume_content_hash(content)
+                turn_marker = self.resume_turn_marker(
+                    map_id=map_id,
+                    profile_name=str(assignment["profile_name"]),
+                    session_id=str(assignment["session_id"]),
+                    coordinator_id=str(assignment["coordinator_id"]),
+                    turn_id=turn_id,
+                    content=content,
+                )
+                existing = self._storage.pm_resume_receipt(
+                    map_id=map_id,
+                    turn_id=turn_id,
+                )
+                agent: Mapping[str, Any] | None = None
+                should_prompt = existing is None
+                if existing is not None:
+                    if any(
+                        existing[name] != expected
+                        for name, expected in (
+                            ("profile_name", assignment["profile_name"]),
+                            ("session_id", assignment["session_id"]),
+                            ("coordinator_id", assignment["coordinator_id"]),
+                            ("content_hash", content_hash),
+                            ("turn_marker", turn_marker),
+                        )
+                    ):
+                        raise CoordinatorRuntimeError(
+                            reason="pm_resume_identity_mismatch",
+                            retryable=False,
+                            repair_required=True,
+                        )
+                    if existing["state"] == "dispatching":
+                        agent = self._validate_live_runtime(record)
+                        marker_visible = self._pm_turn_marker_visible(
+                            record=record,
+                            turn_marker=turn_marker,
+                        )
+                        if marker_visible:
+                            self._storage.confirm_pm_resume_receipt(
+                                map_id=map_id,
+                                turn_id=turn_id,
+                                content_hash=content_hash,
+                                prompted_at=self._clock(),
+                            )
+                        elif (
+                            existing.get("delivery_rejected") == 1
+                            and agent.get("agent_status") == "idle"
+                        ):
+                            self._storage.allow_pm_resume_retry(
+                                map_id=map_id,
+                                turn_id=turn_id,
+                                content_hash=content_hash,
+                            )
+                            should_prompt = True
+                        else:
+                            raise CoordinatorRuntimeError(
+                                reason="pm_ready_delivery_unconfirmed",
+                                retryable=True,
+                            )
+                if should_prompt:
+                    if agent is None:
+                        agent = self._validate_live_runtime(record)
+                    if agent.get("agent_status") != "idle":
+                        raise CoordinatorRuntimeError(
+                            reason="pm_resume_requires_idle_agent",
+                            retryable=True,
+                        )
+                    self._storage.prepare_pm_resume_receipt(
+                        map_id=map_id,
+                        turn_id=turn_id,
+                        profile_name=str(assignment["profile_name"]),
+                        session_id=str(assignment["session_id"]),
+                        coordinator_id=str(assignment["coordinator_id"]),
+                        content_hash=content_hash,
+                        turn_marker=turn_marker,
+                        prepared_at=self._clock(),
+                    )
+                    prompt_payload = {
+                        **dict(payload),
+                        "coordinator_turn_marker": turn_marker,
+                    }
+                    try:
+                        result = self._command_json(
+                            [
+                                str(record.get("herdr_executable") or "herdr"),
+                                "--session",
+                                str(record["session_namespace"]),
+                                "agent",
+                                "prompt",
+                                str(record["agent_id"]),
+                                json.dumps(
+                                    prompt_payload,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                    sort_keys=True,
+                                ),
+                                "--wait",
+                                "--timeout",
+                                "30000",
+                            ]
+                        )
+                    except CoordinatorRuntimeError as error:
+                        if error.reason == "command_failed":
+                            self._storage.mark_pm_resume_delivery_rejected(
+                                map_id=map_id,
+                                turn_id=turn_id,
+                                content_hash=content_hash,
+                            )
+                        raise
+                    prompted = self._agent_from(result)
+                    self._assert_agent_coordinates(record, prompted)
+                    self._assert_agent_coordinates(record, agent)
+                    if prompted.get("agent_status") not in {"idle", "done"}:
+                        raise CoordinatorRuntimeError(
+                            reason="pm_ready_prompt_unconfirmed",
+                            retryable=True,
+                        )
+                    self._storage.confirm_pm_resume_receipt(
+                        map_id=map_id,
+                        turn_id=turn_id,
+                        content_hash=content_hash,
+                        prompted_at=self._clock(),
+                    )
             except CoordinatorRuntimeError as error:
                 self._storage.update_pm_runtime(
                     map_id=map_id,
@@ -805,6 +941,355 @@ class CoordinatorRuntime:
     def status(self, *, map_id: str) -> dict[str, Any]:
         record = self._storage.pm_runtime(map_id)
         return record or {"map_id": map_id, "state": "not_commissioned"}
+
+    @staticmethod
+    def resume_content_hash(content: str) -> str:
+        return "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+
+    @classmethod
+    def resume_turn_marker(
+        cls,
+        *,
+        map_id: str,
+        profile_name: str,
+        session_id: str,
+        coordinator_id: str,
+        turn_id: str,
+        content: str,
+    ) -> str:
+        identity = json.dumps(
+            {
+                "map_id": map_id,
+                "profile_name": profile_name,
+                "session_id": session_id,
+                "coordinator_id": coordinator_id,
+                "turn_id": turn_id,
+                "content_hash": cls.resume_content_hash(content),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(identity.encode()).hexdigest()
+        return f"[map-governance:coordinator-turn:v1:{digest}]"
+
+    @classmethod
+    def resume_prompt_content(
+        cls,
+        *,
+        map_id: str,
+        profile_name: str,
+        session_id: str,
+        coordinator_id: str,
+        turn_id: str,
+        content: str,
+    ) -> str:
+        marker = cls.resume_turn_marker(
+            map_id=map_id,
+            profile_name=profile_name,
+            session_id=session_id,
+            coordinator_id=coordinator_id,
+            turn_id=turn_id,
+            content=content,
+        )
+        return f"{content}\n\n{marker}"
+
+    def readback(self, *, map_id: str, turn_id: str) -> Mapping[str, Any] | None:
+        receipt = self._storage.pm_resume_receipt(map_id=map_id, turn_id=turn_id)
+        if receipt is None:
+            return None
+        with self._storage.pm_runtime_lease(map_id):
+            receipt = self._storage.pm_resume_receipt(
+                map_id=map_id,
+                turn_id=turn_id,
+            )
+            if receipt is None:
+                return None
+            if receipt["state"] == "dispatching":
+                assignment = self._storage.pm_assignment(map_id)
+                record = self._storage.pm_runtime(map_id)
+                if assignment is None or record is None:
+                    raise CoordinatorRuntimeError(
+                        reason="pm_resume_binding_missing",
+                        retryable=False,
+                        repair_required=True,
+                    )
+                self._validate_resume_identity(
+                    assignment=assignment,
+                    record=record,
+                    profile_name=str(receipt["profile_name"]),
+                    session_id=str(receipt["session_id"]),
+                    coordinator_id=str(receipt["coordinator_id"]),
+                    require_idle=True,
+                )
+                self._validate_owned_record(record)
+                agent = self._validate_live_runtime(record)
+                turn_marker = receipt.get("turn_marker")
+                if not isinstance(turn_marker, str) or not turn_marker:
+                    raise CoordinatorRuntimeError(
+                        reason="pm_resume_marker_missing",
+                        retryable=False,
+                        repair_required=True,
+                    )
+                if not self._pm_turn_marker_visible(
+                    record=record,
+                    turn_marker=turn_marker,
+                ):
+                    if (
+                        receipt.get("delivery_rejected") == 1
+                        and agent.get("agent_status") == "idle"
+                    ):
+                        self._storage.allow_pm_resume_retry(
+                            map_id=map_id,
+                            turn_id=turn_id,
+                            content_hash=str(receipt["content_hash"]),
+                        )
+                    return None
+                self._storage.confirm_pm_resume_receipt(
+                    map_id=map_id,
+                    turn_id=turn_id,
+                    content_hash=str(receipt["content_hash"]),
+                    prompted_at=self._clock(),
+                )
+                receipt = self._storage.pm_resume_receipt(
+                    map_id=map_id,
+                    turn_id=turn_id,
+                )
+                if receipt is None:  # pragma: no cover
+                    raise RuntimeError("PM resume receipt disappeared")
+        return {
+            "map_id": map_id,
+            "turn_id": turn_id,
+            "content_hash": receipt["content_hash"],
+            "prompted_at": receipt["prompted_at"],
+        }
+
+    def resume(
+        self,
+        *,
+        map_id: str,
+        profile_name: str,
+        session_id: str,
+        coordinator_id: str,
+        turn_id: str,
+        content: str = "",
+    ) -> None:
+        """Prompt one verified idle PM root and persist a retry-stable receipt."""
+        values = (profile_name, session_id, coordinator_id, turn_id, content)
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ValueError("PM resume requires complete request-scoped identity")
+        if len(content.encode()) > 8_192 or self._contains_sensitive(content):
+            raise ValueError("PM resume content is too large or sensitive")
+        content_hash = self.resume_content_hash(content)
+        turn_marker = self.resume_turn_marker(
+            map_id=map_id,
+            profile_name=profile_name,
+            session_id=session_id,
+            coordinator_id=coordinator_id,
+            turn_id=turn_id,
+            content=content,
+        )
+        with self._storage.pm_runtime_lease(map_id):
+            existing = self._storage.pm_resume_receipt(
+                map_id=map_id,
+                turn_id=turn_id,
+            )
+            if existing is not None:
+                if any(
+                    existing[name] != expected
+                    for name, expected in (
+                        ("profile_name", profile_name),
+                        ("session_id", session_id),
+                        ("coordinator_id", coordinator_id),
+                        ("content_hash", content_hash),
+                    )
+                ):
+                    raise CoordinatorRuntimeError(
+                        reason="pm_resume_identity_mismatch",
+                        retryable=False,
+                        repair_required=True,
+                    )
+                if existing["state"] == "prompted":
+                    return
+                if not existing.get("retry_allowed"):
+                    raise CoordinatorRuntimeError(
+                        reason="pm_resume_delivery_unconfirmed",
+                        retryable=True,
+                    )
+            assignment = self._storage.pm_assignment(map_id)
+            record = self._storage.pm_runtime(map_id)
+            if assignment is None or record is None:
+                raise CoordinatorRuntimeError(
+                    reason="pm_resume_binding_missing",
+                    retryable=False,
+                    repair_required=True,
+                )
+            self._validate_resume_identity(
+                assignment=assignment,
+                record=record,
+                profile_name=profile_name,
+                session_id=session_id,
+                coordinator_id=coordinator_id,
+                require_idle=True,
+            )
+            self._validate_owned_record(record)
+            agent = self._validate_live_runtime(record)
+            if agent.get("agent_status") != "idle":
+                raise CoordinatorRuntimeError(
+                    reason="pm_resume_requires_idle_agent",
+                    retryable=True,
+                )
+            prepared_existing = self._storage.prepare_pm_resume_receipt(
+                map_id=map_id,
+                turn_id=turn_id,
+                profile_name=profile_name,
+                session_id=session_id,
+                coordinator_id=coordinator_id,
+                content_hash=content_hash,
+                turn_marker=turn_marker,
+                prepared_at=self._clock(),
+            )
+            if prepared_existing != (existing is not None):
+                latest = self._storage.pm_resume_receipt(
+                    map_id=map_id,
+                    turn_id=turn_id,
+                )
+                if latest is not None and latest["state"] == "prompted":
+                    return
+                raise CoordinatorRuntimeError(
+                    reason="pm_resume_delivery_unconfirmed",
+                    retryable=True,
+                )
+            try:
+                result = self._command_json(
+                    [
+                        str(record["herdr_executable"]),
+                        "--session",
+                        str(record["session_namespace"]),
+                        "agent",
+                        "prompt",
+                        str(record["agent_id"]),
+                        self.resume_prompt_content(
+                            map_id=map_id,
+                            profile_name=profile_name,
+                            session_id=session_id,
+                            coordinator_id=coordinator_id,
+                            turn_id=turn_id,
+                            content=content,
+                        ),
+                        "--wait",
+                        "--until",
+                        "working",
+                        "--timeout",
+                        "30000",
+                    ]
+                )
+            except CoordinatorRuntimeError as error:
+                if error.reason == "command_failed":
+                    self._storage.mark_pm_resume_delivery_rejected(
+                        map_id=map_id,
+                        turn_id=turn_id,
+                        content_hash=content_hash,
+                    )
+                raise
+            prompted = self._agent_from(result)
+            self._assert_agent_coordinates(record, agent)
+            self._assert_agent_coordinates(record, prompted)
+            if prompted.get("agent_status") != "working":
+                raise CoordinatorRuntimeError(
+                    reason="pm_resume_confirmation_not_working",
+                    retryable=True,
+                )
+            self._storage.confirm_pm_resume_receipt(
+                map_id=map_id,
+                turn_id=turn_id,
+                content_hash=content_hash,
+                prompted_at=self._clock(),
+            )
+
+    def _pm_turn_marker_visible(
+        self,
+        *,
+        record: Mapping[str, Any],
+        turn_marker: str,
+    ) -> bool:
+        result = self._result(
+            self._command_json(
+                [
+                    str(record.get("herdr_executable") or "herdr"),
+                    "--session",
+                    str(record["session_namespace"]),
+                    "agent",
+                    "read",
+                    str(record["agent_id"]),
+                    "--source",
+                    "recent-unwrapped",
+                    "--lines",
+                    "400",
+                    "--format",
+                    "text",
+                ]
+            )
+        )
+        read = result.get("read")
+        if result.get("type") != "pane_read" or not isinstance(read, Mapping):
+            raise self._malformed("pm_resume_readback_malformed")
+        if any(
+            read.get(name) != expected
+            for name, expected in (
+                ("workspace_id", record["workspace_id"]),
+                ("tab_id", record["window_id"]),
+                ("pane_id", record["pane_id"]),
+            )
+        ):
+            raise CoordinatorRuntimeError(
+                reason="pm_resume_readback_coordinate_mismatch",
+                retryable=False,
+                repair_required=True,
+            )
+        text = read.get("text")
+        if (
+            read.get("source") != "recent_unwrapped"
+            or read.get("format") != "text"
+            or not isinstance(text, str)
+            or len(text) > 65_536
+        ):
+            raise self._malformed("pm_resume_readback_malformed")
+        if turn_marker in text:
+            return True
+        if read.get("truncated") is not False:
+            raise CoordinatorRuntimeError(
+                reason="pm_resume_readback_incomplete",
+                retryable=True,
+            )
+        return False
+
+    @staticmethod
+    def _validate_resume_identity(
+        *,
+        assignment: Mapping[str, Any],
+        record: Mapping[str, Any],
+        profile_name: str,
+        session_id: str,
+        coordinator_id: str,
+        require_idle: bool,
+    ) -> None:
+        if (
+            assignment["profile_name"] != profile_name
+            or assignment["session_id"] != session_id
+            or assignment["coordinator_id"] != coordinator_id
+            or record["pm_profile"] != profile_name
+        ):
+            raise CoordinatorRuntimeError(
+                reason="pm_resume_identity_mismatch",
+                retryable=False,
+                repair_required=True,
+            )
+        if require_idle and assignment["state"] != "idle":
+            raise CoordinatorRuntimeError(
+                reason="pm_resume_requires_idle_assignment",
+                retryable=True,
+            )
 
     def prepare_lane(self, request: DeliveryRuntimeRequest) -> dict[str, Any]:
         """Reserve and verify one pane before any coding worker is started."""

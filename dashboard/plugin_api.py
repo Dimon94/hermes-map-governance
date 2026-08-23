@@ -32,6 +32,7 @@ from map_governance import (  # noqa: E402
     ApprovalEnforcementError,
     ApprovalRequestConflict,
     CEOSessionRepairRequired,
+    DecisionResumePendingError,
     GovernanceActorIdentity,
     GovernanceAuthorizationError,
     GovernanceRequestIdentity,
@@ -132,6 +133,8 @@ def _operation(profile: str, method: str, **arguments):
     except CoordinatorRuntimeError as error:
         status_code = 409 if error.repair_required else 503
         raise HTTPException(status_code=status_code, detail=error.as_dict()) from error
+    except DecisionResumePendingError as error:
+        raise HTTPException(status_code=503, detail=error.as_dict()) from error
     except CEOSessionRepairRequired as error:
         raise HTTPException(status_code=409, detail=error.as_dict()) from error
     except MapBindingError as error:

@@ -5,6 +5,7 @@ from .application import (
     ApprovalRequestConflict,
     CEOSessionAmbiguityError,
     CEOSessionRepairRequired,
+    DecisionResumePendingError,
     GovernanceAuthorizationError,
     GovernanceRequestIdentity,
     MapBindingError,
@@ -24,7 +25,7 @@ from .approvals import (
     GovernanceActorIdentity,
 )
 from .tracker import StructuredDecision
-from .reports import PMReport, PMReportDraft
+from .reports import PMDecisionResponse, PMReport, PMReportDraft
 from .coordinator import (
     CommissioningContext,
     CommissioningAuthorizationError,
@@ -55,6 +56,7 @@ __all__ = [
     "DeliveryLaneRegistry",
     "DeliveryLaneSpec",
     "DeliveryRuntimeRequest",
+    "DecisionResumePendingError",
     "GovernanceAuthorizationError",
     "GovernanceActorIdentity",
     "GovernanceRequestIdentity",
@@ -65,6 +67,7 @@ __all__ = [
     "StructuredDecisionConflict",
     "StaleProjectionError",
     "PMReport",
+    "PMDecisionResponse",
     "PMReportConflict",
     "PMReportDraft",
     "PrerequisiteApplication",

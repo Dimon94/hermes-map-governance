@@ -99,6 +99,9 @@ class ExecutiveTracker:
     def list_decisions(self, url: str) -> list[TrackerDecisionRecord]:
         return list(self.decisions) if url == ISSUE_URL else []
 
+    def list_pm_reports(self, url: str):
+        return []
+
 
 class CanonicalSessionRunner:
     def __init__(self) -> None:

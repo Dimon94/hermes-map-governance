@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -119,6 +120,8 @@ class ControllableRuntime:
         self.tracker = tracker
         self.ensure_calls = 0
         self.prompt_calls = 0
+        self.resume_calls = 0
+        self.resume_markers = {}
         self.activate_calls = 0
         self.confirm_calls = 0
         self.error: Exception | None = None
@@ -168,6 +171,26 @@ class ControllableRuntime:
         self.record.update(state="awaiting_ready")
         return dict(self.record)
 
+    def readback(self, *, map_id, turn_id):
+        return self.resume_markers.get((map_id, turn_id))
+
+    def resume(
+        self,
+        *,
+        map_id,
+        profile_name,
+        session_id,
+        coordinator_id,
+        turn_id,
+        content="",
+    ):
+        self.resume_calls += 1
+        self.resume_markers[(map_id, turn_id)] = {
+            "map_id": map_id,
+            "turn_id": turn_id,
+            "content_hash": "sha256:" + hashlib.sha256(content.encode()).hexdigest(),
+        }
+
     def confirm_ready(self, *, map_id, record_id):
         self.confirm_calls += 1
         self.record.update(state="ready_confirmed", ready_record_id=record_id)
@@ -210,7 +233,7 @@ def _packet() -> ApprovalPacket:
     )
 
 
-def _application(tmp_path, *, authorized=True):
+def _application(tmp_path, *, authorized=True, durable_resume=False):
     tracker = CommissionTracker()
     prerequisites = ReadyPrerequisites(tmp_path)
     runtime = ControllableRuntime(tracker)
@@ -222,6 +245,7 @@ def _application(tmp_path, *, authorized=True):
         clock=lambda: datetime(2026, 8, 24, tzinfo=timezone.utc),
         commissioning_prerequisites=prerequisites,
         coordinator_runtime=runtime,
+        coordinator_resume=runtime if durable_resume else None,
     )
     project = application.configure_project(project_url=PROJECT_URL)
     application.bind_map(project_id=project["id"], issue_url=ISSUE_URL)
@@ -278,6 +302,22 @@ def _application(tmp_path, *, authorized=True):
             confirmed_at="2026-08-23T23:31:00Z",
         )
     return application, tracker, prerequisites, runtime
+
+
+def test_commissioning_uses_one_structured_prompt_and_returns_pm_idle(tmp_path):
+    application, tracker, _, runtime = _application(tmp_path, durable_resume=True)
+
+    result = application.commission_map(map_id=MAP_ID, request_identity=CEO)
+
+    assert result["state"] == "active"
+    assert tracker.transition_calls == 1
+    assert runtime.prompt_calls == 1
+    assert runtime.resume_calls == 0
+    assignment = application._storage.pm_assignment(MAP_ID)
+    assert assignment["state"] == "idle"
+    assert assignment["last_turn_id"] == f"commission-ready:{MAP_ID}"
+    assert assignment["last_outcome"] == "report"
+    assert assignment["last_outcome_id"] == "commission-ready-I_atlas_41"
 
 
 def test_commission_fails_closed_before_runtime_when_authorization_is_missing(tmp_path):

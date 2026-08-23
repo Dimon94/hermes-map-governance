@@ -56,6 +56,7 @@ def application_for_storage(
         event_settings=BoardEventSettings(**dict(event_settings or {})),
         commissioning_prerequisites=commissioning_prerequisites,
         coordinator_runtime=coordinator_runtime,
+        coordinator_resume=coordinator_runtime,
     )
     if recover_pending:
         application.recover_outbox()
