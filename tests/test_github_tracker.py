@@ -5,6 +5,7 @@ import json
 import pytest
 
 from map_governance.approvals import ApprovalHistoryEvent
+from map_governance.reports import PMReport, PMReportDraft
 from map_governance.tracker import (
     GitHubTrackerAdapter,
     StructuredDecision,
@@ -465,3 +466,115 @@ def test_github_approval_history_paginates_and_ignores_other_comments():
     assert [value for value in runner.calls[1] if value.startswith("after=")] == [
         "after=cursor-a"
     ]
+
+
+def test_github_pm_report_is_human_readable_and_round_trips_its_machine_marker():
+    report = PMReport(
+        assignment_map_id="I_atlas_41",
+        content=PMReportDraft(
+            record_id="pm-question-001",
+            report_type="question",
+            summary="Choose whether the import may preserve legacy aliases.",
+            timestamp="2026-08-23T10:15:00Z",
+            blocking=False,
+            continuation_requirement=(
+                "An explicit yes/no answer about legacy aliases."
+            ),
+        ),
+    )
+    runner = ScriptedRunner()
+
+    def echo_mutation(arguments):
+        runner.calls.append(list(arguments))
+        body = next(
+            value.removeprefix("body=")
+            for value in arguments
+            if value.startswith("body=")
+        )
+        return json.dumps(
+            {
+                "data": {
+                    "addComment": {
+                        "commentEdge": {
+                            "node": {
+                                "id": "IC_pm_question_1",
+                                "url": f"{_issue_resource()['url']}#issuecomment-pm-1",
+                                "body": body,
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+    runner.run = echo_mutation
+    record = GitHubTrackerAdapter(runner=runner).append_pm_report(
+        _issue_resource()["url"],
+        issue_id="I_atlas_41",
+        report=report,
+    )
+
+    assert record.report == report
+    body = next(
+        value.removeprefix("body=")
+        for value in runner.calls[0]
+        if value.startswith("body=")
+    )
+    assert "mutation MapGovernanceAppendPMReport" in next(
+        value.removeprefix("query=")
+        for value in runner.calls[0]
+        if value.startswith("query=")
+    )
+    assert "<!-- map-governance:pm-report:v1 " in body
+    assert "## PM question · pm-question-001" in body
+    assert "Blocking: no" in body
+    assert "Needed to continue: An explicit yes/no answer" in body
+
+
+def test_github_pm_report_history_reconstructs_authoritative_records():
+    report = PMReport(
+        assignment_map_id="I_atlas_41",
+        content=PMReportDraft(
+            record_id="pm-acceptance-001",
+            report_type="acceptance",
+            summary="Outcome evidence is ready for executive review.",
+            timestamp="2026-08-23T10:30:00Z",
+            evidence=("The outcome-level acceptance suite passed.",),
+        ),
+    )
+    marker = json.dumps(
+        report.payload(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    runner = ScriptedRunner(
+        {
+            "data": {
+                "resource": {
+                    "__typename": "Issue",
+                    "comments": {
+                        "nodes": [
+                            {"id": "IC_plain", "url": "plain", "body": "ordinary"},
+                            {
+                                "id": "IC_pm_acceptance_1",
+                                "url": "acceptance",
+                                "body": (
+                                    f"<!-- map-governance:pm-report:v1 {marker} -->\n"
+                                    "## PM acceptance"
+                                ),
+                            },
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                }
+            }
+        }
+    )
+
+    records = GitHubTrackerAdapter(runner=runner).list_pm_reports(
+        _issue_resource()["url"]
+    )
+
+    assert [record.report for record in records] == [report]
+    assert records[0].tracker_record_id == "IC_pm_acceptance_1"

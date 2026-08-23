@@ -90,7 +90,40 @@ function fetchJSON(path, options) {
         },
       ],
       approvals: approval ? { count: 1, items: [approval] } : { count: 0, items: [] },
-      delivery_summary: { state: "not_reported" },
+      delivery_summary: mode === "pm-report" ? {
+        state: "reported",
+        count: 2,
+        latest: {
+          assignment_map_id: "I_atlas_41",
+          record_id: "failure-dashboard-001",
+          type: "failure",
+          summary: "Delivery terminated because the source contract is invalid.",
+          timestamp: "2026-08-23T10:05:00Z",
+          failure_code: "invalid-source-contract",
+        },
+        badges: [
+          { type: "terminal_failure", count: 1 },
+        ],
+      } : { state: "not_reported" },
+      pm_reports: mode === "pm-report" ? [
+        {
+          assignment_map_id: "I_atlas_41",
+          record_id: "failure-dashboard-001",
+          type: "failure",
+          summary: "Delivery terminated because the source contract is invalid.",
+          timestamp: "2026-08-23T10:05:00Z",
+          failure_code: "invalid-source-contract",
+        },
+        {
+          assignment_map_id: "I_atlas_41",
+          record_id: "question-dashboard-001",
+          type: "question",
+          summary: "May legacy aliases remain available?",
+          timestamp: "2026-08-23T10:02:00Z",
+          blocking: false,
+          continuation_requirement: "A yes/no answer about legacy aliases.",
+        },
+      ] : [],
     });
   }
   if (path.includes("/refresh?profile=")) {
@@ -111,9 +144,15 @@ function fetchJSON(path, options) {
           url: "https://github.com/acme/atlas/issues/41",
         },
         title: "Map the Atlas launch",
-        stage: mode === "approval" ? "awaiting-approval" : "authorized",
+        stage: mode === "approval"
+          ? "awaiting-approval"
+          : mode === "pm-report"
+            ? "delivery"
+            : "authorized",
         available_transitions: mode === "approval"
           ? ["authorized", "discovery", "parked"]
+          : mode === "pm-report"
+            ? ["decision", "acceptance", "parked"]
           : ["delivery", "parked"],
         decision_summary: {
           count: 1,
@@ -134,6 +173,21 @@ function fetchJSON(path, options) {
             status: chairmanDecisionRecorded ? "approved" : "pending",
           },
         } : { count: 0, pending_count: 0, latest: null },
+        delivery_summary: mode === "pm-report" ? {
+          state: "reported",
+          count: 2,
+          latest: {
+            assignment_map_id: "I_atlas_41",
+            record_id: "failure-dashboard-001",
+            type: "failure",
+            summary: "Delivery terminated because the source contract is invalid.",
+            timestamp: "2026-08-23T10:05:00Z",
+            failure_code: "invalid-source-contract",
+          },
+          badges: [
+            { type: "terminal_failure", count: 1 },
+          ],
+        } : { state: "not_reported" },
         ceo_session: mode === "ready" || mode === "hydration-retry"
           ? { state: "ready", last_activity_at: "2026-08-23T09:05:00Z" }
           : { state: "unbound" },
@@ -273,7 +327,10 @@ if (mode !== "empty") {
   assert.match(renderedText, /Acme CEO portfolio/);
   assert.match(renderedText, /Map the Atlas launch/);
   assert.match(renderedText, /acme\/atlas#41/);
-  assert.match(renderedText, mode === "approval" ? /awaiting-approval/ : /authorized/);
+  assert.match(
+    renderedText,
+    mode === "approval" ? /awaiting-approval/ : mode === "pm-report" ? /delivery/ : /authorized/,
+  );
   assert.match(renderedText, /1 confirmed decision/);
   assert.match(renderedText, /product/);
   assert.match(renderedText, /Launch to the research cohort before widening access/);
@@ -305,7 +362,20 @@ if (mode !== "empty") {
       ? /Chairman approval packets.*approval-delivery-001.*Delivery evidence is ready/s
       : /Chairman approval packets No approval requests/,
   );
-  assert.match(detailText, /Delivery: not_reported/);
+  assert.match(
+    detailText,
+    mode === "pm-report" ? /Delivery: reported/ : /Delivery: not_reported/,
+  );
+  if (mode === "pm-report") {
+    assert.match(renderedText, /2 PM executive reports/);
+    assert.match(renderedText, /terminal failure/i);
+    assert.match(renderedText, /Delivery terminated because the source contract is invalid/);
+    assert.match(detailText, /PM executive reports/);
+    assert.match(detailText, /failure-dashboard-001/);
+    assert.match(detailText, /question-dashboard-001/);
+    assert.match(detailText, /A yes\/no answer about legacy aliases/);
+    assert.doesNotMatch(detailText, /worker lane|worktree|pane log|implementation ticket/i);
+  }
   if (mode === "approval") {
     assert.match(detailText, /Alternatives.*Authorize delivery.*Return to discovery/s);
     assert.match(detailText, /Cost \/ risk: Two engineering weeks/);
@@ -404,7 +474,11 @@ if (mode !== "empty") {
   const transitionButton = findNode(
     readyTree,
     (node) => node.type === "Button" && new RegExp(
-      mode === "approval" ? "Move to authorized" : "Move to delivery",
+      mode === "approval"
+        ? "Move to authorized"
+        : mode === "pm-report"
+          ? "Move to decision"
+          : "Move to delivery",
     ).test(textContent(node)),
   );
   assert.ok(transitionButton, "Map card exposes an explicit governed transition control");
@@ -414,7 +488,7 @@ if (mode !== "empty") {
 
   hookIndex = 0;
   const pendingTree = registeredPage();
-  assert.match(textContent(pendingTree), /authorized/);
+  assert.match(textContent(pendingTree), mode === "pm-report" ? /delivery/ : /authorized/);
 
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
@@ -428,8 +502,8 @@ if (mode !== "empty") {
     assert.equal(requestedOptions[transitionIndex].method, "POST");
     assert.deepEqual(JSON.parse(requestedOptions[transitionIndex].body), {
       map_id: "I_atlas_41",
-      expected_stage: "authorized",
-      requested_stage: "delivery",
+      expected_stage: mode === "pm-report" ? "delivery" : "authorized",
+      requested_stage: mode === "pm-report" ? "decision" : "delivery",
     });
   }
   if (mode === "transition-failure") {
@@ -470,5 +544,7 @@ process.stdout.write(
       ? "dashboard transition failure ready\n"
     : mode === "approval"
       ? "dashboard chairman approval ready\n"
+    : mode === "pm-report"
+      ? "dashboard PM reporting ready\n"
       : "dashboard board ready\n",
 );

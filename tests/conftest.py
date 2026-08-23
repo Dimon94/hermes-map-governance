@@ -54,7 +54,14 @@ if "projectV2" in query:
     }
     owner_field = "organization" if owner_type == "Organization" else "user"
     payload = {"data": {owner_field: {"projectV2": resource}}}
-elif "MapGovernanceDecisionHistory" in query:
+elif any(
+    name in query
+    for name in (
+        "MapGovernanceDecisionHistory",
+        "MapGovernanceApprovalHistory",
+        "MapGovernancePMReportHistory",
+    )
+):
     url = next(value.removeprefix("url=") for value in arguments if value.startswith("url="))
     payload = {
         "data": {

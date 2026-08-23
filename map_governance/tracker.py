@@ -6,11 +6,15 @@ import json
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence, TypeVar
 from urllib.parse import urlparse
 
 from .approvals import ApprovalHistoryEvent, normalized_json
+from .reports import PMReport, TrackerPMReportRecord
 from .stages import ACTIVE_STAGES, executive_stage
+
+
+StructuredRecord = TypeVar("StructuredRecord")
 
 
 class TrackerError(RuntimeError):
@@ -167,6 +171,16 @@ class TrackerAdapter(Protocol):
         event: ApprovalHistoryEvent,
     ) -> TrackerApprovalRecord: ...
 
+    def list_pm_reports(self, url: str) -> list[TrackerPMReportRecord]: ...
+
+    def append_pm_report(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        report: PMReport,
+    ) -> TrackerPMReportRecord: ...
+
 
 class CommandRunner(Protocol):
     def run(self, arguments: Sequence[str]) -> str: ...
@@ -286,6 +300,12 @@ _APPEND_APPROVAL_MUTATION = _APPEND_DECISION_MUTATION.replace(
 )
 
 
+_APPEND_PM_REPORT_MUTATION = _APPEND_DECISION_MUTATION.replace(
+    "MapGovernanceAppendDecision",
+    "MapGovernanceAppendPMReport",
+)
+
+
 _DECISION_HISTORY_QUERY = """
 query MapGovernanceDecisionHistory($url: URI!, $after: String) {
   resource(url: $url) {
@@ -308,10 +328,18 @@ _APPROVAL_HISTORY_QUERY = _DECISION_HISTORY_QUERY.replace(
 )
 
 
+_PM_REPORT_HISTORY_QUERY = _DECISION_HISTORY_QUERY.replace(
+    "MapGovernanceDecisionHistory",
+    "MapGovernancePMReportHistory",
+)
+
+
 _DECISION_MARKER_PREFIX = "<!-- map-governance:decision:v1 "
 _DECISION_MARKER_SUFFIX = " -->"
 _APPROVAL_MARKER_PREFIX = "<!-- map-governance:approval:v1 "
 _APPROVAL_MARKER_SUFFIX = " -->"
+_PM_REPORT_MARKER_PREFIX = "<!-- map-governance:pm-report:v1 "
+_PM_REPORT_MARKER_SUFFIX = " -->"
 
 
 class GitHubTrackerAdapter:
@@ -495,25 +523,16 @@ class GitHubTrackerAdapter:
     ) -> TrackerDecisionRecord:
         """Append one structured CEO decision comment to a bound Issue."""
         body = self._decision_comment_body(decision)
-        payload = self._graphql(
-            _APPEND_DECISION_MUTATION,
-            subject=issue_id,
+        committed_decision, record_id, record_url = self._append_structured_comment(
+            query=_APPEND_DECISION_MUTATION,
+            subject_id=issue_id,
             body=body,
+            parser=self._decision_from_comment,
+            expected=decision,
+            record_kind="decision",
+            requested_kind="decision",
+            url=url,
         )
-        try:
-            node = payload["data"]["addComment"]["commentEdge"]["node"]
-            record_id = str(node["id"])
-            record_url = str(node["url"])
-            committed_body = str(node["body"])
-        except (KeyError, TypeError) as error:
-            raise TrackerError(
-                "GitHub decision mutation response is incomplete"
-            ) from error
-        committed_decision = self._decision_from_comment(committed_body)
-        if committed_decision != decision:
-            raise TrackerError(
-                f"GitHub did not return the requested decision comment: {url}"
-            )
         return TrackerDecisionRecord(
             decision=committed_decision,
             tracker_record_id=record_id,
@@ -544,25 +563,16 @@ class GitHubTrackerAdapter:
         event: ApprovalHistoryEvent,
     ) -> TrackerApprovalRecord:
         """Append one human- and machine-readable approval history event."""
-        payload = self._graphql(
-            _APPEND_APPROVAL_MUTATION,
-            subject=issue_id,
+        committed_event, record_id, record_url = self._append_structured_comment(
+            query=_APPEND_APPROVAL_MUTATION,
+            subject_id=issue_id,
             body=self._approval_comment_body(event),
+            parser=self._approval_from_comment,
+            expected=event,
+            record_kind="approval",
+            requested_kind="approval event",
+            url=url,
         )
-        try:
-            node = payload["data"]["addComment"]["commentEdge"]["node"]
-            record_id = str(node["id"])
-            record_url = str(node["url"])
-            committed_body = str(node["body"])
-        except (KeyError, TypeError) as error:
-            raise TrackerError(
-                "GitHub approval mutation response is incomplete"
-            ) from error
-        committed_event = self._approval_from_comment(committed_body)
-        if committed_event != event:
-            raise TrackerError(
-                f"GitHub did not return the requested approval event: {url}"
-            )
         return TrackerApprovalRecord(
             event=committed_event,
             tracker_record_id=record_id,
@@ -584,6 +594,75 @@ class GitHubTrackerAdapter:
                 record_kind="approval",
             )
         ]
+
+    def append_pm_report(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        report: PMReport,
+    ) -> TrackerPMReportRecord:
+        """Append one executive PM report to a bound Map Issue."""
+        committed_report, record_id, record_url = self._append_structured_comment(
+            query=_APPEND_PM_REPORT_MUTATION,
+            subject_id=issue_id,
+            body=self._pm_report_comment_body(report),
+            parser=self._pm_report_from_comment,
+            expected=report,
+            record_kind="PM report",
+            requested_kind="PM report",
+            url=url,
+        )
+        return TrackerPMReportRecord(
+            report=committed_report,
+            tracker_record_id=record_id,
+            tracker_record_url=record_url,
+        )
+
+    def list_pm_reports(self, url: str) -> list[TrackerPMReportRecord]:
+        """Read all structured PM reports from complete Issue history."""
+        return [
+            TrackerPMReportRecord(
+                report=self._pm_report_from_comment(body),
+                tracker_record_id=record_id,
+                tracker_record_url=record_url,
+            )
+            for body, record_id, record_url in self._structured_comment_history(
+                url,
+                query=_PM_REPORT_HISTORY_QUERY,
+                marker_prefix=_PM_REPORT_MARKER_PREFIX,
+                record_kind="PM report",
+            )
+        ]
+
+    def _append_structured_comment(
+        self,
+        *,
+        query: str,
+        subject_id: str,
+        body: str,
+        parser: Callable[[str], StructuredRecord],
+        expected: StructuredRecord,
+        record_kind: str,
+        requested_kind: str,
+        url: str,
+    ) -> tuple[StructuredRecord, str, str]:
+        payload = self._graphql(query, subject=subject_id, body=body)
+        try:
+            node = payload["data"]["addComment"]["commentEdge"]["node"]
+            record_id = str(node["id"])
+            record_url = str(node["url"])
+            committed_body = str(node["body"])
+        except (KeyError, TypeError) as error:
+            raise TrackerError(
+                f"GitHub {record_kind} mutation response is incomplete"
+            ) from error
+        committed = parser(committed_body)
+        if committed != expected:
+            raise TrackerError(
+                f"GitHub did not return the requested {requested_kind} comment: {url}"
+            )
+        return committed, record_id, record_url
 
     def _structured_comment_history(
         self,
@@ -667,24 +746,13 @@ class GitHubTrackerAdapter:
 
     @staticmethod
     def _decision_from_comment(body: str) -> StructuredDecision:
-        marker_line = next(
-            (
-                line
-                for line in body.splitlines()
-                if line.startswith(_DECISION_MARKER_PREFIX)
-                and line.endswith(_DECISION_MARKER_SUFFIX)
-            ),
-            None,
-        )
-        if marker_line is None:
-            raise TrackerError("GitHub decision comment has no structured marker")
-        encoded = marker_line[
-            len(_DECISION_MARKER_PREFIX) : -len(_DECISION_MARKER_SUFFIX)
-        ]
         try:
-            payload = json.loads(encoded)
-            if not isinstance(payload, dict):
-                raise TypeError("decision marker payload is not an object")
+            payload = GitHubTrackerAdapter._structured_marker_payload(
+                body,
+                prefix=_DECISION_MARKER_PREFIX,
+                suffix=_DECISION_MARKER_SUFFIX,
+                record_kind="decision",
+            )
             return StructuredDecision(**payload)
         except (TypeError, ValueError) as error:
             raise TrackerError("GitHub decision comment marker is invalid") from error
@@ -729,27 +797,86 @@ class GitHubTrackerAdapter:
 
     @staticmethod
     def _approval_from_comment(body: str) -> ApprovalHistoryEvent:
+        try:
+            payload = GitHubTrackerAdapter._structured_marker_payload(
+                body,
+                prefix=_APPROVAL_MARKER_PREFIX,
+                suffix=_APPROVAL_MARKER_SUFFIX,
+                record_kind="approval",
+            )
+            return ApprovalHistoryEvent(**payload)
+        except (TypeError, ValueError) as error:
+            raise TrackerError("GitHub approval comment marker is invalid") from error
+
+    @staticmethod
+    def _pm_report_comment_body(report: PMReport) -> str:
+        content = report.content
+        marker = json.dumps(
+            report.payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        lines = [
+            f"{_PM_REPORT_MARKER_PREFIX}{marker}{_PM_REPORT_MARKER_SUFFIX}",
+            f"## PM {content.report_type} · {content.record_id}",
+            "",
+            f"- Assigned Map: {report.assignment_map_id}",
+            f"- Timestamp: {content.timestamp}",
+        ]
+        if content.blocking is not None:
+            lines.append(f"- Blocking: {'yes' if content.blocking else 'no'}")
+        if content.continuation_requirement is not None:
+            lines.append(f"- Needed to continue: {content.continuation_requirement}")
+        if content.failure_code is not None:
+            lines.append(f"- Failure code: {content.failure_code}")
+        lines.extend(("", content.summary))
+        if content.evidence:
+            lines.extend(("", "### Executive evidence"))
+            lines.extend(f"- {item}" for item in content.evidence)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _pm_report_from_comment(body: str) -> PMReport:
+        try:
+            payload = GitHubTrackerAdapter._structured_marker_payload(
+                body,
+                prefix=_PM_REPORT_MARKER_PREFIX,
+                suffix=_PM_REPORT_MARKER_SUFFIX,
+                record_kind="PM report",
+            )
+            return PMReport.from_payload(payload)
+        except (TypeError, ValueError) as error:
+            raise TrackerError("GitHub PM report comment marker is invalid") from error
+
+    @staticmethod
+    def _structured_marker_payload(
+        body: str,
+        *,
+        prefix: str,
+        suffix: str,
+        record_kind: str,
+    ) -> dict[str, Any]:
         marker_line = next(
             (
                 line
                 for line in body.splitlines()
-                if line.startswith(_APPROVAL_MARKER_PREFIX)
-                and line.endswith(_APPROVAL_MARKER_SUFFIX)
+                if line.startswith(prefix) and line.endswith(suffix)
             ),
             None,
         )
         if marker_line is None:
-            raise TrackerError("GitHub approval comment has no structured marker")
-        encoded = marker_line[
-            len(_APPROVAL_MARKER_PREFIX) : -len(_APPROVAL_MARKER_SUFFIX)
-        ]
+            raise TrackerError(f"GitHub {record_kind} comment has no structured marker")
+        encoded = marker_line[len(prefix) : -len(suffix)]
         try:
             payload = json.loads(encoded)
-            if not isinstance(payload, dict):
-                raise TypeError("approval marker payload is not an object")
-            return ApprovalHistoryEvent(**payload)
-        except (TypeError, ValueError) as error:
-            raise TrackerError("GitHub approval comment marker is invalid") from error
+        except ValueError as error:
+            raise TrackerError(
+                f"GitHub {record_kind} comment marker is invalid"
+            ) from error
+        if not isinstance(payload, dict):
+            raise TrackerError(f"GitHub {record_kind} comment marker is invalid")
+        return payload
 
     def _resource(self, query: str, url: str, **variables: str) -> dict:
         payload = self._graphql(query, url=url, **variables)

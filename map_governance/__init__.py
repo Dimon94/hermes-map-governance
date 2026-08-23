@@ -12,6 +12,8 @@ from .application import (
     MapTransitionConflict,
     MapTransitionError,
     StructuredDecisionConflict,
+    PMReportConflict,
+    TrackerPMReportConfirmationError,
     TrackerDecisionConfirmationError,
     TrackerApprovalConfirmationError,
 )
@@ -21,6 +23,7 @@ from .approvals import (
     GovernanceActorIdentity,
 )
 from .tracker import StructuredDecision
+from .reports import PMReport, PMReportDraft
 
 __all__ = [
     "ApprovalEnforcementError",
@@ -37,7 +40,11 @@ __all__ = [
     "MapTransitionConflict",
     "MapTransitionError",
     "StructuredDecisionConflict",
+    "PMReport",
+    "PMReportConflict",
+    "PMReportDraft",
     "StructuredDecision",
     "TrackerDecisionConfirmationError",
+    "TrackerPMReportConfirmationError",
     "TrackerApprovalConfirmationError",
 ]

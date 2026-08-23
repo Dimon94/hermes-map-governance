@@ -18,7 +18,11 @@ projection。每个 Map 现在会在显式 CEO profile 中 exact-adopt 或创建
 Hermes 会话，并在首次创建时以 user turn 写入 Map bootstrap。插件注册显式
 `map-governance:ceo` Skill 与固定 `map-governance-ceo` toolset；canonical CEO 会话可读取
 executive state，并把带稳定 `decision_id`、type、rationale、authority、affected stage 和
-timestamp 的结构化决策写入 Map Issue comment。交付编排仍由后续票交付。
+timestamp 的结构化决策写入 Map Issue comment。插件还独立注册 `map-governance:pm`
+Skill 与 `map-governance-pm` toolset。PM request 只能使用持久 assignment 解析其 Map，
+并可提交 checkpoint、question、blocker、acceptance evidence 和 terminal failure；真实
+PM contract 固定 `dispatch_runtime: herdr`，但 Herdr commissioning 与 worker dispatch
+transport 仍由后续票交付；本票只预留 bounded coordinator bridge。
 新建或既有 canonical lineage 都会在当前 live continuation 幂等加载完整 CEO Skill user
 turn，因此从 #6 升级和 context compression 后仍保留同一 negative-capability 边界。
 CEO 还可提交内容绑定的 chairman approval packet；Dashboard Map detail 只提供显式
@@ -111,12 +115,25 @@ canonical request policy 与审计在工作流层隔离 CEO 和 worker 权限，
 不能由模型声明其他角色权限。
 决策 mutation 后必须从 Issue history 读回同一 payload 才会更新本地 projection；同一
 `decision_id` + 同一 payload 的重试只保留一条 tracker decision，不同 payload 会被拒绝。
-Maps 卡片显示 confirmed decision 与 approval 状态摘要；页面的 Map detail 显示 packet
+Maps 卡片显示 confirmed decision、approval 与 PM executive report 摘要；页面的 Map detail 显示 packet
 alternatives、rationale、cost/risk、scope、evidence、payload hash、status 与 expiry。
 Approval 的 pending/approved/rejected/revision/revoked/expired/consumed 生命周期及历史
 保存在 ledger；缺失、过期、撤销、已消费或 action/scope/content 不匹配均在 tracker
 mutation 前拒绝并写入既有 denial audit。相同 mutation id 可恢复重试，另一个 mutation
-不能重放同一 grant；delivery summary 在后续票接入前仍明确返回 `not_reported`。
+不能重放同一 grant。PM report 使用稳定 record id 与 `map-governance:pm-report:v1`
+machine marker；tracker history 读回确认后才更新 delivery summary、badge 与允许的治理阶段。
+同 payload 重试幂等，同 id 异 payload 冲突。non-blocking question 保持 `delivery`；只有
+whole-Map question/blocker 才可投影 `decision`，terminal failure 只形成高管可读报告，acceptance evidence 只会
+请求进入 `acceptance`，不会自行批准、关闭或发布 Map。badge 只表示最新 confirmed PM
+状态；后续 checkpoint、acceptance 或 failure 会取代已处理 question/blocker 的 pending badge，
+完整历史仍由 Issue comment 与 Map detail 保留。
+
+PM assignment 固定绑定 request-scoped profile/session 与一个 Map，不读取 process env。
+受控 coordinator application seam 以 `idle → active → idle` 运行；tracker-confirmed report
+或确认的 dispatch 结束后必须 idle，失败的 report 保持同一 active turn 供同 payload 重试，
+重启后可安全 resume。acceptance outcome evidence 可出现在 Map detail，但 worker checks、
+commands 与 lane activity 仍只属于 delivery artifacts。该 seam 不创建 implementation card，也不保存 pane、
+worktree、lane 或 worker log。
 
 Authority envelope 使用正常 Hermes plugin settings，不读取进程环境。默认 `product` 与
 `operational` 属于 CEO autonomy；delivery authorization、budget、scope、material

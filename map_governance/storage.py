@@ -14,7 +14,7 @@ from .approvals import normalized_json
 
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class PluginStorage:
@@ -201,6 +201,305 @@ class PluginStorage:
         """Serialize one Map's approval history and protected consumption."""
         with self._map_lease(namespace="approval", map_id=map_id):
             yield
+
+    @contextmanager
+    def pm_report_lease(self, map_id: str) -> Iterator[None]:
+        """Serialize one Map's PM report confirmation and projection."""
+        with self._map_lease(namespace="pm-report", map_id=map_id):
+            yield
+
+    def save_pm_assignment(
+        self,
+        *,
+        map_id: str,
+        profile_name: str,
+        session_id: str,
+        coordinator_id: str,
+        assigned_at: str,
+    ) -> bool:
+        """Persist one immutable PM request identity to Map relationship."""
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM pm_assignments WHERE map_id = ?",
+                (map_id,),
+            ).fetchone()
+            if existing is not None:
+                same = (
+                    existing["profile_name"] == profile_name
+                    and existing["session_id"] == session_id
+                    and existing["coordinator_id"] == coordinator_id
+                )
+                if not same:
+                    raise ValueError("Map already has a different PM assignment")
+                return True
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO pm_assignments(
+                        map_id, profile_name, session_id, coordinator_id,
+                        state, assigned_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'idle', ?, ?)
+                    """,
+                    (
+                        map_id,
+                        profile_name,
+                        session_id,
+                        coordinator_id,
+                        assigned_at,
+                        assigned_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(
+                    "PM request identity is already assigned to another Map"
+                ) from error
+        return False
+
+    def pm_assignment(self, map_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pm_assignments WHERE map_id = ?",
+                (map_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def pm_assignment_for_request(
+        self,
+        *,
+        profile_name: str,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pm_assignments
+                WHERE profile_name = ? AND session_id = ?
+                """,
+                (profile_name, session_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def begin_pm_turn(
+        self,
+        *,
+        map_id: str,
+        coordinator_id: str,
+        turn_id: str,
+        started_at: str,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pm_assignments WHERE map_id = ?",
+                (map_id,),
+            ).fetchone()
+            if row is None or row["coordinator_id"] != coordinator_id:
+                raise ValueError("PM coordinator does not own this assignment")
+            if row["state"] == "active":
+                if row["active_turn_id"] == turn_id:
+                    return True
+                raise ValueError("PM assignment already has an active turn")
+            connection.execute(
+                """
+                UPDATE pm_assignments
+                SET state = 'active', active_turn_id = ?, updated_at = ?
+                WHERE map_id = ? AND state = 'idle'
+                """,
+                (turn_id, started_at, map_id),
+            )
+        return False
+
+    def finish_pm_turn(
+        self,
+        *,
+        map_id: str,
+        turn_id: str,
+        outcome: str,
+        outcome_id: str,
+        finished_at: str,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pm_assignments WHERE map_id = ?",
+                (map_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("PM assignment is missing")
+            if row["state"] == "idle":
+                if (
+                    row["last_turn_id"] == turn_id
+                    and row["last_outcome"] == outcome
+                    and row["last_outcome_id"] == outcome_id
+                ):
+                    return True
+                raise ValueError("PM turn is not active")
+            if row["active_turn_id"] != turn_id:
+                raise ValueError("PM turn identity does not match the active turn")
+            connection.execute(
+                """
+                UPDATE pm_assignments
+                SET state = 'idle', active_turn_id = NULL, last_turn_id = ?,
+                    last_outcome = ?, last_outcome_id = ?, updated_at = ?
+                WHERE map_id = ?
+                """,
+                (turn_id, outcome, outcome_id, finished_at, map_id),
+            )
+        return False
+
+    def save_pm_report_projection(
+        self,
+        *,
+        map_id: str,
+        report: dict[str, Any],
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO pm_report_projections(
+                    map_id, record_id, report_type, summary, reported_at,
+                    evidence_json, blocking, continuation_requirement,
+                    failure_code, tracker_record_id, tracker_record_url,
+                    confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(map_id, record_id) DO UPDATE SET
+                    report_type = excluded.report_type,
+                    summary = excluded.summary,
+                    reported_at = excluded.reported_at,
+                    evidence_json = excluded.evidence_json,
+                    blocking = excluded.blocking,
+                    continuation_requirement = excluded.continuation_requirement,
+                    failure_code = excluded.failure_code,
+                    tracker_record_id = excluded.tracker_record_id,
+                    tracker_record_url = excluded.tracker_record_url,
+                    confirmed_at = excluded.confirmed_at
+                """,
+                self._pm_report_projection_values(map_id, report),
+            )
+
+    def replace_pm_report_projections(
+        self,
+        *,
+        map_id: str,
+        reports: list[dict[str, Any]],
+    ) -> None:
+        """Atomically rebuild one Map's PM summary cache from tracker truth."""
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM pm_report_projections WHERE map_id = ?",
+                (map_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO pm_report_projections(
+                    map_id, record_id, report_type, summary, reported_at,
+                    evidence_json, blocking, continuation_requirement,
+                    failure_code, tracker_record_id, tracker_record_url,
+                    confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    self._pm_report_projection_values(map_id, report)
+                    for report in reports
+                ],
+            )
+
+    @staticmethod
+    def _pm_report_projection_values(
+        map_id: str,
+        report: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        return (
+            map_id,
+            report["record_id"],
+            report["type"],
+            report["summary"],
+            report["timestamp"],
+            json.dumps(report.get("evidence", []), ensure_ascii=False),
+            (int(report["blocking"]) if report.get("blocking") is not None else None),
+            report.get("continuation_requirement"),
+            report.get("failure_code"),
+            report["tracker"]["id"],
+            report["tracker"]["url"],
+            report["confirmed_at"],
+        )
+
+    def recent_pm_reports(
+        self,
+        *,
+        map_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM pm_report_projections
+                WHERE map_id = ?
+                ORDER BY julianday(reported_at) DESC, record_id DESC
+                LIMIT ?
+                """,
+                (map_id, limit),
+            ).fetchall()
+        reports = []
+        for row in rows:
+            report = {
+                "assignment_map_id": map_id,
+                "record_id": row["record_id"],
+                "type": row["report_type"],
+                "summary": row["summary"],
+                "timestamp": row["reported_at"],
+                "evidence": json.loads(row["evidence_json"]),
+                "tracker": {
+                    "id": row["tracker_record_id"],
+                    "url": row["tracker_record_url"],
+                },
+                "confirmed_at": row["confirmed_at"],
+            }
+            if row["blocking"] is not None:
+                report["blocking"] = bool(row["blocking"])
+            if row["continuation_requirement"] is not None:
+                report["continuation_requirement"] = row["continuation_requirement"]
+            if row["failure_code"] is not None:
+                report["failure_code"] = row["failure_code"]
+            reports.append(report)
+        return reports
+
+    def pm_delivery_summary(self, *, map_id: str) -> dict[str, Any]:
+        latest = self.recent_pm_reports(map_id=map_id, limit=1)
+        if not latest:
+            return {"state": "not_reported"}
+        with self._connect() as connection:
+            count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM pm_report_projections
+                    WHERE map_id = ?
+                    """,
+                    (map_id,),
+                ).fetchone()["count"]
+            )
+        latest_report = dict(latest[0])
+        latest_report.pop("evidence", None)
+        badge_type = {
+            ("question", False): "non_blocking_question",
+            ("question", True): "blocking_question",
+            ("blocker", False): "localized_blocker",
+            ("blocker", True): "whole_map_blocker",
+            ("acceptance", None): "acceptance_request",
+            ("failure", None): "terminal_failure",
+        }.get(
+            (
+                latest_report["type"],
+                latest_report.get("blocking"),
+            )
+        )
+        return {
+            "state": "reported",
+            "count": count,
+            "latest": latest_report,
+            "badges": (
+                [{"type": badge_type, "count": 1}] if badge_type is not None else []
+            ),
+        }
 
     @contextmanager
     def _map_lease(self, *, namespace: str, map_id: str) -> Iterator[None]:
@@ -1185,6 +1484,43 @@ class PluginStorage:
                 payload_hash TEXT NOT NULL,
                 tracker_record_id TEXT,
                 tracker_record_url TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pm_assignments (
+                map_id TEXT PRIMARY KEY REFERENCES map_bindings(map_id),
+                profile_name TEXT NOT NULL,
+                session_id TEXT NOT NULL UNIQUE,
+                coordinator_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('idle', 'active')),
+                active_turn_id TEXT,
+                last_turn_id TEXT,
+                last_outcome TEXT,
+                last_outcome_id TEXT,
+                assigned_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(profile_name, session_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pm_report_projections (
+                map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
+                record_id TEXT NOT NULL,
+                report_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                reported_at TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                blocking INTEGER,
+                continuation_requirement TEXT,
+                failure_code TEXT,
+                tracker_record_id TEXT NOT NULL,
+                tracker_record_url TEXT NOT NULL,
+                confirmed_at TEXT NOT NULL,
+                PRIMARY KEY(map_id, record_id)
             )
             """
         )

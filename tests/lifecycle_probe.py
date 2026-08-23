@@ -105,10 +105,13 @@ def main() -> int:
 
     discover_plugins()
     plugin_manager = get_plugin_manager()
-    assert plugin_manager.list_plugin_skills("map-governance") == ["ceo"]
+    assert plugin_manager.list_plugin_skills("map-governance") == ["ceo", "pm"]
     ceo_skill = plugin_manager.find_plugin_skill("map-governance:ceo")
+    pm_skill = plugin_manager.find_plugin_skill("map-governance:pm")
     assert ceo_skill is not None and ceo_skill.is_file()
+    assert pm_skill is not None and pm_skill.is_file()
     assert registry.snapshot_registration("map_governance_ceo", scope=None) is None
+    assert registry.snapshot_registration("map_governance_pm", scope=None) is None
     ceo_tool = registry.snapshot_registration(
         "map_governance_ceo",
         scope=plugin_manager.scope_key,
@@ -129,6 +132,26 @@ def main() -> int:
         definition["function"]["name"] for definition in ceo_definitions
     }
     assert ceo_definition_names == {"map_governance_ceo"}, ceo_definition_names
+    pm_tool = registry.snapshot_registration(
+        "map_governance_pm",
+        scope=plugin_manager.scope_key,
+    )
+    assert pm_tool is not None
+    assert pm_tool.toolset == "map-governance-pm"
+    assert pm_tool.toolset != ceo_tool.toolset
+    assert set(pm_tool.schema["parameters"]["properties"]["action"]["enum"]) == {
+        "inspect",
+        "report",
+    }
+    pm_definitions = get_tool_definitions(
+        enabled_toolsets=["map-governance-pm"],
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+    pm_definition_names = {
+        definition["function"]["name"] for definition in pm_definitions
+    }
+    assert pm_definition_names == {"map_governance_pm"}, pm_definition_names
 
     client = TestClient(web_server.app)
     auth = {"X-Hermes-Session-Token": os.environ["HERMES_DASHBOARD_SESSION_TOKEN"]}

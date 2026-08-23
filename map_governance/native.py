@@ -14,6 +14,7 @@ from .application import (
     MapTransitionError,
 )
 from .ceo_tool import register_ceo_capabilities
+from .pm_tool import register_pm_capabilities
 from .runtime import application_for_profile, application_for_storage
 from .tracker import TrackerError
 
@@ -72,6 +73,7 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
 def register(ctx) -> None:
     """Register the native diagnostic capability with Hermes."""
     register_ceo_capabilities(ctx)
+    register_pm_capabilities(ctx)
     get_config = getattr(ctx, "get_config", lambda _key, default=None: default)
     authority_settings = get_config("authority", {})
     application = (

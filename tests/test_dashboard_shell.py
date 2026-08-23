@@ -127,3 +127,23 @@ def test_map_detail_exposes_explicit_accessible_chairman_approval_actions():
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout == "dashboard chairman approval ready\n"
+
+
+def test_map_card_and_detail_render_pm_executive_summary_without_lane_cards():
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail("Node.js is required to exercise the dashboard plugin bundle")
+    result = subprocess.run(
+        [
+            node,
+            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
+            "pm-report",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "dashboard PM reporting ready\n"

@@ -32,6 +32,7 @@ from .sessions import (
     canonical_session_identity,
     canonical_session_title,
 )
+from .reports import PMReport, PMReportDraft, TrackerPMReportRecord
 from .tracker import (
     GitHubTrackerAdapter,
     TrackerAdapter,
@@ -100,6 +101,26 @@ class TrackerDecisionConfirmationError(TrackerError):
 
 class TrackerApprovalConfirmationError(TrackerError):
     """Raised when an approval event is not visible in tracker history."""
+
+
+class TrackerPMReportConfirmationError(TrackerError):
+    """Raised when a PM report is not visible in tracker Issue history."""
+
+
+class PMReportConflict(ValueError):
+    """Raised when one stable PM report id is reused for other content."""
+
+    def __init__(self, *, record_id: str) -> None:
+        self.record_id = record_id
+        super().__init__(f"PM report identity has a different payload: {record_id}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "pm_report_conflict",
+            "record_id": self.record_id,
+            "reason": "stable PM report identity belongs to another payload",
+            "retryable": False,
+        }
 
 
 class ApprovalRequestConflict(ValueError):
@@ -311,7 +332,7 @@ class MapGovernanceApplication:
             if card["id"] == map_id:
                 card["recent_decisions"] = self._storage.recent_decisions(map_id=map_id)
                 card["approvals"] = self._approval_collection(map_id=map_id)
-                card["delivery_summary"] = {"state": "not_reported"}
+                card["pm_reports"] = self._storage.recent_pm_reports(map_id=map_id)
                 return card
         raise MapBindingError(f"Map is not bound: {map_id}")
 
@@ -333,6 +354,396 @@ class MapGovernanceApplication:
             "approvals": detail["approvals"],
             "authority_envelope": self._authority_policy.projection(),
             "delivery_summary": detail["delivery_summary"],
+        }
+
+    def assign_pm(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        coordinator_id: str,
+    ) -> dict[str, Any]:
+        """Establish one immutable request-scoped PM assignment."""
+        if self._storage.map_binding(map_id) is None:
+            raise MapBindingError(f"Map is not bound: {map_id}")
+        if not request_identity.profile_name or not request_identity.session_id:
+            self._deny_governance_request(
+                map_id=map_id,
+                action="pm:assign",
+                request_identity=request_identity,
+                reason="pm_request_identity_missing",
+            )
+        if not isinstance(coordinator_id, str) or not coordinator_id.strip():
+            self._deny_governance_request(
+                map_id=map_id,
+                action="pm:assign",
+                request_identity=request_identity,
+                reason="pm_coordinator_identity_missing",
+            )
+        assigned_map = self._storage.pm_assignment_for_request(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+        )
+        if assigned_map is not None and assigned_map["map_id"] != map_id:
+            self._deny_governance_request(
+                map_id=map_id,
+                action="pm:assign",
+                request_identity=request_identity,
+                reason="pm_identity_assigned_to_another_map",
+            )
+        map_assignment = self._storage.pm_assignment(map_id)
+        if map_assignment is not None and (
+            map_assignment["profile_name"] != request_identity.profile_name
+            or map_assignment["session_id"] != request_identity.session_id
+            or map_assignment["coordinator_id"] != coordinator_id.strip()
+        ):
+            self._deny_governance_request(
+                map_id=map_id,
+                action="pm:assign",
+                request_identity=request_identity,
+                reason="pm_assignment_conflict",
+            )
+        try:
+            idempotent = self._storage.save_pm_assignment(
+                map_id=map_id,
+                profile_name=request_identity.profile_name,
+                session_id=request_identity.session_id,
+                coordinator_id=coordinator_id.strip(),
+                assigned_at=self._synchronized_at(),
+            )
+        except ValueError:
+            self._deny_governance_request(
+                map_id=map_id,
+                action="pm:assign",
+                request_identity=request_identity,
+                reason="pm_assignment_conflict",
+            )
+        assignment = self._storage.pm_assignment(map_id)
+        return {
+            "assignment": self._pm_assignment_projection(assignment),
+            "idempotent": idempotent,
+        }
+
+    def begin_pm_turn(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        coordinator_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        """Resume an assigned PM for one coordinator-controlled turn."""
+        self._authorize_pm_coordinator(
+            map_id=map_id,
+            action="pm:begin_turn",
+            request_identity=request_identity,
+            coordinator_id=coordinator_id,
+        )
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("PM turn requires a stable turn identity")
+        idempotent = self._storage.begin_pm_turn(
+            map_id=map_id,
+            coordinator_id=coordinator_id,
+            turn_id=turn_id.strip(),
+            started_at=self._synchronized_at(),
+        )
+        assignment = self._storage.pm_assignment(map_id)
+        return {
+            "coordinator": self._pm_assignment_projection(assignment),
+            "idempotent": idempotent,
+        }
+
+    def complete_pm_dispatch(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        coordinator_id: str,
+        turn_id: str,
+        dispatch_id: str,
+    ) -> dict[str, Any]:
+        """Record the coordinator's dispatch boundary and leave the PM idle."""
+        self._authorize_pm_coordinator(
+            map_id=map_id,
+            action="pm:dispatch",
+            request_identity=request_identity,
+            coordinator_id=coordinator_id,
+        )
+        for name, value in (("turn_id", turn_id), ("dispatch_id", dispatch_id)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"PM dispatch requires a stable {name}")
+        idempotent = self._storage.finish_pm_turn(
+            map_id=map_id,
+            turn_id=turn_id.strip(),
+            outcome="dispatch",
+            outcome_id=dispatch_id.strip(),
+            finished_at=self._synchronized_at(),
+        )
+        return {
+            "coordinator": self._pm_assignment_projection(
+                self._storage.pm_assignment(map_id)
+            ),
+            "idempotent": idempotent,
+        }
+
+    def report_pm(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+        report: PMReportDraft,
+    ) -> dict[str, Any]:
+        """Append a request-authorized PM report, then end the turn idle."""
+        assignment = self._storage.pm_assignment_for_request(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+        )
+        if assignment is None:
+            self._deny_governance_request(
+                map_id="unassigned",
+                action="pm:report",
+                request_identity=request_identity,
+                reason="pm_assignment_missing",
+            )
+        map_id = str(assignment["map_id"])
+        bound_report = report.assign_to(map_id)
+        binding = self._storage.map_binding(map_id)
+        if binding is None:
+            raise MapBindingError(f"Map is not bound: {map_id}")
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("pm-report", lock_key):
+            with self._storage.pm_report_lease(map_id):
+                active_turn_id = assignment.get("active_turn_id")
+                records = self._pm_report_records_by_id(
+                    self._tracker.list_pm_reports(binding["issue_url"])
+                )
+                confirmed = records.get(bound_report.content.record_id)
+                idempotent = confirmed is not None
+                if confirmed is None:
+                    if assignment["state"] != "active" or not active_turn_id:
+                        raise ValueError(
+                            "PM report requires an active coordinator turn"
+                        )
+                    self._tracker.append_pm_report(
+                        binding["issue_url"],
+                        issue_id=map_id,
+                        report=bound_report,
+                    )
+                    confirmed = self._pm_report_records_by_id(
+                        self._tracker.list_pm_reports(binding["issue_url"])
+                    ).get(bound_report.content.record_id)
+                    if confirmed is None:
+                        raise TrackerPMReportConfirmationError(
+                            "Tracker did not confirm the PM report in Issue history"
+                        )
+                if confirmed.report != bound_report:
+                    raise PMReportConflict(record_id=bound_report.content.record_id)
+                synchronized_at = self._project_pm_report_stage(
+                    binding=binding,
+                    report=bound_report,
+                )
+                projection = self._pm_report_projection(
+                    confirmed,
+                    confirmed_at=synchronized_at,
+                )
+                self._storage.save_pm_report_projection(
+                    map_id=map_id,
+                    report=projection,
+                )
+                result = {
+                    "map_id": map_id,
+                    "report": projection,
+                    "idempotent": idempotent,
+                }
+                if active_turn_id:
+                    self._storage.finish_pm_turn(
+                        map_id=map_id,
+                        turn_id=str(active_turn_id),
+                        outcome="report",
+                        outcome_id=bound_report.content.record_id,
+                        finished_at=self._synchronized_at(),
+                    )
+                result["coordinator"] = self._pm_assignment_projection(
+                    self._storage.pm_assignment(map_id)
+                )
+                return result
+
+    def pm_state(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+    ) -> dict[str, Any]:
+        """Return the assigned PM's executive-only resumable state."""
+        assignment = self._storage.pm_assignment_for_request(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+        )
+        if assignment is None:
+            self._deny_governance_request(
+                map_id="unassigned",
+                action="pm:inspect",
+                request_identity=request_identity,
+                reason="pm_assignment_missing",
+            )
+        map_id = str(assignment["map_id"])
+        detail = self.map_detail(map_id=map_id)
+        return {
+            "assignment": {
+                "map": {
+                    "id": map_id,
+                    "tracker": detail["tracker"],
+                    "title": detail["title"],
+                    "stage": detail["stage"],
+                },
+                "coordinator": self._pm_assignment_projection(assignment),
+            },
+            "delivery_summary": detail["delivery_summary"],
+            "recent_decisions": detail["recent_decisions"],
+        }
+
+    def enforce_assigned_pm_toolset(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+        tool_name: str,
+        allowed_tool_names: frozenset[str],
+    ) -> bool:
+        """Block non-PM tools only inside a persistently assigned PM session."""
+        assignment = self._storage.pm_assignment_for_request(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+        )
+        if assignment is None:
+            return False
+        if tool_name in allowed_tool_names:
+            return True
+        self._deny_governance_request(
+            map_id=str(assignment["map_id"]),
+            action=f"invoke_tool:{tool_name}",
+            request_identity=request_identity,
+            reason="tool_outside_pm_toolset",
+        )
+
+    def _authorize_pm_coordinator(
+        self,
+        *,
+        map_id: str,
+        action: str,
+        request_identity: GovernanceRequestIdentity,
+        coordinator_id: str,
+    ) -> dict[str, Any]:
+        assignment = self._storage.pm_assignment(map_id)
+        if assignment is None:
+            self._deny_governance_request(
+                map_id=map_id,
+                action=action,
+                request_identity=request_identity,
+                reason="pm_assignment_missing",
+            )
+        if (
+            assignment["profile_name"] != request_identity.profile_name
+            or assignment["session_id"] != request_identity.session_id
+        ):
+            self._deny_governance_request(
+                map_id=map_id,
+                action=action,
+                request_identity=request_identity,
+                reason="pm_assignment_request_mismatch",
+            )
+        if assignment["coordinator_id"] != coordinator_id:
+            self._deny_governance_request(
+                map_id=map_id,
+                action=action,
+                request_identity=request_identity,
+                reason="pm_coordinator_mismatch",
+            )
+        return assignment
+
+    def _project_pm_report_stage(
+        self,
+        *,
+        binding: dict[str, Any],
+        report: PMReport,
+    ) -> str:
+        """Confirm any report-driven governance stage before local projection."""
+        issue = self._tracker.get_issue(binding["issue_url"])
+        if issue.id != report.assignment_map_id:
+            raise MapBindingError("Bound GitHub Issue identity changed")
+        current_stage = self._executive_stage(issue)
+        requested_stage = None
+        if current_stage == "delivery":
+            if report.content.report_type == "acceptance":
+                requested_stage = "acceptance"
+            elif (
+                report.content.report_type in {"question", "blocker"}
+                and report.content.blocking is True
+            ):
+                requested_stage = "decision"
+        if requested_stage is not None:
+            issue = self._tracker.transition_issue_stage(
+                binding["issue_url"],
+                expected_stage=current_stage,
+                requested_stage=requested_stage,
+            )
+            if issue.id != report.assignment_map_id:
+                raise MapBindingError(
+                    "Bound GitHub Issue identity changed during PM stage projection"
+                )
+            if self._executive_stage(issue) != requested_stage:
+                raise TrackerConflictError(
+                    current_stage=self._executive_stage(issue),
+                    requested_stage=requested_stage,
+                )
+        synchronized_at = self._synchronized_at()
+        self._storage.save_map_projection(
+            self._stored_card(
+                issue,
+                project_id=binding["project_id"],
+                synchronized_at=synchronized_at,
+            )
+        )
+        return synchronized_at
+
+    @staticmethod
+    def _pm_report_records_by_id(
+        records: list[TrackerPMReportRecord],
+    ) -> dict[str, TrackerPMReportRecord]:
+        by_id: dict[str, TrackerPMReportRecord] = {}
+        for record in records:
+            record_id = record.report.content.record_id
+            existing = by_id.get(record_id)
+            if existing is not None and existing.report != record.report:
+                raise PMReportConflict(record_id=record_id)
+            by_id.setdefault(record_id, record)
+        return by_id
+
+    @staticmethod
+    def _pm_report_projection(
+        record: TrackerPMReportRecord,
+        *,
+        confirmed_at: str,
+    ) -> dict[str, Any]:
+        return {
+            **record.report.payload(),
+            "tracker": {
+                "id": record.tracker_record_id,
+                "url": record.tracker_record_url,
+            },
+            "confirmed_at": confirmed_at,
+        }
+
+    @staticmethod
+    def _pm_assignment_projection(
+        assignment: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if assignment is None:
+            raise RuntimeError("PM assignment disappeared")
+        return {
+            "map_id": assignment["map_id"],
+            "state": assignment["state"],
+            "active_turn_id": assignment.get("active_turn_id"),
+            "last_turn_id": assignment.get("last_turn_id"),
+            "last_outcome": assignment.get("last_outcome"),
+            "last_outcome_id": assignment.get("last_outcome_id"),
         }
 
     def record_decision(
@@ -1428,6 +1839,11 @@ class MapGovernanceApplication:
             issue_url=issue.url,
             confirmed_at=synchronized_at,
         )
+        self._rebuild_pm_report_projection(
+            map_id=issue.id,
+            issue_url=issue.url,
+            confirmed_at=synchronized_at,
+        )
         return self._card_with_summary(
             card,
             project_url=project_binding["project_url"],
@@ -1463,6 +1879,11 @@ class MapGovernanceApplication:
                     issue_url=issue.url,
                     confirmed_at=synchronized_at,
                 )
+                self._rebuild_pm_report_projection(
+                    map_id=issue.id,
+                    issue_url=issue.url,
+                    confirmed_at=synchronized_at,
+                )
         return self.board()
 
     def _rebuild_decision_projection(
@@ -1480,6 +1901,31 @@ class MapGovernanceApplication:
         self._storage.replace_decision_projections(
             map_id=map_id,
             decisions=decisions,
+        )
+
+    def _rebuild_pm_report_projection(
+        self,
+        *,
+        map_id: str,
+        issue_url: str,
+        confirmed_at: str,
+    ) -> None:
+        list_reports = getattr(self._tracker, "list_pm_reports", None)
+        if list_reports is None:
+            return
+        records = self._pm_report_records_by_id(list_reports(issue_url))
+        reports = []
+        for record in records.values():
+            if record.report.assignment_map_id != map_id:
+                raise MapBindingError(
+                    "Tracker PM report belongs to another assigned Map"
+                )
+            reports.append(
+                self._pm_report_projection(record, confirmed_at=confirmed_at)
+            )
+        self._storage.replace_pm_report_projections(
+            map_id=map_id,
+            reports=reports,
         )
 
     def transition_map(
@@ -1932,6 +2378,7 @@ class MapGovernanceApplication:
             ),
             "latest": approvals["items"][0] if approvals["items"] else None,
         }
+        card["delivery_summary"] = self._storage.pm_delivery_summary(map_id=card["id"])
         return card
 
     @staticmethod

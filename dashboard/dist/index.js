@@ -60,6 +60,54 @@
     );
   }
 
+  function readableBadge(value) {
+    return String(value || "").replaceAll("_", " ");
+  }
+
+  function renderPMReport(report, key, className) {
+    return React.createElement(
+      "article",
+      {
+        key: key,
+        className: className,
+        "aria-label": "PM report " + report.record_id,
+      },
+      React.createElement(
+        "p",
+        { className: "font-medium text-foreground" },
+        report.type + " · " + report.record_id,
+      ),
+      React.createElement("p", null, report.summary),
+      report.blocking !== undefined
+        ? React.createElement("p", null, "Whole Map blocked: " + (report.blocking ? "yes" : "no"))
+        : null,
+      report.continuation_requirement
+        ? React.createElement(
+            "p",
+            null,
+            "Needed to continue: " + report.continuation_requirement,
+          )
+        : null,
+      report.failure_code
+        ? React.createElement("p", null, "Failure code: " + report.failure_code)
+        : null,
+      report.type === "acceptance" && (report.evidence || []).length
+        ? React.createElement(
+            "ul",
+            { className: "list-disc space-y-1 pl-5", "aria-label": "Executive evidence" },
+            report.evidence.map(function (item, index) {
+              return React.createElement("li", { key: index }, item);
+            }),
+          )
+        : null,
+      React.createElement(
+        "time",
+        { dateTime: report.timestamp },
+        report.timestamp,
+      ),
+    );
+  }
+
   function safeExternalUrl(value) {
     try {
       const parsed = new URL(value);
@@ -486,6 +534,38 @@
                         )
                       : null,
                   ),
+                  React.createElement(
+                    "section",
+                    { className: "space-y-2", "aria-label": "PM executive summary" },
+                    (card.delivery_summary || {}).state === "reported"
+                      ? React.createElement(
+                          "p",
+                          null,
+                          card.delivery_summary.count + " PM executive report"
+                            + (card.delivery_summary.count === 1 ? "" : "s"),
+                        )
+                      : React.createElement("p", null, "PM delivery not reported"),
+                    ((card.delivery_summary || {}).badges || []).length
+                      ? React.createElement(
+                          "div",
+                          { className: "flex flex-wrap gap-1", "aria-label": "PM report badges" },
+                          card.delivery_summary.badges.map(function (badge) {
+                            return React.createElement(
+                              Badge,
+                              { key: badge.type, variant: "outline" },
+                              readableBadge(badge.type) + " · " + badge.count,
+                            );
+                          }),
+                        )
+                      : null,
+                    (card.delivery_summary || {}).latest
+                      ? renderPMReport(
+                          card.delivery_summary.latest,
+                          "latest-pm-report",
+                          "space-y-1 rounded-md border p-2",
+                        )
+                      : null,
+                  ),
                   detailState.mapId === card.id && detailState.status === "ready"
                     ? React.createElement(
                         "section",
@@ -659,6 +739,24 @@
                                   );
                                 },
                               ),
+                        ),
+                        React.createElement(
+                          "section",
+                          { className: "space-y-2", "aria-label": "PM executive reports" },
+                          React.createElement(
+                            "h3",
+                            { className: "font-medium text-foreground" },
+                            "PM executive reports",
+                          ),
+                          (detailState.detail.pm_reports || []).length === 0
+                            ? React.createElement("p", null, "No PM executive reports")
+                            : detailState.detail.pm_reports.map(function (report) {
+                                return renderPMReport(
+                                  report,
+                                  report.record_id,
+                                  "space-y-1 rounded-md border p-2",
+                                );
+                              }),
                         ),
                         React.createElement(
                           "p",

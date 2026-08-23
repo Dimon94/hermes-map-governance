@@ -76,3 +76,15 @@ comments written by GitHub collaborators are authoritative Issue history.
 Role-specific toolsets and request policy provide workflow separation here;
 production credential separation is a later hardening step, and local delivery
 never grants remote publication authority.
+
+The plugin also registers `map-governance:pm` and the independent
+`map-governance-pm` toolset. PM model calls do not accept profile, session, Map,
+chairman approval, publication, or worker-control coordinates. The host resolves
+one immutable Map assignment from the active request and records only concise
+tracker-confirmed executive reports. Whole-Map blockers may enter `decision`,
+terminal failures do not change governance stage, acceptance outcome evidence may
+request `acceptance`, and non-blocking questions remain in `delivery`. A confirmed
+report or coordinator-confirmed dispatch ends the PM turn idle; failed reporting
+stays in the active turn for identical-payload retry. The PM contract fixes
+`dispatch_runtime: herdr`, while actual Herdr commissioning and worker-lane routing
+remain outside this phase.
