@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "ceo": "maps-ceo",
+    "pm": "maps-pm"
+  },
+  "skills": {
+    "plugin": [
+      "map-governance:ceo",
+      "map-governance:pm"
+    ],
+    "external": [
+      {
+        "id": "delivery-pipeline",
+        "path": "/absolute/path/to/skills/delivery-pipeline/SKILL.md"
+      },
+      {
+        "id": "implement",
+        "path": "/absolute/path/to/skills/implement/SKILL.md"
+      }
+    ]
+  },
+  "routing": {
+    "policy": "mixed"
+  },
+  "github": {
+    "hostname": "github.com",
+    "projects": [
+      {
+        "id": "PVT_PROJECT_NODE_ID",
+        "url": "https://github.com/orgs/OWNER/projects/1",
+        "owner": "OWNER",
+        "owner_type": "organization",
+        "number": 1,
+        "required_capability": "write"
+      }
+    ],
+    "repositories": [
+      {
+        "coordinate": "OWNER/REPOSITORY",
+        "path": "/absolute/path/to/repository",
+        "worker_write_required": true,
+        "publication_required": false
+      }
+    ]
+  },
+  "authorities": {
+    "worker": {
+      "kind": "local_git",
+      "credential_ref": "local-git"
+    },
+    "publisher": {
+      "kind": "gh",
+      "credential_ref": "gh:github.com:governance-bot",
+      "account": "governance-bot",
+      "required": false
+    }
+  },
+  "herdr": {
+    "executable": "herdr"
+  }
+}

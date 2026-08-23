@@ -225,6 +225,142 @@ def test_native_maps_commands_delegate_to_the_application(
     ]
 
 
+def test_native_setup_and_doctor_use_prerequisite_seam_without_operational_storage(
+    tmp_path, monkeypatch, capsys
+):
+    calls = []
+
+    class PrerequisiteProbe:
+        def setup_plan(self, **arguments):
+            calls.append(("setup_plan", arguments))
+            return {"status": "planned", "plan_id": "setup-plan:one"}
+
+        def setup_apply(self, **arguments):
+            calls.append(("setup_apply", arguments))
+            return {"status": "applied", "readback": "confirmed"}
+
+        def doctor(self):
+            calls.append(("doctor", {}))
+            return {"status": "pass", "checks": []}
+
+    monkeypatch.setattr(
+        native,
+        "prerequisite_application_for_storage",
+        lambda storage: (
+            calls.append(("storage", {"storage": str(storage)})) or PrerequisiteProbe()
+        ),
+    )
+    monkeypatch.setattr(
+        native,
+        "application_for_storage",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("setup/doctor must not initialize operational storage")
+        ),
+    )
+    registrations = []
+    plugin_data = tmp_path / "plugin-data"
+    plugin_data.mkdir()
+    (plugin_data / "registry.db").write_bytes(b"existing registry")
+    context = SimpleNamespace(
+        state=SimpleNamespace(data_dir=plugin_data),
+        profile_name="operator",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
+        register_cli_command=lambda **command: registrations.append(command),
+    )
+    native.register(context)
+    parser = ArgumentParser()
+    registrations[0]["setup_fn"](parser)
+    desired_file = tmp_path / "desired.json"
+    desired_file.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps({"plan_id": "setup-plan:one"}), encoding="utf-8")
+
+    results = [
+        registrations[0]["handler_fn"](
+            parser.parse_args(["setup", "plan", "--file", str(desired_file)])
+        ),
+        registrations[0]["handler_fn"](
+            parser.parse_args(
+                [
+                    "setup",
+                    "apply",
+                    "--file",
+                    str(plan_file),
+                    "--action",
+                    "config.prerequisites",
+                ]
+            )
+        ),
+        registrations[0]["handler_fn"](parser.parse_args(["doctor"])),
+    ]
+
+    assert results == [0, 0, 0]
+    assert [
+        json.loads(line)["status"] for line in capsys.readouterr().out.splitlines()
+    ] == [
+        "planned",
+        "applied",
+        "pass",
+    ]
+    assert calls == [
+        ("storage", {"storage": str(plugin_data)}),
+        ("setup_plan", {"desired": {"schema_version": 1}}),
+        ("storage", {"storage": str(plugin_data)}),
+        (
+            "setup_apply",
+            {
+                "plan": {"plan_id": "setup-plan:one"},
+                "selected_action_ids": ["config.prerequisites"],
+            },
+        ),
+        ("storage", {"storage": str(plugin_data)}),
+        ("doctor", {}),
+    ]
+
+
+def test_native_registration_is_pure_and_first_operational_command_resumes_outbox(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    class ApplicationProbe:
+        def start_outbox_runtime(self):
+            calls.append("start")
+
+        def health(self):
+            return {"status": "ready"}
+
+    monkeypatch.setattr(
+        native,
+        "application_for_storage",
+        lambda root: calls.append(("build", root)) or ApplicationProbe(),
+    )
+    registrations = []
+    storage = tmp_path / "plugin-data" / "map-governance"
+    storage.mkdir(parents=True)
+    (storage / "registry.db").write_bytes(b"existing-registry")
+    context = SimpleNamespace(
+        state=SimpleNamespace(data_dir=storage),
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
+        register_cli_command=lambda **command: registrations.append(command),
+        get_config=lambda _key, default=None: default,
+    )
+
+    native.register(context)
+
+    assert calls == []
+    assert len(registrations) == 1
+    result = registrations[0]["handler_fn"](SimpleNamespace(maps_command="health"))
+
+    assert result == 0
+    assert calls == [("build", storage), "start"]
+
+
 def test_native_transition_prints_structured_policy_failure(
     tmp_path, monkeypatch, capsys
 ):

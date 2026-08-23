@@ -26,6 +26,7 @@ if str(PLUGIN_ROOT) not in sys.path:
 from map_governance.runtime import (  # noqa: E402
     ProfileResolutionError,
     application_for_profile,
+    prerequisite_application_for_profile,
 )
 from map_governance import (  # noqa: E402
     ApprovalEnforcementError,
@@ -36,6 +37,7 @@ from map_governance import (  # noqa: E402
     MapBindingError,
     MapTransitionError,
     StaleProjectionError,
+    SetupApplyError,
 )
 from map_governance.tracker import TrackerError  # noqa: E402
 
@@ -87,6 +89,15 @@ class OutboxRepairRequest(BaseModel):
     note: str = Field(min_length=1)
 
 
+class SetupPlanRequest(BaseModel):
+    desired: dict[str, Any]
+
+
+class SetupApplyRequest(BaseModel):
+    plan: dict[str, Any]
+    selected_action_ids: list[str] = Field(min_length=1)
+
+
 def _application(profile: str):
     try:
         return application_for_profile(profile)
@@ -118,6 +129,18 @@ def _operation(profile: str, method: str, **arguments):
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
+def _prerequisite_operation(profile: str, method: str, **arguments):
+    try:
+        application = prerequisite_application_for_profile(profile)
+        return getattr(application, method)(**arguments)
+    except ProfileResolutionError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except SetupApplyError as error:
+        raise HTTPException(status_code=409, detail=error.as_dict()) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
 def _chairman_identity(request: Request, *, profile: str) -> GovernanceActorIdentity:
     session = getattr(request.state, "session", None)
     if session is None:
@@ -144,6 +167,38 @@ def _chairman_identity(request: Request, *, profile: str) -> GovernanceActorIden
 @router.get("/health")
 async def health(profile: str = Query(min_length=1)):
     return _application(profile).health()
+
+
+@router.get("/doctor")
+async def doctor(profile: str = Query(min_length=1)):
+    return await asyncio.to_thread(_prerequisite_operation, profile, "doctor")
+
+
+@router.post("/setup/plan")
+async def setup_plan(
+    request: SetupPlanRequest,
+    profile: str = Query(min_length=1),
+):
+    return await asyncio.to_thread(
+        _prerequisite_operation,
+        profile,
+        "setup_plan",
+        desired=request.desired,
+    )
+
+
+@router.post("/setup/apply")
+async def setup_apply(
+    request: SetupApplyRequest,
+    profile: str = Query(min_length=1),
+):
+    return await asyncio.to_thread(
+        _prerequisite_operation,
+        profile,
+        "setup_apply",
+        plan=request.plan,
+        selected_action_ids=request.selected_action_ids,
+    )
 
 
 @router.get("/board")

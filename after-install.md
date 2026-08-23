@@ -10,7 +10,36 @@ Verify all shell components and plugin-owned storage:
 
 ```bash
 hermes maps health
+hermes maps doctor
 ```
+
+`maps doctor` is strictly read-only. It does not initialize missing plugin
+storage, install Herdr integrations, create profiles, register Skills, log in to
+GitHub, or repair bindings. A missing prerequisite includes an argv-array
+remediation in the JSON report for an operator to review and run separately.
+
+Before the first binding, create an explicit desired-state JSON file and use
+the two-phase workflow:
+
+```bash
+hermes maps setup plan --file map-governance-setup.json > setup-plan.json
+hermes maps setup apply \
+  --file setup-plan.json \
+  --action config.prerequisites
+```
+
+Setup rejects secret fields. Reference the existing `gh` auth/keychain context
+as `gh:HOST:ACCOUNT` instead of copying a token into plugin config; the active
+account must match that reference. The worker authority is local
+Git and remains separate from the optional publisher authority. Integration,
+Skill, credential, and profile installation remain explicit operator actions;
+setup/doctor never run those remediation commands automatically.
+Behavioral expectations live in the current profile's plugin-owned
+`prerequisites.yaml`; setup never rewrites the shared Hermes `config.yaml`.
+
+The Maps dashboard exposes the same setup workflow: paste desired JSON, inspect
+the secret-safe before/after plan, select each stable action ID explicitly, and
+confirm apply. A successful apply reports verified config readback.
 
 Then start `hermes dashboard` and open **Maps**. An empty-state board is expected
 until an existing GitHub Map Issue is bound:

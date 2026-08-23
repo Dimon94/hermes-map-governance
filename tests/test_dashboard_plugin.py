@@ -76,6 +76,83 @@ def test_rest_health_and_board_delegate_with_explicit_profile(
     assert requested_profiles == ["ceo", "ceo"]
 
 
+def test_rest_setup_and_doctor_delegate_to_the_pure_prerequisite_seam(
+    tmp_path, monkeypatch, hermes_host_root
+):
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _load_dashboard_adapter()
+    api = FastAPI()
+    api.include_router(adapter.router, prefix="/api/plugins/map-governance")
+    calls = []
+
+    class PrerequisiteProbe:
+        def doctor(self):
+            calls.append(("doctor", {}))
+            return {"status": "pass", "checks": []}
+
+        def setup_plan(self, **arguments):
+            calls.append(("setup_plan", arguments))
+            return {"status": "planned", "plan_id": "setup-plan:one"}
+
+        def setup_apply(self, **arguments):
+            calls.append(("setup_apply", arguments))
+            return {"status": "applied", "readback": "confirmed"}
+
+    monkeypatch.setattr(
+        adapter,
+        "prerequisite_application_for_profile",
+        lambda profile: (
+            calls.append(("profile", {"profile": profile})) or PrerequisiteProbe()
+        ),
+    )
+
+    async def exercise_routes():
+        transport = httpx.ASGITransport(app=api)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            doctor = await client.get(
+                "/api/plugins/map-governance/doctor?profile=operator"
+            )
+            plan = await client.post(
+                "/api/plugins/map-governance/setup/plan?profile=operator",
+                json={"desired": {"schema_version": 1}},
+            )
+            apply = await client.post(
+                "/api/plugins/map-governance/setup/apply?profile=operator",
+                json={
+                    "plan": {"plan_id": "setup-plan:one"},
+                    "selected_action_ids": ["config.prerequisites"],
+                },
+            )
+        return doctor, plan, apply
+
+    doctor_response, plan_response, apply_response = asyncio.run(exercise_routes())
+
+    assert doctor_response.status_code == 200
+    assert plan_response.status_code == 200
+    assert apply_response.status_code == 200
+    assert doctor_response.json()["status"] == "pass"
+    assert plan_response.json()["status"] == "planned"
+    assert apply_response.json()["readback"] == "confirmed"
+    assert calls == [
+        ("profile", {"profile": "operator"}),
+        ("doctor", {}),
+        ("profile", {"profile": "operator"}),
+        ("setup_plan", {"desired": {"schema_version": 1}}),
+        ("profile", {"profile": "operator"}),
+        (
+            "setup_apply",
+            {
+                "plan": {"plan_id": "setup-plan:one"},
+                "selected_action_ids": ["config.prerequisites"],
+            },
+        ),
+    ]
+
+
 def test_event_stream_contract_uses_hermes_isolated_dependencies(hermes_host_root):
     runtime = hermes_host_root / "venv" / "bin" / "python"
     assert runtime.is_file(), "Hermes isolated Python runtime is required"

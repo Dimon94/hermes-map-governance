@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from threading import Lock
 from typing import Any, Mapping
@@ -10,6 +11,7 @@ from .application import MapGovernanceApplication
 from .approvals import AuthorityEnvelopePolicy
 from .outbox import OutboxSettings
 from .events import BoardEventSettings
+from .prerequisites import PrerequisiteApplication, YamlConfigRepository
 from .sessions import HermesSessionAdapter, HermesSessionDatabaseBackend
 
 
@@ -114,3 +116,71 @@ def application_for_profile(profile: str) -> MapGovernanceApplication:
         application.start_outbox_runtime()
         _PROFILE_APPLICATIONS[cache_key] = application
         return application
+
+
+def prerequisite_application_for_profile(profile: str) -> PrerequisiteApplication:
+    """Build the setup/doctor seam without initializing plugin storage."""
+    from hermes_cli.plugins import PluginState
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+        validate_profile_name,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    try:
+        canonical_profile = normalize_profile_name(profile)
+        validate_profile_name(canonical_profile)
+    except ValueError as error:
+        raise ProfileResolutionError(str(error)) from error
+    if not profile_exists(canonical_profile):
+        raise ProfileResolutionError(
+            f"Hermes profile {canonical_profile!r} does not exist"
+        )
+
+    profile_home = get_profile_dir(canonical_profile)
+    token = set_hermes_home_override(profile_home)
+    try:
+        storage_root = PluginState(PLUGIN_ID).data_dir
+    finally:
+        reset_hermes_home_override(token)
+    return PrerequisiteApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=storage_root,
+        config_repository=YamlConfigRepository(
+            storage_root / "prerequisites.yaml", storage_root=storage_root
+        ),
+        profile_resolver=get_profile_dir,
+    )
+
+
+def prerequisite_application_for_storage(
+    storage_root: Path,
+) -> PrerequisiteApplication:
+    """Build the native seam from request-scoped PluginState coordinates."""
+    scoped_storage = Path(os.path.abspath(os.fspath(storage_root)))
+    if scoped_storage.parent.name != "plugin-data":
+        raise ProfileResolutionError(
+            "Map Governance plugin storage does not identify a Hermes profile"
+        )
+    profile_home = scoped_storage.parent.parent
+    hermes_root = (
+        profile_home.parent.parent
+        if profile_home.parent.name == "profiles"
+        else profile_home
+    )
+
+    def resolve_profile(profile: str) -> Path:
+        return (
+            hermes_root if profile == "default" else hermes_root / "profiles" / profile
+        )
+
+    return PrerequisiteApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=scoped_storage,
+        config_repository=YamlConfigRepository(
+            scoped_storage / "prerequisites.yaml", storage_root=scoped_storage
+        ),
+        profile_resolver=resolve_profile,
+    )

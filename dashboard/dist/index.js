@@ -108,6 +108,169 @@
     );
   }
 
+  function renderDoctorPanel(doctorState) {
+    if (doctorState.status === "idle") return null;
+    if (doctorState.status === "loading") {
+      return React.createElement(
+        "p",
+        { className: "text-sm text-muted-foreground", role: "status" },
+        "Checking prerequisites…",
+      );
+    }
+    if (doctorState.status === "error") {
+      return React.createElement(
+        "p",
+        { className: "text-sm text-destructive", role: "alert" },
+        doctorState.message,
+      );
+    }
+    const report = doctorState.report;
+    return React.createElement(
+      "section",
+      { className: "space-y-2 rounded-md border p-3", "aria-labelledby": "maps-doctor-title" },
+      React.createElement(
+        "div",
+        { className: "flex flex-wrap items-center justify-between gap-2" },
+        React.createElement(
+          "h2",
+          { id: "maps-doctor-title", className: "text-sm font-semibold" },
+          "Prerequisite doctor",
+        ),
+        React.createElement(
+          Badge,
+          { variant: report.status === "pass" ? "outline" : "destructive" },
+          report.status === "pass" ? "Ready" : "Action required",
+        ),
+      ),
+      React.createElement(
+        "p",
+        { className: "text-xs text-muted-foreground" },
+        report.summary.pass + " pass · " + report.summary.warning + " warning · "
+          + report.summary.fail + " fail · checked " + report.checked_at,
+      ),
+      React.createElement(
+        "ul",
+        { className: "space-y-1 text-sm" },
+        (report.checks || []).filter(function (check) {
+          return check.status !== "pass";
+        }).map(function (check) {
+          return React.createElement(
+            "li",
+            { key: check.id },
+            React.createElement("span", { className: "font-medium" }, check.status + " · "),
+            check.summary,
+            check.remediation
+              ? React.createElement(
+                  "span",
+                  { className: "block text-xs text-muted-foreground" },
+                  check.remediation.description,
+                )
+              : null,
+          );
+        }),
+      ),
+    );
+  }
+
+  function renderSetupPanel(setupState, actions) {
+    if (setupState.status === "idle") return null;
+    if (setupState.status === "planning" || setupState.status === "applying") {
+      return React.createElement(
+        "p",
+        { className: "text-sm text-muted-foreground", role: "status" },
+        setupState.status === "planning" ? "Generating setup plan…" : "Applying selected setup actions…",
+      );
+    }
+    if (setupState.status === "applied") {
+      return React.createElement(
+        "section",
+        { className: "space-y-2 rounded-md border p-3", "aria-labelledby": "maps-setup-title" },
+        React.createElement("h2", { id: "maps-setup-title", className: "text-sm font-semibold" }, "Prerequisite setup"),
+        React.createElement(
+          "p",
+          { className: "text-sm", role: "status" },
+          "Applied " + setupState.result.applied_action_ids.join(", ") + " · readback " + setupState.result.readback,
+        ),
+        React.createElement(Button, { type: "button", onClick: actions.reset }, "Plan another setup"),
+      );
+    }
+    const plan = setupState.plan;
+    return React.createElement(
+      "section",
+      { className: "space-y-3 rounded-md border p-3", "aria-labelledby": "maps-setup-title" },
+      React.createElement("h2", { id: "maps-setup-title", className: "text-sm font-semibold" }, "Prerequisite setup"),
+      setupState.message
+        ? React.createElement("p", { className: "text-sm text-destructive", role: "alert" }, setupState.message)
+        : null,
+      setupState.status === "editing"
+        ? React.createElement(
+            "div",
+            { className: "space-y-2" },
+            React.createElement(
+              "label",
+              { htmlFor: "maps-setup-json", className: "block text-sm font-medium" },
+              "Desired prerequisite JSON",
+            ),
+            React.createElement("textarea", {
+              id: "maps-setup-json",
+              rows: 12,
+              className: "w-full rounded-md border bg-background p-2 font-mono text-xs",
+              value: setupState.desiredText,
+              onChange: actions.changeDesired,
+              spellCheck: false,
+            }),
+            React.createElement(
+              "p",
+              { className: "text-xs text-muted-foreground" },
+              "Secrets are forbidden. Use provider references such as gh:HOST:ACCOUNT.",
+            ),
+            React.createElement(Button, { type: "button", onClick: actions.plan }, "Generate setup plan"),
+          )
+        : React.createElement(
+            "div",
+            { className: "space-y-2" },
+            React.createElement(
+              "p",
+              { className: "text-xs text-muted-foreground" },
+              "Plan " + plan.plan_id + " expires " + plan.expires_at,
+            ),
+            (plan.actions || []).map(function (action) {
+              const selected = setupState.selectedActionIds.includes(action.action_id);
+              return React.createElement(
+                "label",
+                { key: action.action_id, className: "block space-y-1 rounded border p-2 text-sm" },
+                React.createElement("input", {
+                  type: "checkbox",
+                  checked: selected,
+                  onChange: function () { actions.toggle(action.action_id); },
+                }),
+                " " + action.action_id + " · " + action.description,
+                React.createElement(
+                  "pre",
+                  { className: "max-h-48 overflow-auto whitespace-pre-wrap text-xs text-muted-foreground" },
+                  "Before\n" + JSON.stringify(action.before, null, 2)
+                    + "\nAfter\n" + JSON.stringify(action.after, null, 2),
+                ),
+              );
+            }),
+            React.createElement(
+              "div",
+              { className: "flex gap-2" },
+              React.createElement(
+                Button,
+                {
+                  type: "button",
+                  onClick: actions.apply,
+                  disabled: setupState.selectedActionIds.length === 0,
+                },
+                "Apply selected actions",
+              ),
+              React.createElement(Button, { type: "button", onClick: actions.reset }, "Discard plan"),
+            ),
+          ),
+    );
+  }
+
   function safeExternalUrl(value) {
     try {
       const parsed = new URL(value);
@@ -427,6 +590,8 @@
     const [sessionState, setSessionState] = useState({ status: "idle" });
     const [detailState, setDetailState] = useState({ status: "idle" });
     const [approvalState, setApprovalState] = useState({ status: "idle" });
+    const [doctorState, setDoctorState] = useState({ status: "idle" });
+    const [setupState, setSetupState] = useState({ status: "idle" });
     const [streamState, setStreamState] = useState({ status: "connecting" });
     const streamRef = useRef({ cursor: 0, socket: null, retry: null, disposed: false });
 
@@ -564,6 +729,108 @@
         },
       );
     }, [load]);
+
+    const runDoctor = useCallback(function () {
+      setDoctorState({ status: "loading" });
+      requestProfile().then(function (profile) {
+        return fetchJSON(
+          "/api/plugins/map-governance/doctor?profile=" + encodeURIComponent(profile),
+        );
+      }).then(
+        function (report) { setDoctorState({ status: "ready", report: report }); },
+        function (error) {
+          setDoctorState({
+            status: "error",
+            message: error && error.message ? error.message : "Unable to run prerequisite doctor",
+          });
+        },
+      );
+    }, []);
+
+    const setupActions = {
+      open: function () {
+        setSetupState({ status: "editing", desiredText: "", message: null });
+      },
+      reset: function () {
+        setSetupState({ status: "editing", desiredText: "", message: null });
+      },
+      changeDesired: function (event) {
+        const value = event.target.value;
+        setSetupState(function (current) {
+          return Object.assign({}, current, { desiredText: value, message: null });
+        });
+      },
+      plan: function () {
+        let desired;
+        try {
+          desired = JSON.parse(setupState.desiredText);
+        } catch (_error) {
+          setSetupState(Object.assign({}, setupState, { message: "Desired setup must be valid JSON." }));
+          return;
+        }
+        setSetupState(Object.assign({}, setupState, { status: "planning", message: null }));
+        requestProfile().then(function (profile) {
+          return fetchJSON(
+            "/api/plugins/map-governance/setup/plan?profile=" + encodeURIComponent(profile),
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ desired: desired }),
+            },
+          );
+        }).then(
+          function (plan) {
+            setSetupState({
+              status: "planned",
+              desiredText: setupState.desiredText,
+              plan: plan,
+              selectedActionIds: [],
+              message: null,
+            });
+          },
+          function (error) {
+            setSetupState(Object.assign({}, setupState, {
+              status: "editing",
+              message: error && error.message ? error.message : "Unable to generate setup plan",
+            }));
+          },
+        );
+      },
+      toggle: function (actionId) {
+        setSetupState(function (current) {
+          const selected = current.selectedActionIds.includes(actionId)
+            ? current.selectedActionIds.filter(function (item) { return item !== actionId; })
+            : current.selectedActionIds.concat([actionId]);
+          return Object.assign({}, current, { selectedActionIds: selected });
+        });
+      },
+      apply: function () {
+        if (!setupState.selectedActionIds.length) return;
+        if (!window.confirm("Apply exactly the selected prerequisite setup actions?")) return;
+        setSetupState(Object.assign({}, setupState, { status: "applying", message: null }));
+        requestProfile().then(function (profile) {
+          return fetchJSON(
+            "/api/plugins/map-governance/setup/apply?profile=" + encodeURIComponent(profile),
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                plan: setupState.plan,
+                selected_action_ids: setupState.selectedActionIds,
+              }),
+            },
+          );
+        }).then(
+          function (result) { setSetupState({ status: "applied", result: result }); },
+          function (error) {
+            setSetupState(Object.assign({}, setupState, {
+              status: "planned",
+              message: error && error.message ? error.message : "Unable to apply setup plan",
+            }));
+          },
+        );
+      },
+    };
 
     const transitionMap = useCallback(function (mapId, expectedStage, requestedStage) {
       let approval = null;
@@ -923,10 +1190,26 @@
               state.board.empty_state.description,
             ),
             React.createElement(
-              Button,
-              { type: "button", onClick: refresh },
-              "Refresh from GitHub",
+              "div",
+              { className: "flex flex-wrap gap-2" },
+              React.createElement(
+                Button,
+                { type: "button", onClick: refresh },
+                "Refresh from GitHub",
+              ),
+              React.createElement(
+                Button,
+                { type: "button", onClick: runDoctor },
+                "Run prerequisite doctor",
+              ),
+              React.createElement(
+                Button,
+                { type: "button", onClick: setupActions.open },
+                "Setup prerequisites",
+              ),
             ),
+            renderDoctorPanel(doctorState),
+            renderSetupPanel(setupState, setupActions),
           ),
         ),
       );
@@ -950,8 +1233,16 @@
                 ? "Live updates connecting"
                 : "Live updates disconnected · reconnecting",
         ),
-        React.createElement(Button, { type: "button", onClick: refresh }, "Refresh"),
+        React.createElement(
+          "div",
+          { className: "flex gap-2" },
+          React.createElement(Button, { type: "button", onClick: setupActions.open }, "Setup"),
+          React.createElement(Button, { type: "button", onClick: runDoctor }, "Doctor"),
+          React.createElement(Button, { type: "button", onClick: refresh }, "Refresh"),
+        ),
       ),
+      renderDoctorPanel(doctorState),
+      renderSetupPanel(setupState, setupActions),
       state.board.projects.map(function (project) {
         const headingId = "project-" + project.id;
         const authority = project.authority || { state: "healthy" };

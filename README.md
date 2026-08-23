@@ -46,6 +46,58 @@ Hermes Kanban task。插件数据位于当前请求 profile 的 Hermes 原生插
 本仓库是 standalone plugin，安装到
 `<HERMES_HOME>/plugins/map-governance/`，不要求也不会修改 Hermes core。
 
+## 显式 setup 与纯读 doctor
+
+`maps setup` 只管理普通 Hermes/plugin behavioral configuration，不读取当前 shell
+来猜 profile、Skill、repository 或 authority，也不接收 secret。GitHub credential 只以
+`gh:<host>:<account>` provider/auth-context reference 表示，而且必须与所选 host/account
+一致；token 仍由 `gh`/keychain
+持有。可从 [`docs/setup-example.json`](docs/setup-example.json) 复制一份 JSON
+desired-state 文件，内容包含：
+
+- 不同的 CEO/PM profile ID；
+- plugin Skills `map-governance:ceo`、`map-governance:pm`，以及既有外部 owner
+  Skills `delivery-pipeline`、`implement` 的绝对 `SKILL.md` 路径；
+- `codex`、`claude` 或 `mixed` routing policy；
+- 已选择的 GitHub Project identity、repository coordinate 与本地 repository path；
+- `local_git` worker authority 和独立的 publisher provider reference；
+- Herdr executable 名称或绝对路径。
+
+计划阶段不写入任何状态，并返回稳定 action ID、before/after、operator authority、config
+revision 与过期时间：
+
+```bash
+hermes maps setup plan --file map-governance-setup.json > setup-plan.json
+```
+
+只有被 operator 明确选择的 action 才会执行：
+
+```bash
+hermes maps setup apply \
+  --file setup-plan.json \
+  --action config.prerequisites
+```
+
+apply 会拒绝未知 action、过期/过时 plan 和 payload drift；behavioral configuration 写入当前
+profile 的 plugin-owned `prerequisites.yaml`，由所有 setup writer 共享同一 lock，再做二次
+revision compare、单次 atomic replace 和 readback；它不与 Hermes 主 `config.yaml` 争用或
+覆盖更新。安装 profile、Skill、credential 或 Herdr integration
+不隐藏在 apply 中；doctor 只会给出需要人工执行的 argv remediation。
+
+```bash
+hermes maps doctor
+```
+
+Doctor 为每项 prerequisite 返回独立 `pass`、`warning` 或 `fail` evidence，包括 profile
+隔离、Skill discovery、现有 storage owner/mode 与 SQLite immutable read-only open、GitHub
+auth/Project/repository capability、registry coordinate cross-check、local worker write authority、
+单独的 publisher authority，以及 Herdr version 和 Hermes/Codex/Claude integration state。
+它不创建 storage、DB、journal、lock，不安装 integration，不修改 profile/config/credential，
+也不会输出 subprocess stderr 或 credential body。缺 publisher credential 不会让 local
+execution worker 失败；只有明确要求 publication 的 repository 才把 publisher 缺失判为
+fail。Maps 页面提供同一 read-only Doctor report，也提供 desired JSON、secret-safe plan preview、
+逐 action ID 选择和 verified apply；REST endpoints 同样要求显式 action ID。
+
 ## 绑定已有 Map
 
 先确保 `gh auth status` 可用且 token 具有 `read:project` scope，并且开放中的 Map

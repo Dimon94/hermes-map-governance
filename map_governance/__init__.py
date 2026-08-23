@@ -25,6 +25,11 @@ from .approvals import (
 )
 from .tracker import StructuredDecision
 from .reports import PMReport, PMReportDraft
+from .prerequisites import (
+    PrerequisiteApplication,
+    SetupApplyError,
+    YamlConfigRepository,
+)
 
 __all__ = [
     "ApprovalEnforcementError",
@@ -45,8 +50,11 @@ __all__ = [
     "PMReport",
     "PMReportConflict",
     "PMReportDraft",
+    "PrerequisiteApplication",
+    "SetupApplyError",
     "StructuredDecision",
     "TrackerDecisionConfirmationError",
     "TrackerPMReportConfirmationError",
     "TrackerApprovalConfirmationError",
+    "YamlConfigRepository",
 ]

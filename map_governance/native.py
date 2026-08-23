@@ -16,13 +16,42 @@ from .application import (
 )
 from .ceo_tool import register_ceo_capabilities
 from .pm_tool import register_pm_capabilities
-from .runtime import application_for_profile, application_for_storage
+from .prerequisites import SetupApplyError
+from .runtime import (
+    application_for_profile,
+    application_for_storage,
+    prerequisite_application_for_storage,
+)
 from .tracker import TrackerError
 
 
 def _setup_maps_command(parser: ArgumentParser) -> None:
     commands = parser.add_subparsers(dest="maps_command", required=True)
     commands.add_parser("health", help="Check Map Governance readiness")
+    commands.add_parser("doctor", help="Read all Map Governance prerequisite evidence")
+    setup = commands.add_parser(
+        "setup", help="Plan or apply explicit prerequisite configuration"
+    )
+    setup_commands = setup.add_subparsers(dest="setup_command", required=True)
+    setup_plan = setup_commands.add_parser(
+        "plan", help="Preview stable setup action IDs without changing config"
+    )
+    setup_plan.add_argument(
+        "--file", required=True, help="JSON file containing desired prerequisites"
+    )
+    setup_apply = setup_commands.add_parser(
+        "apply", help="Apply explicitly selected actions from a saved plan"
+    )
+    setup_apply.add_argument(
+        "--file", required=True, help="JSON file containing the setup plan"
+    )
+    setup_apply.add_argument(
+        "--action",
+        action="append",
+        required=True,
+        dest="actions",
+        help="Stable action ID to apply; repeat for each authorized action",
+    )
     commands.add_parser("board", help="Read the current Maps board")
     detail = commands.add_parser("detail", help="Read one Map detail projection")
     detail.add_argument("--map", required=True, help="Bound Map Issue node id")
@@ -90,29 +119,92 @@ def register(ctx) -> None:
     authority_settings = get_config("authority", {})
     outbox_settings = get_config("outbox", {})
     event_settings = get_config("events", {})
-    application = (
-        application_for_storage(
-            ctx.state.data_dir,
-            authority_settings=authority_settings,
-            outbox_settings=outbox_settings,
-            event_settings=event_settings,
+    application = None
+
+    def build_operational_application():
+        built = (
+            application_for_storage(
+                ctx.state.data_dir,
+                authority_settings=authority_settings,
+                outbox_settings=outbox_settings,
+                event_settings=event_settings,
+            )
+            if authority_settings or outbox_settings or event_settings
+            else application_for_storage(ctx.state.data_dir)
         )
-        if authority_settings or outbox_settings or event_settings
-        else application_for_storage(ctx.state.data_dir)
-    )
-    start_outbox_runtime = getattr(application, "start_outbox_runtime", None)
-    if callable(start_outbox_runtime):
-        start_outbox_runtime()
+        start_outbox_runtime = getattr(built, "start_outbox_runtime", None)
+        if callable(start_outbox_runtime):
+            start_outbox_runtime()
+        return built
+
+    def operational_application():
+        nonlocal application
+        if application is None:
+            application = build_operational_application()
+        return application
+
+    def prerequisite_application():
+        return prerequisite_application_for_storage(ctx.state.data_dir)
+
+    def read_json_file(path: str) -> dict:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except OSError:
+            raise ValueError("Setup JSON file is unavailable") from None
+        except json.JSONDecodeError:
+            raise ValueError("Setup JSON file is invalid JSON") from None
+        if not isinstance(payload, dict):
+            raise ValueError("Setup JSON root must be an object")
+        return payload
 
     def _handle_maps_command(args: Namespace) -> int:
+        if args.maps_command == "doctor":
+            report = prerequisite_application().doctor()
+            print(json.dumps(report, sort_keys=True))
+            return 0 if report["status"] == "pass" else 1
+        if args.maps_command == "setup":
+            try:
+                payload = read_json_file(args.file)
+                if args.setup_command == "plan":
+                    report = prerequisite_application().setup_plan(desired=payload)
+                else:
+                    report = prerequisite_application().setup_apply(
+                        plan=payload,
+                        selected_action_ids=args.actions,
+                    )
+            except SetupApplyError as error:
+                print(
+                    json.dumps({"error": error.as_dict()}, sort_keys=True),
+                    file=sys.stderr,
+                )
+                return 1
+            except ValueError as error:
+                print(
+                    json.dumps(
+                        {
+                            "error": {
+                                "type": "setup_input_error",
+                                "reason": str(error),
+                                "retryable": False,
+                            }
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        current_application = operational_application()
         if args.maps_command == "health":
-            print(json.dumps(application.health(), sort_keys=True))
+            print(json.dumps(current_application.health(), sort_keys=True))
             return 0
         if args.maps_command == "board":
-            print(json.dumps(application.board(), sort_keys=True))
+            print(json.dumps(current_application.board(), sort_keys=True))
             return 0
         if args.maps_command == "detail":
-            report = application.map_detail(map_id=args.map)
+            report = current_application.map_detail(map_id=args.map)
             print(json.dumps(report, sort_keys=True))
             return 0
         if args.maps_command == "open":
@@ -127,28 +219,28 @@ def register(ctx) -> None:
             print(json.dumps(report, sort_keys=True))
             return 0
         if args.maps_command == "project" and args.project_command == "configure":
-            report = application.configure_project(project_url=args.url)
+            report = current_application.configure_project(project_url=args.url)
             print(json.dumps(report, sort_keys=True))
             return 0
         if args.maps_command == "bind":
-            report = application.bind_map(
+            report = current_application.bind_map(
                 project_id=args.project,
                 issue_url=args.issue,
             )
             print(json.dumps(report, sort_keys=True))
             return 0
         if args.maps_command == "refresh":
-            report = application.refresh(project_id=args.project)
+            report = current_application.refresh(project_id=args.project)
             print(json.dumps(report, sort_keys=True))
             return 0
         if args.maps_command == "outbox":
             try:
                 if args.outbox_command == "status":
-                    report = application.outbox_status(effect_id=args.effect)
+                    report = current_application.outbox_status(effect_id=args.effect)
                 elif args.outbox_command == "recover":
-                    report = application.recover_outbox(limit=args.limit)
+                    report = current_application.recover_outbox(limit=args.limit)
                 else:
-                    report = application.repair_outbox(
+                    report = current_application.repair_outbox(
                         effect_id=args.effect,
                         repair_id=args.repair_id,
                         note=args.note,
@@ -181,7 +273,7 @@ def register(ctx) -> None:
                     transition_arguments["approval_request_id"] = args.approval_request
                 if args.mutation_id is not None:
                     transition_arguments["mutation_id"] = args.mutation_id
-                report = application.transition_map(
+                report = current_application.transition_map(
                     **transition_arguments,
                 )
             except (ApprovalEnforcementError, ApprovalRequestConflict) as error:

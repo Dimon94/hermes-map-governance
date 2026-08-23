@@ -241,6 +241,43 @@ function fetchJSON(path, options) {
   if (path.includes("/health?profile=")) {
     return Promise.resolve({ status: "ready" });
   }
+  if (path.includes("/doctor?profile=")) {
+    return Promise.resolve({
+      status: "pass",
+      checked_at: "2026-08-24T01:30:00Z",
+      summary: { pass: 18, warning: 1, fail: 0 },
+      checks: [{
+        id: "repository.acme/atlas.publisher",
+        status: "warning",
+        summary: "Remote publication is not required for execution readiness",
+        evidence: { required: false },
+        remediation: { description: "No action is needed until publication is authorized." },
+      }],
+    });
+  }
+  if (path.includes("/setup/plan?profile=")) {
+    return Promise.resolve({
+      status: "planned",
+      plan_id: "setup-plan:safe-preview",
+      expires_at: "2026-08-24T01:45:00Z",
+      actions: [
+        {
+          action_id: "config.prerequisites",
+          description: "Store Map Governance behavioral prerequisites",
+          before: null,
+          after: { authorities: { publisher: { credential_ref: "gh:github.com:release-bot" } } },
+        },
+      ],
+    });
+  }
+  if (path.includes("/setup/apply?profile=")) {
+    return Promise.resolve({
+      status: "applied",
+      applied_action_ids: ["config.prerequisites"],
+      not_selected_action_ids: [],
+      readback: "confirmed",
+    });
+  }
   return Promise.reject(new Error(`Unexpected path: ${path}`));
 }
 
@@ -552,6 +589,73 @@ const refreshButton = findNode(
   (node) => node.type === "Button" && /Refresh/.test(textContent(node)),
 );
 assert.ok(refreshButton, "Maps page exposes refresh in populated and empty states");
+const doctorButton = findNode(
+  readyTree,
+  (node) => node.type === "Button" && /Doctor|Run prerequisite doctor/.test(textContent(node)),
+);
+assert.ok(doctorButton, "Maps page exposes read-only prerequisite doctor");
+doctorButton.props.onClick();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+hookIndex = 0;
+const doctorTree = registeredPage();
+assert.match(textContent(doctorTree), /Prerequisite doctor/);
+assert.match(textContent(doctorTree), /Remote publication is not required/);
+const setupButton = findNode(
+  readyTree,
+  (node) => node.type === "Button" && /Setup(?: prerequisites)?/.test(textContent(node)),
+);
+assert.ok(setupButton, "Maps page exposes explicit prerequisite setup");
+setupButton.props.onClick();
+hookIndex = 0;
+const setupEditorTree = registeredPage();
+const setupTextarea = findNode(
+  setupEditorTree,
+  (node) => node.type === "textarea" && node.props.id === "maps-setup-json",
+);
+assert.ok(setupTextarea, "Setup starts with operator-provided desired JSON");
+setupTextarea.props.onChange({ target: { value: JSON.stringify({ schema_version: 1 }) } });
+hookIndex = 0;
+const setupReadyTree = registeredPage();
+const planButton = findNode(
+  setupReadyTree,
+  (node) => node.type === "Button" && /Generate setup plan/.test(textContent(node)),
+);
+planButton.props.onClick();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+const planIndex = requestedPaths.findIndex((path) => path.includes("/setup/plan?profile="));
+assert.notEqual(planIndex, -1);
+assert.deepEqual(JSON.parse(requestedOptions[planIndex].body), {
+  desired: { schema_version: 1 },
+});
+hookIndex = 0;
+const setupPlanTree = registeredPage();
+assert.match(textContent(setupPlanTree), /config\.prerequisites/);
+assert.match(textContent(setupPlanTree), /Before.*After/s);
+assert.doesNotMatch(textContent(setupPlanTree), /token|password|secret/i);
+const firstAction = findNode(
+  setupPlanTree,
+  (node) => node.type === "input" && node.props.type === "checkbox",
+);
+firstAction.props.onChange();
+hookIndex = 0;
+const setupSelectedTree = registeredPage();
+const applyButton = findNode(
+  setupSelectedTree,
+  (node) => node.type === "Button" && /Apply selected actions/.test(textContent(node)),
+);
+assert.equal(applyButton.props.disabled, false);
+applyButton.props.onClick();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+const applyIndex = requestedPaths.findIndex((path) => path.includes("/setup/apply?profile="));
+assert.notEqual(applyIndex, -1);
+assert.deepEqual(JSON.parse(requestedOptions[applyIndex].body).selected_action_ids, [
+  "config.prerequisites",
+]);
+hookIndex = 0;
+assert.match(textContent(registeredPage()), /readback confirmed/);
 refreshButton.props.onClick();
 await new Promise((resolve) => setImmediate(resolve));
 await new Promise((resolve) => setImmediate(resolve));
