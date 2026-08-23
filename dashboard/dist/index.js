@@ -60,11 +60,23 @@
     );
   }
 
+  function safeExternalUrl(value) {
+    try {
+      const parsed = new URL(value);
+      return parsed.protocol === "https:" || parsed.protocol === "http:"
+        ? parsed.href
+        : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
   function MapsPage() {
     const [state, setState] = useState({ status: "loading" });
     const [transitionState, setTransitionState] = useState({ status: "idle" });
     const [sessionState, setSessionState] = useState({ status: "idle" });
     const [detailState, setDetailState] = useState({ status: "idle" });
+    const [approvalState, setApprovalState] = useState({ status: "idle" });
 
     const load = useCallback(function () {
       setState({ status: "loading" });
@@ -111,6 +123,34 @@
     }, [load]);
 
     const transitionMap = useCallback(function (mapId, expectedStage, requestedStage) {
+      let approval = null;
+      if (requestedStage === "authorized") {
+        const detail = detailState.mapId === mapId && detailState.status === "ready"
+          ? detailState.detail
+          : null;
+        approval = detail && (detail.approvals.items || []).find(function (item) {
+          return item.status === "approved"
+            && item.proposed_action === "transition_map"
+            && item.requested_scope.map_id === mapId
+            && item.decision_payload.expected_stage === expectedStage
+            && item.decision_payload.requested_stage === requestedStage;
+        });
+        if (!approval) {
+          setTransitionState({
+            status: "error",
+            mapId: mapId,
+            message: "Open Map detail and obtain a matching chairman approval first.",
+          });
+          return;
+        }
+      }
+      if ((requestedStage === "authorized" || requestedStage === "parked")
+          && !window.confirm(
+            "Confirm major Map action: move from " + expectedStage
+              + " to " + requestedStage + "?",
+          )) {
+        return;
+      }
       setTransitionState({ status: "pending", mapId: mapId });
       requestProfile().then(function (profile) {
         const encodedProfile = encodeURIComponent(profile);
@@ -119,11 +159,16 @@
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
+            body: JSON.stringify(Object.assign({
               map_id: mapId,
               expected_stage: expectedStage,
               requested_stage: requestedStage,
-            }),
+            }, approval ? {
+              approval_request_id: approval.request_id,
+              // One approval can authorize exactly one protected mutation, so its
+              // stable request identity is also the stable retry identity.
+              mutation_id: approval.request_id,
+            } : {})),
           },
         );
       }).then(
@@ -141,7 +186,7 @@
           });
         },
       );
-    }, [load]);
+    }, [detailState, load]);
 
     const openCEOSession = useCallback(function (mapId) {
       setSessionState({ status: "pending", mapId: mapId });
@@ -206,6 +251,52 @@
         },
       );
     }, []);
+
+    const decideApproval = useCallback(function (mapId, requestId, decision) {
+      const label = decision === "revision" ? "request revision" : decision;
+      if (!window.confirm(
+        "Confirm chairman decision: " + label + " approval " + requestId + "?",
+      )) {
+        return;
+      }
+      const note = window.prompt("Record the chairman rationale for this decision:");
+      if (!note || !note.trim()) {
+        setApprovalState({
+          status: "error",
+          mapId: mapId,
+          message: "A chairman decision note is required.",
+        });
+        return;
+      }
+      setApprovalState({ status: "pending", mapId: mapId, requestId: requestId });
+      requestProfile().then(function (profile) {
+        return fetchJSON(
+          "/api/plugins/map-governance/maps/" + encodeURIComponent(mapId)
+            + "/approvals/" + encodeURIComponent(requestId)
+            + "/decision?profile=" + encodeURIComponent(profile),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ decision: decision, note: note.trim() }),
+          },
+        );
+      }).then(
+        function () {
+          setApprovalState({ status: "idle" });
+          loadMapDetail(mapId);
+          load();
+        },
+        function (error) {
+          setApprovalState({
+            status: "error",
+            mapId: mapId,
+            message: error && error.message
+              ? error.message
+              : "The approval decision was not confirmed by GitHub.",
+          });
+        },
+      );
+    }, [load, loadMapDetail]);
 
     useEffect(function () {
       load();
@@ -369,6 +460,32 @@
                         )
                       : null,
                   ),
+                  React.createElement(
+                    "section",
+                    { className: "space-y-1", "aria-label": "Chairman approval status" },
+                    React.createElement(
+                      "p",
+                      null,
+                      ((card.approval_summary || {}).count || 0)
+                        + " approval request"
+                        + (((card.approval_summary || {}).count === 1) ? "" : "s"),
+                    ),
+                    (card.approval_summary || {}).pending_count
+                      ? React.createElement(
+                          Badge,
+                          { variant: "outline" },
+                          card.approval_summary.pending_count + " pending chairman decision",
+                        )
+                      : null,
+                    (card.approval_summary || {}).latest
+                      ? React.createElement(
+                          "p",
+                          null,
+                          "Latest: " + card.approval_summary.latest.status
+                            + " · " + card.approval_summary.latest.request_id,
+                        )
+                      : null,
+                  ),
                   detailState.mapId === card.id && detailState.status === "ready"
                     ? React.createElement(
                         "section",
@@ -393,10 +510,155 @@
                               },
                             ),
                         React.createElement(
-                          "p",
-                          null,
-                          "Approvals: "
-                            + ((detailState.detail.approvals || {}).count || 0),
+                          "section",
+                          { className: "space-y-2", "aria-label": "Chairman approval packets" },
+                          React.createElement(
+                            "h3",
+                            { className: "font-medium text-foreground" },
+                            "Chairman approval packets",
+                          ),
+                          ((detailState.detail.approvals || {}).items || []).length === 0
+                            ? React.createElement("p", null, "No approval requests")
+                            : (detailState.detail.approvals.items || []).map(
+                                function (approval) {
+                                  return React.createElement(
+                                    "article",
+                                    {
+                                      key: approval.request_id,
+                                      className: "space-y-2 rounded-md border p-3",
+                                      "aria-label": "Approval " + approval.request_id,
+                                    },
+                                    React.createElement(
+                                      "div",
+                                      { className: "flex flex-wrap items-center gap-2" },
+                                      React.createElement(
+                                        "p",
+                                        { className: "font-medium text-foreground" },
+                                        approval.proposed_action + " · " + approval.request_id,
+                                      ),
+                                      React.createElement(Badge, { variant: "outline" }, approval.status),
+                                    ),
+                                    React.createElement("p", null, approval.rationale),
+                                    React.createElement(
+                                      "div",
+                                      null,
+                                      React.createElement(
+                                        "p",
+                                        { className: "font-medium text-foreground" },
+                                        "Alternatives",
+                                      ),
+                                      React.createElement(
+                                        "ul",
+                                        { className: "list-disc space-y-1 pl-5" },
+                                        (approval.alternatives || []).map(function (alternative, index) {
+                                          return React.createElement("li", { key: index }, alternative);
+                                        }),
+                                      ),
+                                    ),
+                                    React.createElement(
+                                      "p",
+                                      null,
+                                      "Cost / risk: " + approval.cost_risk,
+                                    ),
+                                    React.createElement(
+                                      "p",
+                                      null,
+                                      "Scope: ",
+                                      React.createElement(
+                                        "code",
+                                        null,
+                                        JSON.stringify(approval.requested_scope),
+                                      ),
+                                    ),
+                                    React.createElement(
+                                      "p",
+                                      null,
+                                      "Decision content: ",
+                                      React.createElement(
+                                        "code",
+                                        null,
+                                        JSON.stringify(approval.decision_payload),
+                                      ),
+                                    ),
+                                    React.createElement(
+                                      "p",
+                                      null,
+                                      "Payload hash: ",
+                                      React.createElement("code", null, approval.payload_hash),
+                                    ),
+                                    approval.expires_at
+                                      ? React.createElement(
+                                          "p",
+                                          null,
+                                          "Expires: ",
+                                          React.createElement(
+                                            "time",
+                                            { dateTime: approval.expires_at },
+                                            approval.expires_at,
+                                          ),
+                                        )
+                                      : React.createElement("p", null, "Expiry starts on approval"),
+                                    React.createElement(
+                                      "ul",
+                                      { className: "list-disc space-y-1 pl-5", "aria-label": "Approval evidence" },
+                                      (approval.evidence || []).map(function (evidence, index) {
+                                        const href = safeExternalUrl(evidence);
+                                        return React.createElement(
+                                          "li",
+                                          { key: index },
+                                          href
+                                            ? React.createElement(
+                                                "a",
+                                                {
+                                                  href: href,
+                                                  target: "_blank",
+                                                  rel: "noreferrer",
+                                                  className: "underline-offset-4 hover:underline",
+                                                },
+                                                evidence,
+                                              )
+                                            : evidence,
+                                        );
+                                      }),
+                                    ),
+                                    approval.status === "pending"
+                                      ? React.createElement(
+                                          "div",
+                                          {
+                                            className: "flex flex-wrap gap-2",
+                                            "aria-label": "Chairman approval decisions",
+                                          },
+                                          [
+                                            ["approved", "Approve"],
+                                            ["rejected", "Reject"],
+                                            ["revision", "Request revision"],
+                                          ].map(function (choice) {
+                                            const pending = approvalState.status === "pending"
+                                              && approvalState.requestId === approval.request_id;
+                                            return React.createElement(
+                                              Button,
+                                              {
+                                                key: choice[0],
+                                                type: "button",
+                                                variant: choice[0] === "approved" ? "default" : "outline",
+                                                disabled: pending,
+                                                "aria-label": choice[1] + " " + approval.request_id,
+                                                onClick: function () {
+                                                  decideApproval(
+                                                    card.id,
+                                                    approval.request_id,
+                                                    choice[0],
+                                                  );
+                                                },
+                                              },
+                                              pending ? "Recording decision…" : choice[1],
+                                            );
+                                          }),
+                                        )
+                                      : null,
+                                  );
+                                },
+                              ),
                         ),
                         React.createElement(
                           "p",
@@ -464,6 +726,13 @@
                         "p",
                         { role: "alert", className: "text-sm text-destructive" },
                         sessionState.message,
+                      )
+                    : null,
+                  approvalState.status === "error" && approvalState.mapId === card.id
+                    ? React.createElement(
+                        "p",
+                        { role: "alert", className: "text-sm text-destructive" },
+                        approvalState.message,
                       )
                     : null,
                   React.createElement(

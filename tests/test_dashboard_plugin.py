@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI
@@ -326,3 +327,99 @@ def test_rest_session_open_preserves_repair_required_detail(
         "candidate_count": 2,
         "retryable": False,
     }
+
+
+def test_rest_chairman_decision_uses_authenticated_request_identity(
+    tmp_path, monkeypatch, hermes_host_root
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    adapter = _load_dashboard_adapter()
+    api = FastAPI()
+
+    @api.middleware("http")
+    async def authenticated_chairman(request, call_next):
+        request.state.session = SimpleNamespace(
+            user_id="chairman-1",
+            provider="basic",
+        )
+        return await call_next(request)
+
+    api.include_router(adapter.router, prefix="/api/plugins/map-governance")
+    calls = []
+
+    class ApplicationProbe:
+        def decide_approval(self, **arguments):
+            calls.append(("decide_approval", arguments))
+            return {"operation": "decide_approval"}
+
+        def transition_map(self, **arguments):
+            calls.append(("transition_map", arguments))
+            return {"operation": "transition_map"}
+
+    monkeypatch.setattr(
+        adapter,
+        "application_for_profile",
+        lambda profile: ApplicationProbe(),
+    )
+
+    async def exercise_routes():
+        transport = httpx.ASGITransport(app=api)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            decision = await client.post(
+                "/api/plugins/map-governance/maps/I_atlas_41/approvals/approval-1/decision?profile=ceo",
+                json={"decision": "approved", "note": "Approve exact scope."},
+            )
+            transition = await client.post(
+                "/api/plugins/map-governance/transitions?profile=ceo",
+                json={
+                    "map_id": "I_atlas_41",
+                    "expected_stage": "awaiting-approval",
+                    "requested_stage": "authorized",
+                    "approval_request_id": "approval-1",
+                    "mutation_id": "transition-1",
+                },
+            )
+        return decision, transition
+
+    decision, transition = asyncio.run(exercise_routes())
+
+    assert decision.status_code == transition.status_code == 200
+    actor = calls[0][1]["actor_identity"]
+    assert actor.role == "chairman"
+    assert actor.profile_name == "ceo"
+    assert actor.actor_id == "basic:chairman-1"
+    assert actor.session_id == "dashboard:basic:chairman-1"
+    assert calls[1][1]["actor_identity"] == actor
+    assert calls[1][1]["approval_request_id"] == "approval-1"
+    assert calls[1][1]["mutation_id"] == "transition-1"
+
+
+def test_rest_chairman_decision_rejects_missing_interactive_identity(
+    tmp_path, monkeypatch, hermes_host_root
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    adapter = _load_dashboard_adapter()
+    api = FastAPI()
+    api.include_router(adapter.router, prefix="/api/plugins/map-governance")
+    monkeypatch.setattr(
+        adapter,
+        "application_for_profile",
+        lambda profile: (_ for _ in ()).throw(AssertionError("must not delegate")),
+    )
+
+    async def exercise_route():
+        transport = httpx.ASGITransport(app=api)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.post(
+                "/api/plugins/map-governance/maps/I_atlas_41/approvals/approval-1/decision?profile=ceo",
+                json={"decision": "approved", "note": "Forged."},
+            )
+
+    response = asyncio.run(exercise_route())
+    assert response.status_code == 403

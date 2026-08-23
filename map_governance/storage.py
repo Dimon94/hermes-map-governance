@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .approvals import normalized_json
+
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class PluginStorage:
@@ -191,6 +194,12 @@ class PluginStorage:
     def decision_lease(self, map_id: str) -> Iterator[None]:
         """Serialize one Map's tracker idempotency check and decision write."""
         with self._map_lease(namespace="decision", map_id=map_id):
+            yield
+
+    @contextmanager
+    def approval_lease(self, map_id: str) -> Iterator[None]:
+        """Serialize one Map's approval history and protected consumption."""
+        with self._map_lease(namespace="approval", map_id=map_id):
             yield
 
     @contextmanager
@@ -455,6 +464,384 @@ class PluginStorage:
                 """,
                 (action, map_id, profile_name, session_id, reason, denied_at),
             )
+
+    def approval(self, request_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM approval_ledger
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        return self._approval_row(dict(row)) if row is not None else None
+
+    def approvals(self, *, map_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM approval_ledger
+                WHERE map_id = ?
+                ORDER BY julianday(requested_at) DESC, request_id DESC
+                """,
+                (map_id,),
+            ).fetchall()
+        return [self._approval_row(dict(row)) for row in rows]
+
+    def save_approval_request(
+        self,
+        *,
+        map_id: str,
+        packet: dict[str, Any],
+        packet_hash: str,
+        requested_by_profile: str,
+        requested_by_session: str,
+        requested_at: str,
+        tracker_record_id: str,
+        tracker_record_url: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO approval_ledger(
+                    request_id, map_id, decision_class, proposed_action,
+                    alternatives_json, rationale, cost_risk, evidence_json,
+                    requested_scope_json, decision_payload_json, payload_hash,
+                    packet_hash, status, requested_by_profile,
+                    requested_by_session, requested_at, tracker_request_id,
+                    tracker_request_url, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
+                          ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    packet["request_id"],
+                    map_id,
+                    packet["decision_class"],
+                    packet["proposed_action"],
+                    normalized_json(packet["alternatives"]),
+                    packet["rationale"],
+                    packet["cost_risk"],
+                    normalized_json(packet["evidence"]),
+                    normalized_json(packet["requested_scope"]),
+                    normalized_json(packet["decision_payload"]),
+                    packet["payload_hash"],
+                    packet_hash,
+                    requested_by_profile,
+                    requested_by_session,
+                    requested_at,
+                    tracker_record_id,
+                    tracker_record_url,
+                    requested_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO approval_ledger_events(
+                    event_id, request_id, event_type, occurred_at,
+                    actor_profile, payload_hash, tracker_record_id,
+                    tracker_record_url
+                ) VALUES (?, ?, 'requested', ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"approval:{packet['request_id']}:request",
+                    packet["request_id"],
+                    requested_at,
+                    requested_by_profile,
+                    packet["payload_hash"],
+                    tracker_record_id,
+                    tracker_record_url,
+                ),
+            )
+
+    def apply_approval_decision(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        actor_id: str,
+        actor_profile: str,
+        note: str,
+        decided_at: str,
+        expires_at: str | None,
+        tracker_record_id: str,
+        tracker_record_url: str,
+    ) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE approval_ledger
+                SET status = ?, decided_by = ?, decided_by_profile = ?,
+                    decision_note = ?, decided_at = ?, expires_at = ?,
+                    tracker_decision_id = ?, tracker_decision_url = ?,
+                    updated_at = ?
+                WHERE request_id = ? AND status = 'pending'
+                """,
+                (
+                    decision,
+                    actor_id,
+                    actor_profile,
+                    note,
+                    decided_at,
+                    expires_at,
+                    tracker_record_id,
+                    tracker_record_url,
+                    decided_at,
+                    request_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Approval is no longer pending")
+            connection.execute(
+                """
+                INSERT INTO approval_ledger_events(
+                    event_id, request_id, event_type, occurred_at, actor_id,
+                    actor_profile, note, expires_at, payload_hash,
+                    tracker_record_id, tracker_record_url
+                )
+                SELECT ?, request_id, ?, ?, ?, ?, ?, ?, payload_hash, ?, ?
+                FROM approval_ledger WHERE request_id = ?
+                """,
+                (
+                    f"approval:{request_id}:decision",
+                    decision,
+                    decided_at,
+                    actor_id,
+                    actor_profile,
+                    note,
+                    expires_at,
+                    tracker_record_id,
+                    tracker_record_url,
+                    request_id,
+                ),
+            )
+
+    def revoke_approval(
+        self,
+        *,
+        request_id: str,
+        actor_id: str,
+        actor_profile: str,
+        note: str,
+        revoked_at: str,
+        tracker_record_id: str,
+        tracker_record_url: str,
+    ) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE approval_ledger
+                SET status = 'revoked', decided_by = ?, decided_by_profile = ?,
+                    decision_note = ?, decided_at = ?, expires_at = NULL,
+                    tracker_decision_id = ?, tracker_decision_url = ?,
+                    updated_at = ?
+                WHERE request_id = ? AND status = 'approved'
+                """,
+                (
+                    actor_id,
+                    actor_profile,
+                    note,
+                    revoked_at,
+                    tracker_record_id,
+                    tracker_record_url,
+                    revoked_at,
+                    request_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Approval is no longer revocable")
+            connection.execute(
+                """
+                INSERT INTO approval_ledger_events(
+                    event_id, request_id, event_type, occurred_at, actor_id,
+                    actor_profile, note, payload_hash, tracker_record_id,
+                    tracker_record_url
+                )
+                SELECT ?, request_id, 'revoked', ?, ?, ?, ?, payload_hash, ?, ?
+                FROM approval_ledger WHERE request_id = ?
+                """,
+                (
+                    f"approval:{request_id}:revocation",
+                    revoked_at,
+                    actor_id,
+                    actor_profile,
+                    note,
+                    tracker_record_id,
+                    tracker_record_url,
+                    request_id,
+                ),
+            )
+
+    def expire_approval(self, *, request_id: str, expired_at: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE approval_ledger
+                SET status = 'expired', updated_at = ?
+                WHERE request_id = ? AND status = 'approved'
+                """,
+                (expired_at, request_id),
+            )
+            if cursor.rowcount == 1:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO approval_ledger_events(
+                        event_id, request_id, event_type, occurred_at, payload_hash
+                    )
+                    SELECT ?, request_id, 'expired', ?, payload_hash
+                    FROM approval_ledger WHERE request_id = ?
+                    """,
+                    (f"approval:{request_id}:expired", expired_at, request_id),
+                )
+        return cursor.rowcount == 1
+
+    def approval_history(self, *, request_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_id, event_type, occurred_at, actor_id,
+                       actor_profile, note, expires_at, payload_hash,
+                       tracker_record_id, tracker_record_url
+                FROM approval_ledger_events
+                WHERE request_id = ?
+                ORDER BY event_sequence
+                """,
+                (request_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def protected_mutation(self, mutation_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT mutation_id, map_id, request_id, action, scope_json,
+                       payload_json, payload_hash, status, reserved_at,
+                       confirmed_at
+                FROM protected_mutations
+                WHERE mutation_id = ?
+                """,
+                (mutation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["scope"] = json.loads(result.pop("scope_json"))
+        result["payload"] = json.loads(result.pop("payload_json"))
+        return result
+
+    def reserve_protected_mutation(
+        self,
+        *,
+        mutation_id: str,
+        map_id: str,
+        request_id: str,
+        action: str,
+        scope: dict[str, Any],
+        payload: dict[str, Any],
+        payload_hash: str,
+        reserved_at: str,
+    ) -> tuple[bool, str]:
+        """Atomically bind one approved ledger record to exactly one mutation."""
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT map_id, request_id, action, scope_json, payload_json,
+                       payload_hash, status
+                FROM protected_mutations
+                WHERE mutation_id = ?
+                """,
+                (mutation_id,),
+            ).fetchone()
+            scope_json = normalized_json(scope)
+            payload_json = normalized_json(payload)
+            if existing is not None:
+                same = (
+                    existing["map_id"] == map_id
+                    and existing["request_id"] == request_id
+                    and existing["action"] == action
+                    and existing["scope_json"] == scope_json
+                    and existing["payload_json"] == payload_json
+                    and existing["payload_hash"] == payload_hash
+                )
+                if not same:
+                    raise ValueError("Mutation identity belongs to another payload")
+                return True, str(existing["status"])
+
+            cursor = connection.execute(
+                """
+                UPDATE approval_ledger
+                SET status = 'consumed', consumed_by_mutation_id = ?,
+                    consumed_at = ?, updated_at = ?
+                WHERE request_id = ? AND map_id = ? AND status = 'approved'
+                """,
+                (mutation_id, reserved_at, reserved_at, request_id, map_id),
+            )
+            if cursor.rowcount != 1:
+                row = connection.execute(
+                    "SELECT status FROM approval_ledger WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                return False, str(row["status"]) if row is not None else "missing"
+            connection.execute(
+                """
+                INSERT INTO protected_mutations(
+                    mutation_id, map_id, request_id, action, scope_json,
+                    payload_json, payload_hash, status, reserved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?)
+                """,
+                (
+                    mutation_id,
+                    map_id,
+                    request_id,
+                    action,
+                    scope_json,
+                    payload_json,
+                    payload_hash,
+                    reserved_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO approval_ledger_events(
+                    event_id, request_id, event_type, occurred_at,
+                    payload_hash
+                ) VALUES (?, ?, 'consumed', ?, ?)
+                """,
+                (
+                    f"approval:{request_id}:consumed:{mutation_id}",
+                    request_id,
+                    reserved_at,
+                    payload_hash,
+                ),
+            )
+        return False, "reserved"
+
+    def confirm_protected_mutation(
+        self,
+        *,
+        mutation_id: str,
+        confirmed_at: str,
+    ) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE protected_mutations
+                SET status = 'confirmed', confirmed_at = ?
+                WHERE mutation_id = ? AND status IN ('reserved', 'confirmed')
+                """,
+                (confirmed_at, mutation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Protected mutation reservation is missing")
+
+    @staticmethod
+    def _approval_row(row: dict[str, Any]) -> dict[str, Any]:
+        row["alternatives"] = json.loads(row.pop("alternatives_json"))
+        row["evidence"] = json.loads(row.pop("evidence_json"))
+        row["requested_scope"] = json.loads(row.pop("requested_scope_json"))
+        row["decision_payload"] = json.loads(row.pop("decision_payload_json"))
+        return row
 
     def save_decision_projection(
         self,
@@ -724,6 +1111,80 @@ class PluginStorage:
                 tracker_record_url TEXT NOT NULL,
                 confirmed_at TEXT NOT NULL,
                 PRIMARY KEY(map_id, decision_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS approval_ledger (
+                request_id TEXT PRIMARY KEY,
+                map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
+                decision_class TEXT NOT NULL,
+                proposed_action TEXT NOT NULL,
+                alternatives_json TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                cost_risk TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                requested_scope_json TEXT NOT NULL,
+                decision_payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                packet_hash TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending', 'approved', 'rejected', 'revision',
+                    'revoked', 'expired', 'consumed'
+                )),
+                requested_by_profile TEXT NOT NULL,
+                requested_by_session TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                tracker_request_id TEXT NOT NULL,
+                tracker_request_url TEXT NOT NULL,
+                decided_by TEXT,
+                decided_by_profile TEXT,
+                decision_note TEXT,
+                decided_at TEXT,
+                expires_at TEXT,
+                tracker_decision_id TEXT,
+                tracker_decision_url TEXT,
+                consumed_by_mutation_id TEXT UNIQUE,
+                consumed_at TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS protected_mutations (
+                mutation_id TEXT PRIMARY KEY,
+                map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
+                request_id TEXT NOT NULL UNIQUE REFERENCES approval_ledger(request_id),
+                action TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'confirmed')),
+                reserved_at TEXT NOT NULL,
+                confirmed_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS approval_ledger_events (
+                event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                request_id TEXT NOT NULL REFERENCES approval_ledger(request_id),
+                event_type TEXT NOT NULL CHECK(event_type IN (
+                    'requested', 'approved', 'rejected', 'revision',
+                    'revoked', 'expired', 'consumed'
+                )),
+                occurred_at TEXT NOT NULL,
+                actor_id TEXT,
+                actor_profile TEXT,
+                note TEXT,
+                expires_at TEXT,
+                payload_hash TEXT NOT NULL,
+                tracker_record_id TEXT,
+                tracker_record_url TEXT
             )
             """
         )

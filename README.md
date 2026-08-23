@@ -21,6 +21,10 @@ executive state，并把带稳定 `decision_id`、type、rationale、authority�
 timestamp 的结构化决策写入 Map Issue comment。交付编排仍由后续票交付。
 新建或既有 canonical lineage 都会在当前 live continuation 幂等加载完整 CEO Skill user
 turn，因此从 #6 升级和 context compression 后仍保留同一 negative-capability 边界。
+CEO 还可提交内容绑定的 chairman approval packet；Dashboard Map detail 只提供显式
+approve、reject、request revision 操作。审批 request/decision 先由 GitHub Issue history
+读回确认，再进入 plugin-owned durable ledger。`awaiting-approval → authorized` 会在执行
+同一 application transition 前原子校验并消费匹配 action、scope 与 payload 的有效审批。
 
 ## 安装
 
@@ -63,6 +67,14 @@ hermes maps transition \
   --from authorized \
   --stage delivery
 
+# chairman-protected transition 还必须带稳定 request 与 mutation identity。
+hermes maps transition \
+  --map ISSUE_NODE_ID \
+  --from awaiting-approval \
+  --stage authorized \
+  --approval-request APPROVAL_REQUEST_ID \
+  --mutation-id STABLE_MUTATION_ID
+
 # 解析/初始化 canonical 会话；Dashboard 卡片使用同一 application seam。
 hermes maps open --map ISSUE_NODE_ID --profile CEO_PROFILE
 ```
@@ -84,7 +96,8 @@ adopt；零匹配只创建和 bootstrap 一次；多个 exact 匹配会把卡片
 backend restart 与 context compression 都继续同一段历史。Map 内容只写入首个 user
 turn；board refresh 不更新已有会话的 system prompt 或 toolset。
 
-CEO Tool 只提供 `inspect` 与 `record_decision`。Profile 与 session identity 不属于模型参数；
+CEO Tool 只提供 `inspect`、`record_decision` 与 `request_approval`。Profile、session 与
+chairman identity 不属于模型参数；
 handler 使用 Hermes request-scoped identity 回查 canonical binding。跨 profile、session 或
 Map 请求会 fail closed，并写入 plugin-owned denial audit，不会产生 tracker governance write。
 canonical CEO 会话还通过 Hermes `pre_tool_call` 公共 hook 拒绝该 named toolset 之外的
@@ -98,17 +111,57 @@ canonical request policy 与审计在工作流层隔离 CEO 和 worker 权限，
 不能由模型声明其他角色权限。
 决策 mutation 后必须从 Issue history 读回同一 payload 才会更新本地 projection；同一
 `decision_id` + 同一 payload 的重试只保留一条 tracker decision，不同 payload 会被拒绝。
-Maps 卡片显示 confirmed decision count 和最新摘要；页面的 Map detail 会读取并显示
-recent decisions、当前 approvals 读模型和 delivery summary。本票
-尚无 approval 或 delivery checkpoint 数据时分别明确返回空列表和 `not_reported`。
+Maps 卡片显示 confirmed decision 与 approval 状态摘要；页面的 Map detail 显示 packet
+alternatives、rationale、cost/risk、scope、evidence、payload hash、status 与 expiry。
+Approval 的 pending/approved/rejected/revision/revoked/expired/consumed 生命周期及历史
+保存在 ledger；缺失、过期、撤销、已消费或 action/scope/content 不匹配均在 tracker
+mutation 前拒绝并写入既有 denial audit。相同 mutation id 可恢复重试，另一个 mutation
+不能重放同一 grant；delivery summary 在后续票接入前仍明确返回 `not_reported`。
+
+Authority envelope 使用正常 Hermes plugin settings，不读取进程环境。默认 `product` 与
+`operational` 属于 CEO autonomy；delivery authorization、budget、scope、material
+schedule、security/legal、cancellation、publication 与 final acceptance 要求 chairman。
+可在 profile 的 `config.yaml` 中覆盖并设置审批 TTL：
+
+```yaml
+plugins:
+  entries:
+    map-governance:
+      settings:
+        authority:
+          ceo_autonomous_decision_classes: [product, operational]
+          chairman_required_decision_classes:
+            [delivery_authorization, budget_increase, scope_expansion,
+             schedule_change, security, legal, cancellation,
+             remote_publication, final_acceptance]
+          chairman_actor_ids: ["basic:local-chairman"]
+          authority_thresholds:
+            budget_increase:
+              source: decision_payload
+              field: amount
+              maximum: 1000
+            schedule_change:
+              source: decision_payload
+              field: days
+              maximum: 5
+            scope_expansion:
+              source: requested_scope
+              field: area
+              allowed_values: [existing-map]
+          approval_ttl_seconds: 86400
+```
+
+`chairman_actor_ids` 使用认证 Dashboard request 的 `provider:user_id`，默认空集；只有
+明确列入当前 profile 配置的身份能执行审批。阈值只缩小原本 chairman-required class
+中需要中断的范围；缺字段、无效值和未配置 decision class 都按 fail-closed 处理。
 
 ## 架构壳
 
 - `MapGovernanceApplication` 是 REST、dashboard 和诊断入口共同调用的应用 seam。
 - `hermes maps health` 与 `/api/plugins/map-governance/health` 返回同一 readiness。
 - `/api/plugins/map-governance/board` 提供按 GitHub Project 分组的 board 投影；
-  `/projects`、`/bindings`、`/refresh`、`/transitions`、Map detail 与 canonical session
-  open routes 是同一应用接口的薄适配器。
+  `/projects`、`/bindings`、`/refresh`、`/transitions`、approval decision、Map detail 与
+  canonical session open routes 是同一应用接口的薄适配器。
 - `registry.db` 属于 `map-governance` 命名空间，由请求中的 profile 选择，且与
   `<PROFILE_HOME>/kanban.db` 隔离。
 

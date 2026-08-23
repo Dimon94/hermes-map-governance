@@ -118,6 +118,7 @@ def main() -> int:
     assert set(ceo_tool.schema["parameters"]["properties"]["action"]["enum"]) == {
         "inspect",
         "record_decision",
+        "request_approval",
     }
     ceo_definitions = get_tool_definitions(
         enabled_toolsets=["map-governance-ceo"],

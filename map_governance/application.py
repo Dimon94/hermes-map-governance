@@ -10,6 +10,15 @@ from pathlib import Path
 from threading import Lock, RLock
 from typing import Any, Callable, NoReturn
 
+from .approvals import (
+    APPROVAL_DECISIONS,
+    ApprovalHistoryEvent,
+    ApprovalPacket,
+    AuthorityEnvelopePolicy,
+    GovernanceActorIdentity,
+    normalized_hash,
+    normalized_json,
+)
 from .stages import (
     ALLOWED_TRANSITIONS,
     available_transitions,
@@ -26,6 +35,7 @@ from .sessions import (
 from .tracker import (
     GitHubTrackerAdapter,
     TrackerAdapter,
+    TrackerApprovalRecord,
     TrackerConflictError,
     StructuredDecision,
     TrackerDecisionRecord,
@@ -86,6 +96,46 @@ class StructuredDecisionConflict(ValueError):
 
 class TrackerDecisionConfirmationError(TrackerError):
     """Raised when a tracker mutation is not visible in authoritative history."""
+
+
+class TrackerApprovalConfirmationError(TrackerError):
+    """Raised when an approval event is not visible in tracker history."""
+
+
+class ApprovalRequestConflict(ValueError):
+    """Raised when a stable approval or mutation id belongs to other content."""
+
+    def __init__(self, *, request_id: str, reason: str) -> None:
+        self.request_id = request_id
+        self.reason = reason
+        super().__init__(f"Approval request conflict for {request_id}: {reason}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "approval_conflict",
+            "request_id": self.request_id,
+            "reason": self.reason,
+            "retryable": False,
+        }
+
+
+class ApprovalEnforcementError(PermissionError):
+    """Raised after policy rejects an approval request or protected action."""
+
+    def __init__(self, *, action: str, map_id: str, reason: str) -> None:
+        self.action = action
+        self.map_id = map_id
+        self.reason = reason
+        super().__init__(f"Approval enforcement denied {action}: {reason}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "approval_denied",
+            "action": self.action,
+            "map_id": self.map_id,
+            "reason": self.reason,
+            "retryable": False,
+        }
 
 
 class MapTransitionError(ValueError):
@@ -163,6 +213,7 @@ class MapGovernanceApplication:
         session_runner: CEOSessionRunner | None = None,
         profile_name: str | None = None,
         clock: Callable[[], datetime] | None = None,
+        authority_policy: AuthorityEnvelopePolicy | None = None,
     ) -> None:
         self._plugin_root = plugin_root.resolve()
         self._storage = PluginStorage(storage_root)
@@ -170,6 +221,9 @@ class MapGovernanceApplication:
         self._session_runner = session_runner
         self._profile_name = profile_name
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._authority_policy = (
+            authority_policy or AuthorityEnvelopePolicy.from_settings(None)
+        )
 
     def health(self) -> dict[str, Any]:
         """Return readiness for the application and its owned storage."""
@@ -256,7 +310,7 @@ class MapGovernanceApplication:
         for card in self.board()["maps"]:
             if card["id"] == map_id:
                 card["recent_decisions"] = self._storage.recent_decisions(map_id=map_id)
-                card["approvals"] = {"count": 0, "items": []}
+                card["approvals"] = self._approval_collection(map_id=map_id)
                 card["delivery_summary"] = {"state": "not_reported"}
                 return card
         raise MapBindingError(f"Map is not bound: {map_id}")
@@ -277,6 +331,7 @@ class MapGovernanceApplication:
             "map": (detail := self.map_detail(map_id=map_id)),
             "recent_decisions": detail["recent_decisions"],
             "approvals": detail["approvals"],
+            "authority_envelope": self._authority_policy.projection(),
             "delivery_summary": detail["delivery_summary"],
         }
 
@@ -299,6 +354,23 @@ class MapGovernanceApplication:
                 action="record_decision",
                 request_identity=request_identity,
                 reason="decision_authority_mismatch",
+            )
+        authority_context = decision.authority_context or {}
+        decision_authority = self._authority_policy.classify(
+            decision.type,
+            decision_payload=authority_context.get("decision_payload"),
+            requested_scope=authority_context.get("requested_scope"),
+        )
+        if decision_authority != "ceo":
+            self._deny_governance_request(
+                map_id=map_id,
+                action="record_decision",
+                request_identity=request_identity,
+                reason=(
+                    "chairman_approval_required"
+                    if decision_authority == "chairman"
+                    else "decision_class_not_configured"
+                ),
             )
         lock_key = f"{self._storage.database}:{map_id}"
         with _operation_lock("decision", lock_key):
@@ -375,6 +447,571 @@ class MapGovernanceApplication:
             },
             "confirmed_at": confirmed_at,
         }
+
+    def request_approval(
+        self,
+        *,
+        map_id: str,
+        request_identity: GovernanceRequestIdentity,
+        packet: ApprovalPacket,
+    ) -> dict[str, Any]:
+        """Persist one CEO escalation only after tracker history confirms it."""
+        self._authorize_ceo_request(
+            map_id=map_id,
+            action="request_approval",
+            request_identity=request_identity,
+        )
+        decision_authority = self._authority_policy.classify(
+            packet.decision_class,
+            decision_payload=packet.decision_payload,
+            requested_scope=packet.requested_scope,
+        )
+        if decision_authority == "ceo":
+            self._deny_approval_enforcement(
+                map_id=map_id,
+                action="request_approval",
+                reason="decision_within_ceo_authority",
+                profile_name=request_identity.profile_name,
+                session_id=request_identity.session_id,
+            )
+        if decision_authority == "unconfigured":
+            self._deny_approval_enforcement(
+                map_id=map_id,
+                action="request_approval",
+                reason="decision_class_not_configured",
+                profile_name=request_identity.profile_name,
+                session_id=request_identity.session_id,
+            )
+        if packet.requested_scope.get("map_id") != map_id:
+            self._deny_approval_enforcement(
+                map_id=map_id,
+                action="request_approval",
+                reason="approval_scope_mismatch",
+                profile_name=request_identity.profile_name,
+                session_id=request_identity.session_id,
+            )
+        binding = self._storage.map_binding(map_id)
+        if binding is None:
+            raise MapBindingError(f"Map is not bound: {map_id}")
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("approval", lock_key):
+            with self._storage.approval_lease(map_id):
+                existing = self._storage.approval(packet.request_id)
+                if existing is not None:
+                    if (
+                        existing["map_id"] != map_id
+                        or existing["packet_hash"] != packet.packet_hash
+                    ):
+                        raise ApprovalRequestConflict(
+                            request_id=packet.request_id,
+                            reason="stable request identity belongs to another packet",
+                        )
+                    return {
+                        "map_id": map_id,
+                        "approval": self._approval_projection(existing),
+                        "idempotent": True,
+                    }
+
+                requested_at = self._synchronized_at()
+                event = ApprovalHistoryEvent(
+                    event_id=f"approval:{packet.request_id}:request",
+                    request_id=packet.request_id,
+                    event_type="requested",
+                    occurred_at=requested_at,
+                    payload_hash=packet.payload_hash,
+                    details={**packet.payload(), "packet_hash": packet.packet_hash},
+                )
+                confirmed = self._append_confirmed_approval_event(
+                    issue_url=binding["issue_url"],
+                    issue_id=map_id,
+                    event=event,
+                )
+                confirmed_requested_at = confirmed.event.occurred_at
+                try:
+                    self._storage.save_approval_request(
+                        map_id=map_id,
+                        packet=packet.payload(),
+                        packet_hash=packet.packet_hash,
+                        requested_by_profile=request_identity.profile_name,
+                        requested_by_session=request_identity.session_id,
+                        requested_at=confirmed_requested_at,
+                        tracker_record_id=confirmed.tracker_record_id,
+                        tracker_record_url=confirmed.tracker_record_url,
+                    )
+                except ValueError as error:
+                    raise ApprovalRequestConflict(
+                        request_id=packet.request_id,
+                        reason="stable request identity belongs to another packet",
+                    ) from error
+                stored = self._storage.approval(packet.request_id)
+                if stored is None:  # pragma: no cover - SQLite contract guard
+                    raise RuntimeError("Approval ledger did not persist the request")
+                return {
+                    "map_id": map_id,
+                    "approval": self._approval_projection(stored),
+                    "idempotent": False,
+                }
+
+    def decide_approval(
+        self,
+        *,
+        map_id: str,
+        request_id: str,
+        actor_identity: GovernanceActorIdentity,
+        decision: str,
+        note: str,
+    ) -> dict[str, Any]:
+        """Record an explicit chairman approve/reject/revision decision."""
+        self._authorize_chairman_request(
+            map_id=map_id,
+            action=f"approval:{decision}",
+            actor_identity=actor_identity,
+        )
+        if decision not in APPROVAL_DECISIONS:
+            raise ValueError("decision must be approved, rejected, or revision")
+        if not isinstance(note, str) or not note.strip():
+            raise ValueError("approval decision note must be a non-empty string")
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("approval", lock_key):
+            with self._storage.approval_lease(map_id):
+                approval = self._current_approval(request_id=request_id)
+                if approval is None or approval["map_id"] != map_id:
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action=f"approval:{decision}",
+                        reason="approval_missing",
+                        actor_identity=actor_identity,
+                    )
+                if approval["status"] == decision:
+                    if (
+                        approval["decided_by"] == actor_identity.actor_id
+                        and approval["decided_by_profile"]
+                        == actor_identity.profile_name
+                        and approval["decision_note"] == note.strip()
+                    ):
+                        return {
+                            "map_id": map_id,
+                            "approval": self._approval_projection(approval),
+                            "idempotent": True,
+                        }
+                    raise ApprovalRequestConflict(
+                        request_id=request_id,
+                        reason="chairman decision identity has different content",
+                    )
+                if approval["status"] != "pending":
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action=f"approval:{decision}",
+                        reason=self._approval_status_reason(approval["status"]),
+                        actor_identity=actor_identity,
+                    )
+
+                decided_at = self._synchronized_at()
+                expires_at = (
+                    self._format_datetime(
+                        self._current_datetime() + self._authority_policy.approval_ttl
+                    )
+                    if decision == "approved"
+                    else None
+                )
+                event = ApprovalHistoryEvent(
+                    event_id=f"approval:{request_id}:decision",
+                    request_id=request_id,
+                    event_type=decision,
+                    occurred_at=decided_at,
+                    payload_hash=approval["payload_hash"],
+                    details={
+                        "decision": decision,
+                        "actor_id": actor_identity.actor_id,
+                        "actor_profile": actor_identity.profile_name,
+                        "note": note.strip(),
+                        "expires_at": expires_at,
+                    },
+                )
+                binding = self._storage.map_binding(map_id)
+                if binding is None:
+                    raise MapBindingError(f"Map is not bound: {map_id}")
+                confirmed = self._append_confirmed_approval_event(
+                    issue_url=binding["issue_url"],
+                    issue_id=map_id,
+                    event=event,
+                )
+                confirmed_details = confirmed.event.details
+                self._storage.apply_approval_decision(
+                    request_id=request_id,
+                    decision=decision,
+                    actor_id=str(confirmed_details["actor_id"]),
+                    actor_profile=str(confirmed_details["actor_profile"]),
+                    note=str(confirmed_details["note"]),
+                    decided_at=confirmed.event.occurred_at,
+                    expires_at=(
+                        str(confirmed_details["expires_at"])
+                        if confirmed_details.get("expires_at")
+                        else None
+                    ),
+                    tracker_record_id=confirmed.tracker_record_id,
+                    tracker_record_url=confirmed.tracker_record_url,
+                )
+                stored = self._storage.approval(request_id)
+                if stored is None:  # pragma: no cover - SQLite contract guard
+                    raise RuntimeError("Approval ledger lost the decision")
+                return {
+                    "map_id": map_id,
+                    "approval": self._approval_projection(stored),
+                    "idempotent": False,
+                }
+
+    def revoke_approval(
+        self,
+        *,
+        map_id: str,
+        request_id: str,
+        actor_identity: GovernanceActorIdentity,
+        note: str,
+    ) -> dict[str, Any]:
+        """Revoke an unconsumed chairman approval through the application seam."""
+        self._authorize_chairman_request(
+            map_id=map_id,
+            action="approval:revoke",
+            actor_identity=actor_identity,
+        )
+        if not isinstance(note, str) or not note.strip():
+            raise ValueError("approval revocation note must be a non-empty string")
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("approval", lock_key):
+            with self._storage.approval_lease(map_id):
+                approval = self._current_approval(request_id=request_id)
+                if approval is None or approval["map_id"] != map_id:
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action="approval:revoke",
+                        reason="approval_missing",
+                        actor_identity=actor_identity,
+                    )
+                if approval["status"] == "revoked":
+                    if (
+                        approval["decided_by"] == actor_identity.actor_id
+                        and approval["decision_note"] == note.strip()
+                    ):
+                        return {
+                            "map_id": map_id,
+                            "approval": self._approval_projection(approval),
+                            "idempotent": True,
+                        }
+                    raise ApprovalRequestConflict(
+                        request_id=request_id,
+                        reason="revocation identity has different content",
+                    )
+                if approval["status"] != "approved":
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action="approval:revoke",
+                        reason=self._approval_status_reason(approval["status"]),
+                        actor_identity=actor_identity,
+                    )
+                revoked_at = self._synchronized_at()
+                event = ApprovalHistoryEvent(
+                    event_id=f"approval:{request_id}:revocation",
+                    request_id=request_id,
+                    event_type="revoked",
+                    occurred_at=revoked_at,
+                    payload_hash=approval["payload_hash"],
+                    details={
+                        "actor_id": actor_identity.actor_id,
+                        "actor_profile": actor_identity.profile_name,
+                        "note": note.strip(),
+                    },
+                )
+                binding = self._storage.map_binding(map_id)
+                if binding is None:
+                    raise MapBindingError(f"Map is not bound: {map_id}")
+                confirmed = self._append_confirmed_approval_event(
+                    issue_url=binding["issue_url"],
+                    issue_id=map_id,
+                    event=event,
+                )
+                confirmed_details = confirmed.event.details
+                self._storage.revoke_approval(
+                    request_id=request_id,
+                    actor_id=str(confirmed_details["actor_id"]),
+                    actor_profile=str(confirmed_details["actor_profile"]),
+                    note=str(confirmed_details["note"]),
+                    revoked_at=confirmed.event.occurred_at,
+                    tracker_record_id=confirmed.tracker_record_id,
+                    tracker_record_url=confirmed.tracker_record_url,
+                )
+                stored = self._storage.approval(request_id)
+                if stored is None:  # pragma: no cover
+                    raise RuntimeError("Approval ledger lost the revocation")
+                return {
+                    "map_id": map_id,
+                    "approval": self._approval_projection(stored),
+                    "idempotent": False,
+                }
+
+    def _append_confirmed_approval_event(
+        self,
+        *,
+        issue_url: str,
+        issue_id: str,
+        event: ApprovalHistoryEvent,
+    ) -> TrackerApprovalRecord:
+        records = self._approval_records_by_event_id(
+            self._tracker.list_approval_events(issue_url)
+        )
+        existing = records.get(event.event_id)
+        if existing is None:
+            self._tracker.append_approval_event(
+                issue_url,
+                issue_id=issue_id,
+                event=event,
+            )
+            records = self._approval_records_by_event_id(
+                self._tracker.list_approval_events(issue_url)
+            )
+            existing = records.get(event.event_id)
+        if existing is None:
+            raise TrackerApprovalConfirmationError(
+                "Tracker did not confirm the approval event in Issue history"
+            )
+        if not self._approval_events_semantically_compatible(
+            existing.event,
+            event,
+        ):
+            raise ApprovalRequestConflict(
+                request_id=event.request_id,
+                reason="tracker event identity has different content",
+            )
+        return existing
+
+    @staticmethod
+    def _approval_events_semantically_compatible(
+        existing: ApprovalHistoryEvent,
+        requested: ApprovalHistoryEvent,
+    ) -> bool:
+        if (
+            existing.event_id != requested.event_id
+            or existing.request_id != requested.request_id
+            or existing.event_type != requested.event_type
+            or existing.payload_hash != requested.payload_hash
+        ):
+            return False
+        if existing.event_type == "requested":
+            return existing.details == requested.details
+        stable_keys = {"actor_id", "actor_profile", "note", "decision"}
+        return all(
+            existing.details.get(key) == requested.details.get(key)
+            for key in stable_keys
+            if key in existing.details or key in requested.details
+        )
+
+    @staticmethod
+    def _approval_records_by_event_id(
+        records: list[TrackerApprovalRecord],
+    ) -> dict[str, TrackerApprovalRecord]:
+        by_id: dict[str, TrackerApprovalRecord] = {}
+        for record in records:
+            existing = by_id.get(record.event.event_id)
+            if existing is not None and existing.event != record.event:
+                raise ApprovalRequestConflict(
+                    request_id=record.event.request_id,
+                    reason="tracker event identity has conflicting history",
+                )
+            by_id.setdefault(record.event.event_id, record)
+        return by_id
+
+    def _authorize_chairman_request(
+        self,
+        *,
+        map_id: str,
+        action: str,
+        actor_identity: GovernanceActorIdentity,
+    ) -> None:
+        binding = self._storage.ceo_session_binding(map_id)
+        if binding is None:
+            self._deny_governance_actor(
+                map_id=map_id,
+                action=action,
+                actor_identity=actor_identity,
+                reason="canonical_session_missing",
+            )
+        if actor_identity.role != "chairman":
+            self._deny_governance_actor(
+                map_id=map_id,
+                action=action,
+                actor_identity=actor_identity,
+                reason="chairman_actor_required",
+            )
+        if not actor_identity.actor_id:
+            self._deny_governance_actor(
+                map_id=map_id,
+                action=action,
+                actor_identity=actor_identity,
+                reason="chairman_actor_missing",
+            )
+        if actor_identity.profile_name != binding["profile_name"]:
+            self._deny_governance_actor(
+                map_id=map_id,
+                action=action,
+                actor_identity=actor_identity,
+                reason="profile_mismatch",
+            )
+        if not self._authority_policy.authorizes_chairman_actor(
+            actor_identity.actor_id
+        ):
+            self._deny_governance_actor(
+                map_id=map_id,
+                action=action,
+                actor_identity=actor_identity,
+                reason="chairman_actor_not_authorized",
+            )
+
+    def _deny_governance_actor(
+        self,
+        *,
+        map_id: str,
+        action: str,
+        actor_identity: GovernanceActorIdentity,
+        reason: str,
+    ) -> NoReturn:
+        self._storage.save_authorization_denial(
+            action=action,
+            map_id=map_id,
+            profile_name=actor_identity.profile_name,
+            session_id=actor_identity.session_id,
+            reason=reason,
+            denied_at=self._synchronized_at(),
+        )
+        raise GovernanceAuthorizationError(action=action, map_id=map_id, reason=reason)
+
+    def _deny_approval_enforcement(
+        self,
+        *,
+        map_id: str,
+        action: str,
+        reason: str,
+        actor_identity: GovernanceActorIdentity | None = None,
+        profile_name: str = "",
+        session_id: str = "",
+    ) -> NoReturn:
+        if actor_identity is not None:
+            profile_name = actor_identity.profile_name
+            session_id = actor_identity.session_id
+        self._storage.save_authorization_denial(
+            action=action,
+            map_id=map_id,
+            profile_name=profile_name,
+            session_id=session_id,
+            reason=reason,
+            denied_at=self._synchronized_at(),
+        )
+        raise ApprovalEnforcementError(action=action, map_id=map_id, reason=reason)
+
+    def _current_approval(self, *, request_id: str) -> dict[str, Any] | None:
+        approval = self._storage.approval(request_id)
+        if approval is None:
+            return None
+        if approval["status"] == "approved" and approval.get("expires_at"):
+            expires_at = datetime.fromisoformat(
+                str(approval["expires_at"]).replace("Z", "+00:00")
+            )
+            if expires_at <= self._current_datetime():
+                self._storage.expire_approval(
+                    request_id=request_id,
+                    expired_at=self._synchronized_at(),
+                )
+                approval = self._storage.approval(request_id)
+        return approval
+
+    def _approval_collection(self, *, map_id: str) -> dict[str, Any]:
+        approvals = []
+        for row in self._storage.approvals(map_id=map_id):
+            current = self._current_approval(request_id=row["request_id"])
+            if current is not None:
+                approvals.append(self._approval_projection(current))
+        return {"count": len(approvals), "items": approvals}
+
+    def _approval_projection(self, row: dict[str, Any]) -> dict[str, Any]:
+        decision = None
+        if row.get("decided_by"):
+            decision = {
+                "actor_id": row["decided_by"],
+                "actor_profile": row["decided_by_profile"],
+                "note": row["decision_note"],
+                "decided_at": row["decided_at"],
+            }
+        consumption = None
+        if row.get("consumed_by_mutation_id"):
+            consumption = {
+                "mutation_id": row["consumed_by_mutation_id"],
+                "consumed_at": row["consumed_at"],
+            }
+        history = []
+        for event in self._storage.approval_history(request_id=row["request_id"]):
+            history.append(
+                {
+                    "event_id": event["event_id"],
+                    "event_type": event["event_type"],
+                    "occurred_at": event["occurred_at"],
+                    "actor_id": event["actor_id"],
+                    "actor_profile": event["actor_profile"],
+                    "note": event["note"],
+                    "expires_at": event["expires_at"],
+                    "payload_hash": event["payload_hash"],
+                    "tracker": (
+                        {
+                            "id": event["tracker_record_id"],
+                            "url": event["tracker_record_url"],
+                        }
+                        if event["tracker_record_id"]
+                        else None
+                    ),
+                }
+            )
+        return {
+            "request_id": row["request_id"],
+            "decision_class": row["decision_class"],
+            "proposed_action": row["proposed_action"],
+            "alternatives": row["alternatives"],
+            "rationale": row["rationale"],
+            "cost_risk": row["cost_risk"],
+            "evidence": row["evidence"],
+            "requested_scope": row["requested_scope"],
+            "decision_payload": row["decision_payload"],
+            "payload_hash": row["payload_hash"],
+            "status": row["status"],
+            "requested_at": row["requested_at"],
+            "expires_at": row["expires_at"],
+            "decision": decision,
+            "consumption": consumption,
+            "history": history,
+            "tracker": {
+                "request": {
+                    "id": row["tracker_request_id"],
+                    "url": row["tracker_request_url"],
+                },
+                "decision": (
+                    {
+                        "id": row["tracker_decision_id"],
+                        "url": row["tracker_decision_url"],
+                    }
+                    if row.get("tracker_decision_id")
+                    else None
+                ),
+            },
+        }
+
+    @staticmethod
+    def _approval_status_reason(status: str) -> str:
+        return {
+            "pending": "approval_pending",
+            "approved": "approval_already_approved",
+            "rejected": "approval_rejected",
+            "revision": "approval_revision_required",
+            "revoked": "approval_revoked",
+            "expired": "approval_expired",
+            "consumed": "approval_consumed",
+        }.get(status, "approval_invalid")
 
     def _authorize_ceo_request(
         self,
@@ -851,13 +1488,30 @@ class MapGovernanceApplication:
         map_id: str,
         expected_stage: str,
         requested_stage: str,
+        approval_request_id: str | None = None,
+        mutation_id: str | None = None,
+        actor_identity: GovernanceActorIdentity | None = None,
     ) -> dict[str, Any]:
         """Commit a governed stage transition to the tracker, then project it."""
-        with _operation_lock("transition", map_id):
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("transition", lock_key):
+            if self._transition_requires_approval(requested_stage=requested_stage):
+                with self._storage.approval_lease(map_id):
+                    return self._transition_map(
+                        map_id=map_id,
+                        expected_stage=expected_stage,
+                        requested_stage=requested_stage,
+                        approval_request_id=approval_request_id,
+                        mutation_id=mutation_id,
+                        actor_identity=actor_identity,
+                    )
             return self._transition_map(
                 map_id=map_id,
                 expected_stage=expected_stage,
                 requested_stage=requested_stage,
+                approval_request_id=approval_request_id,
+                mutation_id=mutation_id,
+                actor_identity=actor_identity,
             )
 
     def _transition_map(
@@ -866,6 +1520,9 @@ class MapGovernanceApplication:
         map_id: str,
         expected_stage: str,
         requested_stage: str,
+        approval_request_id: str | None,
+        mutation_id: str | None,
+        actor_identity: GovernanceActorIdentity | None,
     ) -> dict[str, Any]:
         binding = self._storage.map_binding(map_id)
         if binding is None:
@@ -876,10 +1533,114 @@ class MapGovernanceApplication:
                 f"CEO project is not configured: {binding['project_id']}"
             )
 
+        protected = self._transition_requires_approval(requested_stage=requested_stage)
+        action = "transition_map"
+        scope = {"map_id": map_id}
+        payload = {
+            "expected_stage": expected_stage,
+            "requested_stage": requested_stage,
+        }
+        payload_hash = normalized_hash(
+            {"action": action, "scope": scope, "payload": payload}
+        )
+        existing_mutation = None
+        approval = None
+        if protected:
+            if not approval_request_id:
+                self._deny_approval_enforcement(
+                    map_id=map_id,
+                    action=action,
+                    reason="approval_missing",
+                    actor_identity=actor_identity,
+                )
+            if not mutation_id:
+                self._deny_approval_enforcement(
+                    map_id=map_id,
+                    action=action,
+                    reason="mutation_id_missing",
+                    actor_identity=actor_identity,
+                )
+            if len(mutation_id) > 128:
+                raise ValueError("mutation_id must not exceed 128 characters")
+            existing_mutation = self._storage.protected_mutation(mutation_id)
+            if existing_mutation is not None:
+                if (
+                    existing_mutation["map_id"] != map_id
+                    or existing_mutation["request_id"] != approval_request_id
+                    or existing_mutation["action"] != action
+                    or normalized_json(existing_mutation["scope"])
+                    != normalized_json(scope)
+                    or normalized_json(existing_mutation["payload"])
+                    != normalized_json(payload)
+                    or existing_mutation["payload_hash"] != payload_hash
+                ):
+                    raise ApprovalRequestConflict(
+                        request_id=approval_request_id,
+                        reason="stable mutation identity belongs to another payload",
+                    )
+            approval = self._current_approval(request_id=approval_request_id)
+            if approval is None or approval["map_id"] != map_id:
+                self._deny_approval_enforcement(
+                    map_id=map_id,
+                    action=action,
+                    reason="approval_missing",
+                    actor_identity=actor_identity,
+                )
+            if existing_mutation is None:
+                if approval["status"] != "approved":
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action=action,
+                        reason=self._approval_status_reason(approval["status"]),
+                        actor_identity=actor_identity,
+                    )
+                self._validate_approval_action(
+                    map_id=map_id,
+                    approval=approval,
+                    decision_class=self._transition_decision_class(requested_stage),
+                    action=action,
+                    scope=scope,
+                    payload=payload,
+                    actor_identity=actor_identity,
+                )
+            elif approval["status"] != "consumed":
+                self._deny_approval_enforcement(
+                    map_id=map_id,
+                    action=action,
+                    reason=self._approval_status_reason(approval["status"]),
+                    actor_identity=actor_identity,
+                )
+
         current_issue = self._tracker.get_issue(binding["issue_url"])
         if current_issue.id != map_id:
             raise MapBindingError("Bound GitHub Issue identity changed")
         current_stage = self._executive_stage(current_issue)
+        if (
+            protected
+            and existing_mutation is not None
+            and current_stage == requested_stage
+        ):
+            synchronized_at = self._synchronized_at()
+            card = self._stored_card(
+                current_issue,
+                project_id=binding["project_id"],
+                synchronized_at=synchronized_at,
+            )
+            self._storage.save_map_projection(card)
+            self._storage.confirm_protected_mutation(
+                mutation_id=mutation_id or "",
+                confirmed_at=synchronized_at,
+            )
+            result = self._card_with_summary(
+                card,
+                project_url=project["project_url"],
+            )
+            result["protected_mutation"] = {
+                "mutation_id": mutation_id,
+                "approval_request_id": approval_request_id,
+                "idempotent": True,
+            }
+            return result
         if current_stage != expected_stage:
             raise MapTransitionConflict(
                 current_stage=current_stage,
@@ -892,6 +1653,34 @@ class MapGovernanceApplication:
                 requested_stage=requested_stage,
                 reason=rejection_reason(current_stage, requested_stage),
             )
+
+        mutation_replay = existing_mutation is not None
+        if protected and existing_mutation is None:
+            try:
+                mutation_replay, reservation_status = (
+                    self._storage.reserve_protected_mutation(
+                        mutation_id=mutation_id or "",
+                        map_id=map_id,
+                        request_id=approval_request_id or "",
+                        action=action,
+                        scope=scope,
+                        payload=payload,
+                        payload_hash=payload_hash,
+                        reserved_at=self._synchronized_at(),
+                    )
+                )
+            except ValueError as error:
+                raise ApprovalRequestConflict(
+                    request_id=approval_request_id or "",
+                    reason=str(error),
+                ) from error
+            if reservation_status not in {"reserved", "confirmed"}:
+                self._deny_approval_enforcement(
+                    map_id=map_id,
+                    action=action,
+                    reason=self._approval_status_reason(reservation_status),
+                    actor_identity=actor_identity,
+                )
 
         try:
             committed_issue = self._tracker.transition_issue_stage(
@@ -929,6 +1718,11 @@ class MapGovernanceApplication:
             project_id=binding["project_id"],
             synchronized_at=synchronized_at,
         )
+        if protected:
+            self._storage.confirm_protected_mutation(
+                mutation_id=mutation_id or "",
+                confirmed_at=synchronized_at,
+            )
         competing_stage = self._storage.compare_and_save_map_projection(
             card,
             expected_stage=expected_stage,
@@ -941,13 +1735,78 @@ class MapGovernanceApplication:
                     "local projection changed after tracker commit; refresh to reconcile"
                 ),
             )
-        return self._card_with_summary(
+        result = self._card_with_summary(
             card,
             project_url=project["project_url"],
         )
+        if protected:
+            result["protected_mutation"] = {
+                "mutation_id": mutation_id,
+                "approval_request_id": approval_request_id,
+                "idempotent": mutation_replay,
+            }
+        return result
+
+    def _validate_approval_action(
+        self,
+        *,
+        map_id: str,
+        approval: dict[str, Any],
+        decision_class: str,
+        action: str,
+        scope: dict[str, Any],
+        payload: dict[str, Any],
+        actor_identity: GovernanceActorIdentity | None,
+    ) -> None:
+        reason = None
+        if approval["proposed_action"] != action:
+            reason = "approval_action_mismatch"
+        elif normalized_json(approval["requested_scope"]) != normalized_json(scope):
+            reason = "approval_scope_mismatch"
+        elif normalized_json(approval["decision_payload"]) != normalized_json(payload):
+            reason = "approval_payload_mismatch"
+        elif approval["decision_class"] != decision_class:
+            reason = "approval_decision_class_mismatch"
+        elif approval["payload_hash"] != normalized_hash(
+            {"action": action, "scope": scope, "payload": payload}
+        ):
+            reason = "approval_payload_mismatch"
+        if reason is not None:
+            self._deny_approval_enforcement(
+                map_id=map_id,
+                action=action,
+                reason=reason,
+                actor_identity=actor_identity,
+            )
+
+    def _transition_requires_approval(self, *, requested_stage: str) -> bool:
+        return (
+            self._authority_policy.classify(
+                self._transition_decision_class(requested_stage),
+                decision_payload={"requested_stage": requested_stage},
+            )
+            != "ceo"
+        )
+
+    @staticmethod
+    def _transition_decision_class(requested_stage: str) -> str:
+        return (
+            "delivery_authorization"
+            if requested_stage == "authorized"
+            else "operational"
+        )
 
     def _synchronized_at(self) -> str:
+        return self._format_datetime(self._current_datetime())
+
+    def _current_datetime(self) -> datetime:
         value = self._clock()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _format_datetime(value: datetime) -> str:
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1065,6 +1924,14 @@ class MapGovernanceApplication:
     ) -> dict[str, Any]:
         card = self._card_projection(row, project_url=project_url)
         card["decision_summary"] = self._storage.decision_summary(map_id=card["id"])
+        approvals = self._approval_collection(map_id=card["id"])
+        card["approval_summary"] = {
+            "count": approvals["count"],
+            "pending_count": sum(
+                item["status"] == "pending" for item in approvals["items"]
+            ),
+            "latest": approvals["items"][0] if approvals["items"] else None,
+        }
         return card
 
     @staticmethod

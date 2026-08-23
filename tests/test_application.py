@@ -219,6 +219,7 @@ def test_operator_binds_an_existing_issue_once_as_a_complete_map_card(tmp_path):
         "stage": "authorized",
         "available_transitions": ["delivery", "parked"],
         "decision_summary": {"count": 0, "latest": None},
+        "approval_summary": {"count": 0, "pending_count": 0, "latest": None},
         "ceo_session": {"state": "unbound"},
         "last_synchronized_at": "2026-08-23T07:30:00Z",
     }
@@ -496,7 +497,6 @@ def test_stale_requested_stage_conflicts_before_tracker_mutation(tmp_path):
         ("discovery", "awaiting-approval"),
         ("discovery", "parked"),
         ("awaiting-approval", "discovery"),
-        ("awaiting-approval", "authorized"),
         ("awaiting-approval", "parked"),
         ("authorized", "delivery"),
         ("authorized", "parked"),

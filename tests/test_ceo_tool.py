@@ -51,6 +51,7 @@ def test_ceo_skill_and_named_toolset_register_with_request_scoped_identity(
     assert registered["schema"]["parameters"]["properties"]["action"]["enum"] == [
         "inspect",
         "record_decision",
+        "request_approval",
     ]
     decision_schema = registered["schema"]["parameters"]["properties"]["decision"]
     assert decision_schema["properties"]["authority"] == {
@@ -130,6 +131,10 @@ def test_ceo_tool_delegates_structured_decision_without_identity_arguments(
                     "authority": "ceo",
                     "affected_stage": "authorized",
                     "timestamp": "2026-08-23T09:25:00Z",
+                    "authority_context": {
+                        "decision_payload": {"cohort_size": 50},
+                        "requested_scope": {"map_id": "I_atlas_41"},
+                    },
                 },
             },
             session_id="canonical-live-session",
@@ -148,6 +153,10 @@ def test_ceo_tool_delegates_structured_decision_without_identity_arguments(
         "authority": "ceo",
         "affected_stage": "authorized",
         "timestamp": "2026-08-23T09:25:00Z",
+        "authority_context": {
+            "decision_payload": {"cohort_size": 50},
+            "requested_scope": {"map_id": "I_atlas_41"},
+        },
     }
 
     blocked = hooks[0][1](
@@ -165,3 +174,65 @@ def test_ceo_tool_delegates_structured_decision_without_identity_arguments(
         )
         is None
     )
+
+
+def test_ceo_tool_submits_complete_approval_packet_without_actor_override(
+    monkeypatch,
+):
+    calls = []
+
+    class ApplicationProbe:
+        def request_approval(self, **arguments):
+            calls.append(arguments)
+            return {
+                "operation": "request_approval",
+                "payload_hash": arguments["packet"].payload_hash,
+            }
+
+        def enforce_canonical_ceo_toolset(self, **_arguments):
+            return True
+
+    monkeypatch.setattr(
+        ceo_tool,
+        "application_for_profile",
+        lambda profile: ApplicationProbe(),
+    )
+    registrations = []
+    context = SimpleNamespace(
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: registrations.append(kwargs),
+        register_hook=lambda *args: None,
+    )
+    ceo_tool.register_ceo_capabilities(context)
+
+    result = json.loads(
+        registrations[0]["handler"](
+            {
+                "action": "request_approval",
+                "map_id": "I_atlas_41",
+                "approval_packet": {
+                    "request_id": "approval-delivery-001",
+                    "decision_class": "delivery_authorization",
+                    "proposed_action": "transition_map",
+                    "alternatives": ["Authorize", "Revise"],
+                    "rationale": "Delivery evidence is ready.",
+                    "cost_risk": "Two engineering weeks.",
+                    "evidence": ["https://github.com/acme/atlas/issues/41"],
+                    "requested_scope": {"map_id": "I_atlas_41"},
+                    "decision_payload": {
+                        "expected_stage": "awaiting-approval",
+                        "requested_stage": "authorized",
+                    },
+                },
+            },
+            session_id="canonical-live-session",
+        )
+    )
+
+    assert result["operation"] == "request_approval"
+    assert result["payload_hash"].startswith("sha256:")
+    assert calls[0]["request_identity"] == GovernanceRequestIdentity(
+        "ceo", "canonical-live-session"
+    )
+    assert calls[0]["packet"].request_id == "approval-delivery-001"

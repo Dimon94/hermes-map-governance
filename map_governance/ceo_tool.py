@@ -7,12 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from .application import (
+    ApprovalEnforcementError,
+    ApprovalRequestConflict,
     GovernanceAuthorizationError,
     GovernanceRequestIdentity,
     MapBindingError,
     StructuredDecisionConflict,
     TrackerDecisionConfirmationError,
+    TrackerApprovalConfirmationError,
 )
+from .approvals import ApprovalPacket
 from .runtime import application_for_profile
 from .tracker import StructuredDecision, TrackerError
 
@@ -24,13 +28,16 @@ CEO_SKILL = Path(__file__).resolve().parents[1] / "skills" / "ceo" / "SKILL.md"
 
 CEO_TOOL_SCHEMA = {
     "name": CEO_TOOL_NAME,
-    "description": "Inspect one governed Map or record one CEO decision.",
+    "description": (
+        "Inspect one governed Map, record an autonomous CEO decision, or submit "
+        "a content-bound chairman approval request."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["inspect", "record_decision"],
+                "enum": ["inspect", "record_decision", "request_approval"],
             },
             "map_id": {
                 "type": "string",
@@ -49,6 +56,14 @@ CEO_TOOL_SCHEMA = {
                         "type": "string",
                         "format": "date-time",
                     },
+                    "authority_context": {
+                        "type": "object",
+                        "properties": {
+                            "decision_payload": {"type": "object"},
+                            "requested_scope": {"type": "object"},
+                        },
+                        "additionalProperties": False,
+                    },
                 },
                 "required": [
                     "decision_id",
@@ -57,6 +72,40 @@ CEO_TOOL_SCHEMA = {
                     "authority",
                     "affected_stage",
                     "timestamp",
+                ],
+                "additionalProperties": False,
+            },
+            "approval_packet": {
+                "type": "object",
+                "properties": {
+                    "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "decision_class": {"type": "string", "minLength": 1},
+                    "proposed_action": {"type": "string", "minLength": 1},
+                    "alternatives": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "rationale": {"type": "string", "minLength": 1},
+                    "cost_risk": {"type": "string", "minLength": 1},
+                    "evidence": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "requested_scope": {"type": "object"},
+                    "decision_payload": {"type": "object"},
+                },
+                "required": [
+                    "request_id",
+                    "decision_class",
+                    "proposed_action",
+                    "alternatives",
+                    "rationale",
+                    "cost_risk",
+                    "evidence",
+                    "requested_scope",
+                    "decision_payload",
                 ],
                 "additionalProperties": False,
             },
@@ -103,15 +152,39 @@ def register_ceo_capabilities(ctx) -> None:
                     request_identity=identity,
                     decision=StructuredDecision(**raw_decision),
                 )
+            elif action == "request_approval":
+                raw_packet = arguments.get("approval_packet")
+                if not isinstance(raw_packet, dict):
+                    raise ValueError("approval_packet is required for request_approval")
+                result = application.request_approval(
+                    map_id=map_id,
+                    request_identity=identity,
+                    packet=ApprovalPacket(**raw_packet),
+                )
             else:
-                raise ValueError("action must be inspect or record_decision")
+                raise ValueError(
+                    "action must be inspect, record_decision, or request_approval"
+                )
             return json.dumps(result, ensure_ascii=False, sort_keys=True)
         except (
             GovernanceAuthorizationError,
+            ApprovalEnforcementError,
+            ApprovalRequestConflict,
             StructuredDecisionConflict,
         ) as error:
             return json.dumps({"error": error.as_dict()}, sort_keys=True)
         except TrackerDecisionConfirmationError as error:
+            return json.dumps(
+                {
+                    "error": {
+                        "type": "tracker_confirmation_error",
+                        "reason": str(error),
+                        "retryable": True,
+                    }
+                },
+                sort_keys=True,
+            )
+        except TrackerApprovalConfirmationError as error:
             return json.dumps(
                 {
                     "error": {

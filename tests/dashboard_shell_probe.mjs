@@ -9,10 +9,12 @@ const requestedPaths = [];
 const requestedOptions = [];
 const openedSessions = [];
 const effects = [];
+const confirmations = [];
 const state = [];
 let hookIndex = 0;
 let registeredName = null;
 let registeredPage = null;
+let chairmanDecisionRecorded = false;
 
 function createElement(type, props, ...children) {
   return { type, props: props || {}, children };
@@ -35,6 +37,10 @@ function useState(initialValue) {
 function fetchJSON(path, options) {
   requestedPaths.push(path);
   requestedOptions.push(options || {});
+  if (path.includes("/approvals/approval-delivery-001/decision?profile=")) {
+    chairmanDecisionRecorded = true;
+    return Promise.resolve({ status: "approved" });
+  }
   if (path.includes("/transitions?profile=")) {
     if (mode === "transition-failure") {
       return Promise.reject(new Error("GitHub denied the stage label update"));
@@ -53,6 +59,24 @@ function fetchJSON(path, options) {
     });
   }
   if (path.includes("/maps/I_atlas_41?profile=")) {
+    const approval = mode === "approval" ? {
+      request_id: "approval-delivery-001",
+      decision_class: "delivery_authorization",
+      proposed_action: "transition_map",
+      alternatives: ["Authorize delivery", "Return to discovery"],
+      rationale: "Delivery evidence is ready.",
+      cost_risk: "Two engineering weeks.",
+      evidence: ["https://github.com/acme/atlas/issues/41#issuecomment-7"],
+      requested_scope: { map_id: "I_atlas_41" },
+      decision_payload: {
+        expected_stage: "awaiting-approval",
+        requested_stage: "authorized",
+      },
+      payload_hash: "sha256:approval-payload",
+      status: chairmanDecisionRecorded ? "approved" : "pending",
+      requested_at: "2026-08-23T09:00:00Z",
+      expires_at: chairmanDecisionRecorded ? "2026-08-24T09:30:00Z" : null,
+    } : null;
     return Promise.resolve({
       id: "I_atlas_41",
       recent_decisions: [
@@ -65,7 +89,7 @@ function fetchJSON(path, options) {
           timestamp: "2026-08-23T09:28:00Z",
         },
       ],
-      approvals: { count: 0, items: [] },
+      approvals: approval ? { count: 1, items: [approval] } : { count: 0, items: [] },
       delivery_summary: { state: "not_reported" },
     });
   }
@@ -87,8 +111,10 @@ function fetchJSON(path, options) {
           url: "https://github.com/acme/atlas/issues/41",
         },
         title: "Map the Atlas launch",
-        stage: "authorized",
-        available_transitions: ["delivery", "parked"],
+        stage: mode === "approval" ? "awaiting-approval" : "authorized",
+        available_transitions: mode === "approval"
+          ? ["authorized", "discovery", "parked"]
+          : ["delivery", "parked"],
         decision_summary: {
           count: 1,
           latest: {
@@ -100,6 +126,14 @@ function fetchJSON(path, options) {
             timestamp: "2026-08-23T09:25:00Z",
           },
         },
+        approval_summary: mode === "approval" ? {
+          count: 1,
+          pending_count: chairmanDecisionRecorded ? 0 : 1,
+          latest: {
+            request_id: "approval-delivery-001",
+            status: chairmanDecisionRecorded ? "approved" : "pending",
+          },
+        } : { count: 0, pending_count: 0, latest: null },
         ceo_session: mode === "ready" || mode === "hydration-retry"
           ? { state: "ready", last_activity_at: "2026-08-23T09:05:00Z" }
           : { state: "unbound" },
@@ -136,6 +170,18 @@ function fetchJSON(path, options) {
 
 globalThis.window = {
   location: { search: "?profile=worker" },
+  confirm(message) {
+    confirmations.push(message);
+    return true;
+  },
+  prompt() {
+    return "Approved for the declared scope.";
+  },
+  crypto: {
+    randomUUID() {
+      return "transition-approved-001";
+    },
+  },
   __HERMES_PLUGIN_SDK__: {
     React: { createElement },
     fetchJSON,
@@ -227,7 +273,7 @@ if (mode !== "empty") {
   assert.match(renderedText, /Acme CEO portfolio/);
   assert.match(renderedText, /Map the Atlas launch/);
   assert.match(renderedText, /acme\/atlas#41/);
-  assert.match(renderedText, /authorized/);
+  assert.match(renderedText, mode === "approval" ? /awaiting-approval/ : /authorized/);
   assert.match(renderedText, /1 confirmed decision/);
   assert.match(renderedText, /product/);
   assert.match(renderedText, /Launch to the research cohort before widening access/);
@@ -253,8 +299,68 @@ if (mode !== "empty") {
   assert.match(detailText, /Recent confirmed decisions/);
   assert.match(detailText, /decision-atlas-scope-002/);
   assert.match(detailText, /Hold the public beta until cohort evidence is reviewed/);
-  assert.match(detailText, /Approvals: 0/);
+  assert.match(
+    detailText,
+    mode === "approval"
+      ? /Chairman approval packets.*approval-delivery-001.*Delivery evidence is ready/s
+      : /Chairman approval packets No approval requests/,
+  );
   assert.match(detailText, /Delivery: not_reported/);
+  if (mode === "approval") {
+    assert.match(detailText, /Alternatives.*Authorize delivery.*Return to discovery/s);
+    assert.match(detailText, /Cost \/ risk: Two engineering weeks/);
+    assert.match(detailText, /Decision content:.*awaiting-approval.*authorized/s);
+    assert.match(detailText, /sha256:approval-payload/);
+    assert.match(detailText, /Expiry starts on approval/);
+    const approveButton = findNode(
+      detailTree,
+      (node) => node.type === "Button" && /Approve/.test(textContent(node)),
+    );
+    const rejectButton = findNode(
+      detailTree,
+      (node) => node.type === "Button" && /Reject/.test(textContent(node)),
+    );
+    const revisionButton = findNode(
+      detailTree,
+      (node) => node.type === "Button" && /Request revision/.test(textContent(node)),
+    );
+    assert.ok(approveButton && rejectButton && revisionButton);
+    assert.equal(approveButton.props["aria-label"], "Approve approval-delivery-001");
+    approveButton.props.onClick();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    const decisionIndex = requestedPaths.findIndex(
+      (path) => path.includes("/approvals/approval-delivery-001/decision?"),
+    );
+    assert.notEqual(decisionIndex, -1);
+    assert.deepEqual(JSON.parse(requestedOptions[decisionIndex].body), {
+      decision: "approved",
+      note: "Approved for the declared scope.",
+    });
+    assert.match(confirmations[0], /Confirm chairman decision/);
+    hookIndex = 0;
+    const approvedTree = registeredPage();
+    const protectedTransition = findNode(
+      approvedTree,
+      (node) => node.type === "Button" && /Move to authorized/.test(textContent(node)),
+    );
+    assert.ok(protectedTransition);
+    protectedTransition.props.onClick();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    const protectedIndex = requestedPaths.findIndex(
+      (path) => path.includes("/transitions?profile="),
+    );
+    assert.notEqual(protectedIndex, -1);
+    assert.deepEqual(JSON.parse(requestedOptions[protectedIndex].body), {
+      map_id: "I_atlas_41",
+      expected_stage: "awaiting-approval",
+      requested_stage: "authorized",
+      approval_request_id: "approval-delivery-001",
+      mutation_id: "approval-delivery-001",
+    });
+    assert.match(confirmations[1], /Confirm major Map action/);
+  }
   if (mode === "ready" || mode === "hydration-retry") {
     assert.match(renderedText, /CEO session: ready/);
     assert.match(renderedText, /2026-08-23T09:05:00Z/);
@@ -297,10 +403,14 @@ if (mode !== "empty") {
   assert.match(renderedText, /2026-08-23T07:30:00Z/);
   const transitionButton = findNode(
     readyTree,
-    (node) => node.type === "Button" && /Move to delivery/.test(textContent(node)),
+    (node) => node.type === "Button" && new RegExp(
+      mode === "approval" ? "Move to authorized" : "Move to delivery",
+    ).test(textContent(node)),
   );
   assert.ok(transitionButton, "Map card exposes an explicit governed transition control");
-  transitionButton.props.onClick();
+  if (mode !== "approval") {
+    transitionButton.props.onClick();
+  }
 
   hookIndex = 0;
   const pendingTree = registeredPage();
@@ -309,17 +419,19 @@ if (mode !== "empty") {
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   const transitionIndex = requestedPaths.findIndex((path) => path.includes("/transitions?profile="));
-  assert.notEqual(transitionIndex, -1);
-  assert.equal(
-    requestedPaths[transitionIndex],
-    "/api/plugins/map-governance/transitions?profile=worker",
-  );
-  assert.equal(requestedOptions[transitionIndex].method, "POST");
-  assert.deepEqual(JSON.parse(requestedOptions[transitionIndex].body), {
-    map_id: "I_atlas_41",
-    expected_stage: "authorized",
-    requested_stage: "delivery",
-  });
+  if (mode !== "approval") {
+    assert.notEqual(transitionIndex, -1);
+    assert.equal(
+      requestedPaths[transitionIndex],
+      "/api/plugins/map-governance/transitions?profile=worker",
+    );
+    assert.equal(requestedOptions[transitionIndex].method, "POST");
+    assert.deepEqual(JSON.parse(requestedOptions[transitionIndex].body), {
+      map_id: "I_atlas_41",
+      expected_stage: "authorized",
+      requested_stage: "delivery",
+    });
+  }
   if (mode === "transition-failure") {
     hookIndex = 0;
     const failedTree = registeredPage();
@@ -356,5 +468,7 @@ process.stdout.write(
       ? "dashboard hydration retry ready\n"
     : mode === "transition-failure"
       ? "dashboard transition failure ready\n"
+    : mode === "approval"
+      ? "dashboard chairman approval ready\n"
       : "dashboard board ready\n",
 );

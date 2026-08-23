@@ -6,9 +6,10 @@ import json
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlparse
 
+from .approvals import ApprovalHistoryEvent, normalized_json
 from .stages import ACTIVE_STAGES, executive_stage
 
 
@@ -60,6 +61,7 @@ class StructuredDecision:
     authority: str
     affected_stage: str
     timestamp: str
+    authority_context: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         values = {
@@ -83,9 +85,25 @@ class StructuredDecision:
             raise ValueError("Decision timestamp must be RFC 3339") from error
         if parsed.tzinfo is None:
             raise ValueError("Decision timestamp must include a timezone")
+        if self.authority_context is not None:
+            if not isinstance(self.authority_context, Mapping):
+                raise ValueError("Decision authority_context must be an object")
+            context = json.loads(normalized_json(dict(self.authority_context)))
+            allowed = {"decision_payload", "requested_scope"}
+            if set(context) - allowed:
+                raise ValueError(
+                    "Decision authority_context only supports decision_payload "
+                    "and requested_scope"
+                )
+            for name, value in context.items():
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"Decision authority_context {name} must be an object"
+                    )
+            object.__setattr__(self, "authority_context", context)
 
-    def payload(self) -> dict[str, str]:
-        return {
+    def payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "decision_id": self.decision_id,
             "type": self.type,
             "rationale": self.rationale,
@@ -93,6 +111,9 @@ class StructuredDecision:
             "affected_stage": self.affected_stage,
             "timestamp": self.timestamp,
         }
+        if self.authority_context is not None:
+            payload["authority_context"] = self.authority_context
+        return payload
 
 
 @dataclass(frozen=True)
@@ -100,6 +121,15 @@ class TrackerDecisionRecord:
     """A structured decision confirmed in authoritative tracker history."""
 
     decision: StructuredDecision
+    tracker_record_id: str
+    tracker_record_url: str
+
+
+@dataclass(frozen=True)
+class TrackerApprovalRecord:
+    """A structured approval event confirmed in authoritative Issue history."""
+
+    event: ApprovalHistoryEvent
     tracker_record_id: str
     tracker_record_url: str
 
@@ -126,6 +156,16 @@ class TrackerAdapter(Protocol):
         issue_id: str,
         decision: StructuredDecision,
     ) -> TrackerDecisionRecord: ...
+
+    def list_approval_events(self, url: str) -> list[TrackerApprovalRecord]: ...
+
+    def append_approval_event(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        event: ApprovalHistoryEvent,
+    ) -> TrackerApprovalRecord: ...
 
 
 class CommandRunner(Protocol):
@@ -240,6 +280,12 @@ mutation MapGovernanceAppendDecision($subject: ID!, $body: String!) {
 """
 
 
+_APPEND_APPROVAL_MUTATION = _APPEND_DECISION_MUTATION.replace(
+    "MapGovernanceAppendDecision",
+    "MapGovernanceAppendApproval",
+)
+
+
 _DECISION_HISTORY_QUERY = """
 query MapGovernanceDecisionHistory($url: URI!, $after: String) {
   resource(url: $url) {
@@ -256,8 +302,16 @@ query MapGovernanceDecisionHistory($url: URI!, $after: String) {
 """
 
 
+_APPROVAL_HISTORY_QUERY = _DECISION_HISTORY_QUERY.replace(
+    "MapGovernanceDecisionHistory",
+    "MapGovernanceApprovalHistory",
+)
+
+
 _DECISION_MARKER_PREFIX = "<!-- map-governance:decision:v1 "
 _DECISION_MARKER_SUFFIX = " -->"
+_APPROVAL_MARKER_PREFIX = "<!-- map-governance:approval:v1 "
+_APPROVAL_MARKER_SUFFIX = " -->"
 
 
 class GitHubTrackerAdapter:
@@ -468,14 +522,86 @@ class GitHubTrackerAdapter:
 
     def list_decisions(self, url: str) -> list[TrackerDecisionRecord]:
         """Read structured CEO decisions from the complete Issue history."""
-        records: list[TrackerDecisionRecord] = []
+        return [
+            TrackerDecisionRecord(
+                decision=self._decision_from_comment(body),
+                tracker_record_id=record_id,
+                tracker_record_url=record_url,
+            )
+            for body, record_id, record_url in self._structured_comment_history(
+                url,
+                query=_DECISION_HISTORY_QUERY,
+                marker_prefix=_DECISION_MARKER_PREFIX,
+                record_kind="decision",
+            )
+        ]
+
+    def append_approval_event(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        event: ApprovalHistoryEvent,
+    ) -> TrackerApprovalRecord:
+        """Append one human- and machine-readable approval history event."""
+        payload = self._graphql(
+            _APPEND_APPROVAL_MUTATION,
+            subject=issue_id,
+            body=self._approval_comment_body(event),
+        )
+        try:
+            node = payload["data"]["addComment"]["commentEdge"]["node"]
+            record_id = str(node["id"])
+            record_url = str(node["url"])
+            committed_body = str(node["body"])
+        except (KeyError, TypeError) as error:
+            raise TrackerError(
+                "GitHub approval mutation response is incomplete"
+            ) from error
+        committed_event = self._approval_from_comment(committed_body)
+        if committed_event != event:
+            raise TrackerError(
+                f"GitHub did not return the requested approval event: {url}"
+            )
+        return TrackerApprovalRecord(
+            event=committed_event,
+            tracker_record_id=record_id,
+            tracker_record_url=record_url,
+        )
+
+    def list_approval_events(self, url: str) -> list[TrackerApprovalRecord]:
+        """Read all structured approval events from Issue history."""
+        return [
+            TrackerApprovalRecord(
+                event=self._approval_from_comment(body),
+                tracker_record_id=record_id,
+                tracker_record_url=record_url,
+            )
+            for body, record_id, record_url in self._structured_comment_history(
+                url,
+                query=_APPROVAL_HISTORY_QUERY,
+                marker_prefix=_APPROVAL_MARKER_PREFIX,
+                record_kind="approval",
+            )
+        ]
+
+    def _structured_comment_history(
+        self,
+        url: str,
+        *,
+        query: str,
+        marker_prefix: str,
+        record_kind: str,
+    ) -> list[tuple[str, str, str]]:
+        """Read one complete typed structured-comment stream."""
+        records: list[tuple[str, str, str]] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
         while True:
             variables = {"url": url}
             if cursor is not None:
                 variables["after"] = cursor
-            resource = self._resource(_DECISION_HISTORY_QUERY, **variables)
+            resource = self._resource(query, **variables)
             if resource.get("__typename") != "Issue":
                 raise TrackerError(f"GitHub resource is not an Issue: {url}")
             comments = resource.get("comments")
@@ -491,27 +617,25 @@ class GitHubTrackerAdapter:
                         f"GitHub Issue comment response is incomplete: {url}"
                     )
                 body = node.get("body")
-                if not isinstance(body, str) or _DECISION_MARKER_PREFIX not in body:
+                if not isinstance(body, str) or marker_prefix not in body:
                     continue
                 try:
-                    records.append(
-                        TrackerDecisionRecord(
-                            decision=self._decision_from_comment(body),
-                            tracker_record_id=str(node["id"]),
-                            tracker_record_url=str(node["url"]),
-                        )
-                    )
+                    records.append((body, str(node["id"]), str(node["url"])))
                 except KeyError as error:
                     raise TrackerError(
-                        f"GitHub decision comment response is incomplete: {url}"
+                        f"GitHub {record_kind} comment response is incomplete: {url}"
                     ) from error
             if not page_info.get("hasNextPage"):
                 return records
             next_cursor = page_info.get("endCursor")
             if not isinstance(next_cursor, str) or not next_cursor:
-                raise TrackerError("GitHub decision history pagination is incomplete")
+                raise TrackerError(
+                    f"GitHub {record_kind} history pagination is incomplete"
+                )
             if next_cursor in seen_cursors:
-                raise TrackerError("GitHub decision history pagination did not advance")
+                raise TrackerError(
+                    f"GitHub {record_kind} history pagination did not advance"
+                )
             seen_cursors.add(next_cursor)
             cursor = next_cursor
 
@@ -523,19 +647,23 @@ class GitHubTrackerAdapter:
             sort_keys=True,
             separators=(",", ":"),
         )
-        return "\n".join(
-            (
-                f"{_DECISION_MARKER_PREFIX}{marker}{_DECISION_MARKER_SUFFIX}",
-                f"## CEO decision · {decision.decision_id}",
-                "",
-                f"- Type: {decision.type}",
-                f"- Authority: {decision.authority}",
-                f"- Affected stage: {decision.affected_stage}",
-                f"- Timestamp: {decision.timestamp}",
-                "",
-                decision.rationale,
+        lines = [
+            f"{_DECISION_MARKER_PREFIX}{marker}{_DECISION_MARKER_SUFFIX}",
+            f"## CEO decision · {decision.decision_id}",
+            "",
+            f"- Type: {decision.type}",
+            f"- Authority: {decision.authority}",
+            f"- Affected stage: {decision.affected_stage}",
+            f"- Timestamp: {decision.timestamp}",
+        ]
+        if decision.authority_context is not None:
+            lines.append(
+                "- Authority context: `"
+                + normalized_json(decision.authority_context)
+                + "`"
             )
-        )
+        lines.extend(("", decision.rationale))
+        return "\n".join(lines)
 
     @staticmethod
     def _decision_from_comment(body: str) -> StructuredDecision:
@@ -560,6 +688,68 @@ class GitHubTrackerAdapter:
             return StructuredDecision(**payload)
         except (TypeError, ValueError) as error:
             raise TrackerError("GitHub decision comment marker is invalid") from error
+
+    @staticmethod
+    def _approval_comment_body(event: ApprovalHistoryEvent) -> str:
+        marker = json.dumps(
+            event.payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        title = {
+            "requested": "Approval requested",
+            "approved": "Chairman approved",
+            "rejected": "Chairman rejected",
+            "revision": "Chairman requested revision",
+            "revoked": "Chairman revoked approval",
+        }[event.event_type]
+        details = event.details
+        lines = [
+            f"{_APPROVAL_MARKER_PREFIX}{marker}{_APPROVAL_MARKER_SUFFIX}",
+            f"## {title} · {event.request_id}",
+            "",
+            f"- Event: {event.event_type}",
+            f"- Payload hash: `{event.payload_hash}`",
+            f"- Timestamp: {event.occurred_at}",
+        ]
+        if details.get("decision_class"):
+            lines.append(f"- Decision class: {details['decision_class']}")
+        if details.get("proposed_action"):
+            lines.append(f"- Proposed action: {details['proposed_action']}")
+        if details.get("expires_at"):
+            lines.append(f"- Expires: {details['expires_at']}")
+        if details.get("actor_id"):
+            lines.append(f"- Actor: {details['actor_id']}")
+        if details.get("note"):
+            lines.extend(("", str(details["note"])))
+        elif details.get("rationale"):
+            lines.extend(("", str(details["rationale"])))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _approval_from_comment(body: str) -> ApprovalHistoryEvent:
+        marker_line = next(
+            (
+                line
+                for line in body.splitlines()
+                if line.startswith(_APPROVAL_MARKER_PREFIX)
+                and line.endswith(_APPROVAL_MARKER_SUFFIX)
+            ),
+            None,
+        )
+        if marker_line is None:
+            raise TrackerError("GitHub approval comment has no structured marker")
+        encoded = marker_line[
+            len(_APPROVAL_MARKER_PREFIX) : -len(_APPROVAL_MARKER_SUFFIX)
+        ]
+        try:
+            payload = json.loads(encoded)
+            if not isinstance(payload, dict):
+                raise TypeError("approval marker payload is not an object")
+            return ApprovalHistoryEvent(**payload)
+        except (TypeError, ValueError) as error:
+            raise TrackerError("GitHub approval comment marker is invalid") from error
 
     def _resource(self, query: str, url: str, **variables: str) -> dict:
         payload = self._graphql(query, url=url, **variables)

@@ -10,3 +10,23 @@ tags:
   - governance
   - dashboard
   - maps
+config_schema:
+  authority:
+    type: object
+    default:
+      ceo_autonomous_decision_classes:
+        - product
+        - operational
+      chairman_required_decision_classes:
+        - delivery_authorization
+        - budget_increase
+        - scope_expansion
+        - schedule_change
+        - security
+        - legal
+        - cancellation
+        - remote_publication
+        - final_acceptance
+      authority_thresholds: {}
+      chairman_actor_ids: []
+      approval_ttl_seconds: 86400

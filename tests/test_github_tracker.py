@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from map_governance.approvals import ApprovalHistoryEvent
 from map_governance.tracker import (
     GitHubTrackerAdapter,
     StructuredDecision,
@@ -185,6 +186,10 @@ def test_github_decision_write_builds_a_human_and_machine_readable_comment():
         authority="CEO within the authorized Map envelope",
         affected_stage="authorized",
         timestamp="2026-08-23T09:25:00Z",
+        authority_context={
+            "decision_payload": {"amount": 750, "currency": "USD"},
+            "requested_scope": {"map_id": "I_atlas_41"},
+        },
     )
     runner = ScriptedRunner(
         {
@@ -246,6 +251,8 @@ def test_github_decision_write_builds_a_human_and_machine_readable_comment():
     assert "mutation MapGovernanceAppendDecision" in query
     assert "<!-- map-governance:decision:v1 " in body
     assert "## CEO decision · decision-atlas-market-001" in body
+    assert "Authority context:" in body
+    assert '"amount":750' in body
     assert "Launch to the research cohort before widening access." in body
     assert [value for value in mutation if value.startswith("subject=")] == [
         "subject=I_atlas_41"
@@ -321,4 +328,140 @@ def test_github_decision_history_reads_all_pages_and_ignores_ordinary_comments()
     assert not any(value.startswith("after=") for value in runner.calls[0])
     assert [value for value in runner.calls[1] if value.startswith("after=")] == [
         "after=cursor-1"
+    ]
+
+
+def test_github_approval_event_is_human_readable_and_round_trips_marker():
+    event = ApprovalHistoryEvent(
+        event_id="approval:approval-delivery-001:decision",
+        request_id="approval-delivery-001",
+        event_type="approved",
+        occurred_at="2026-08-23T09:30:00Z",
+        payload_hash="sha256:" + "a" * 64,
+        details={
+            "actor_id": "basic:chairman-1",
+            "note": "Approved for the declared scope.",
+            "expires_at": "2026-08-24T09:30:00Z",
+        },
+    )
+    runner = ScriptedRunner()
+
+    def echo_mutation(arguments):
+        runner.calls.append(list(arguments))
+        body = next(
+            value.removeprefix("body=")
+            for value in arguments
+            if value.startswith("body=")
+        )
+        return json.dumps(
+            {
+                "data": {
+                    "addComment": {
+                        "commentEdge": {
+                            "node": {
+                                "id": "IC_approval_1",
+                                "url": f"{_issue_resource()['url']}#issuecomment-approval-1",
+                                "body": body,
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+    runner.run = echo_mutation
+    record = GitHubTrackerAdapter(runner=runner).append_approval_event(
+        _issue_resource()["url"],
+        issue_id="I_atlas_41",
+        event=event,
+    )
+
+    assert record.event == event
+    body = next(
+        value.removeprefix("body=")
+        for value in runner.calls[0]
+        if value.startswith("body=")
+    )
+    assert "mutation MapGovernanceAppendApproval" in next(
+        value.removeprefix("query=")
+        for value in runner.calls[0]
+        if value.startswith("query=")
+    )
+    assert "<!-- map-governance:approval:v1 " in body
+    assert "## Chairman approved · approval-delivery-001" in body
+    assert "Approved for the declared scope." in body
+
+
+def test_github_approval_history_paginates_and_ignores_other_comments():
+    first = ApprovalHistoryEvent(
+        event_id="approval:approval-delivery-001:request",
+        request_id="approval-delivery-001",
+        event_type="requested",
+        occurred_at="2026-08-23T09:00:00Z",
+        payload_hash="sha256:" + "b" * 64,
+        details={"rationale": "Ready for approval."},
+    )
+    second = ApprovalHistoryEvent(
+        event_id="approval:approval-delivery-001:decision",
+        request_id="approval-delivery-001",
+        event_type="rejected",
+        occurred_at="2026-08-23T09:30:00Z",
+        payload_hash=first.payload_hash,
+        details={"actor_id": "basic:chairman", "note": "Revise evidence."},
+    )
+
+    def body(event):
+        marker = json.dumps(
+            event.payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"<!-- map-governance:approval:v1 {marker} -->\nSummary"
+
+    runner = ScriptedRunner(
+        {
+            "data": {
+                "resource": {
+                    "__typename": "Issue",
+                    "comments": {
+                        "nodes": [
+                            {"id": "IC_plain", "url": "plain", "body": "ordinary"},
+                            {"id": "IC_request", "url": "request", "body": body(first)},
+                        ],
+                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-a"},
+                    },
+                }
+            }
+        },
+        {
+            "data": {
+                "resource": {
+                    "__typename": "Issue",
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "IC_decision",
+                                "url": "decision",
+                                "body": body(second),
+                            }
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                }
+            }
+        },
+    )
+
+    records = GitHubTrackerAdapter(runner=runner).list_approval_events(
+        _issue_resource()["url"]
+    )
+
+    assert [record.event for record in records] == [first, second]
+    assert [record.tracker_record_id for record in records] == [
+        "IC_request",
+        "IC_decision",
+    ]
+    assert [value for value in runner.calls[1] if value.startswith("after=")] == [
+        "after=cursor-a"
     ]

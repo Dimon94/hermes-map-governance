@@ -51,9 +51,24 @@ system prompt and the required toolset identity; Map-specific bootstrap data
 remains in the first user turn. Configure the dedicated CEO profile to expose
 this named toolset through normal Hermes profile toolset settings. The plugin's
 request-scoped tool policy also blocks every other tool inside canonical CEO
-sessions. The CEO Tool can inspect executive state or record a structured
-decision. It cannot control worker lanes, edit implementation worktrees, or
-publish code.
+sessions. The CEO Tool can inspect executive state, record an autonomous
+structured decision, or submit a complete chairman approval packet. It cannot
+approve its own packet, control worker lanes, edit implementation worktrees,
+or publish code. Open Map detail to approve, reject, or request revision
+explicitly; each result is confirmed in GitHub Issue history before the local
+ledger projects it.
+
+The default authority envelope and 24-hour approval TTL come from the plugin's
+normal `plugins.entries.map-governance.settings.authority` configuration. A
+protected `awaiting-approval → authorized` transition needs the approved
+request id and a stable mutation id; missing, expired, revoked, consumed, or
+content-mismatched grants fail before the tracker transition.
+
+Before using Map detail approval controls, add the authenticated chairman
+identity (`provider:user_id`) to that profile's `chairman_actor_ids`; the
+default allowlist is empty. Optional `authority_thresholds` can grant CEO
+autonomy inside numeric budget/schedule ceilings or configured scope values.
+Missing or malformed threshold evidence remains chairman-required.
 
 This phase uses the authenticated `gh` identity of the plugin process for
 tracker writes, as defined by the prototype security boundary. Structured

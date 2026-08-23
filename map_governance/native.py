@@ -7,6 +7,8 @@ import sys
 from argparse import ArgumentParser, Namespace
 
 from .application import (
+    ApprovalEnforcementError,
+    ApprovalRequestConflict,
     CEOSessionRepairRequired,
     MapBindingError,
     MapTransitionError,
@@ -57,12 +59,29 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
         help="Stage shown when the transition was requested",
     )
     transition.add_argument("--stage", required=True, help="Requested executive stage")
+    transition.add_argument(
+        "--approval-request",
+        help="Stable approval request id for a chairman-protected transition",
+    )
+    transition.add_argument(
+        "--mutation-id",
+        help="Stable idempotency identity for a protected transition attempt",
+    )
 
 
 def register(ctx) -> None:
     """Register the native diagnostic capability with Hermes."""
     register_ceo_capabilities(ctx)
-    application = application_for_storage(ctx.state.data_dir)
+    get_config = getattr(ctx, "get_config", lambda _key, default=None: default)
+    authority_settings = get_config("authority", {})
+    application = (
+        application_for_storage(
+            ctx.state.data_dir,
+            authority_settings=authority_settings,
+        )
+        if authority_settings
+        else application_for_storage(ctx.state.data_dir)
+    )
 
     def handle_maps_command(args: Namespace) -> int:
         if args.maps_command == "health":
@@ -103,11 +122,24 @@ def register(ctx) -> None:
             return 0
         if args.maps_command == "transition":
             try:
+                transition_arguments = {
+                    "map_id": args.map,
+                    "expected_stage": args.expected_stage,
+                    "requested_stage": args.stage,
+                }
+                if args.approval_request is not None:
+                    transition_arguments["approval_request_id"] = args.approval_request
+                if args.mutation_id is not None:
+                    transition_arguments["mutation_id"] = args.mutation_id
                 report = application.transition_map(
-                    map_id=args.map,
-                    expected_stage=args.expected_stage,
-                    requested_stage=args.stage,
+                    **transition_arguments,
                 )
+            except (ApprovalEnforcementError, ApprovalRequestConflict) as error:
+                print(
+                    json.dumps({"error": error.as_dict()}, sort_keys=True),
+                    file=sys.stderr,
+                )
+                return 1
             except MapTransitionError as error:
                 print(
                     json.dumps({"error": error.as_dict()}, sort_keys=True),

@@ -107,3 +107,23 @@ def test_failed_dashboard_transition_keeps_committed_stage_and_shows_error():
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout == "dashboard transition failure ready\n"
+
+
+def test_map_detail_exposes_explicit_accessible_chairman_approval_actions():
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail("Node.js is required to exercise the dashboard plugin bundle")
+    result = subprocess.run(
+        [
+            node,
+            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
+            "approval",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "dashboard chairman approval ready\n"
