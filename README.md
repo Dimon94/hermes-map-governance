@@ -14,7 +14,9 @@ Hermes Map Governance 是一个独立安装的 Hermes 治理插件。它把 Herm
 当前交付包含可安装插件壳、GitHub Project / Issue adapter、Map binding registry、
 可重建董事会投影，以及 native CLI、dashboard API 和 Maps 页面。治理 transition 会先
 原子替换 GitHub 的唯一 `map-stage/*` label、读回确认，再按 expected stage 提交本地
-projection；CEO 会话与交付编排仍由后续票交付。
+projection。每个 Map 现在会在显式 CEO profile 中 exact-adopt 或创建一条 canonical
+Hermes 会话，并在首次创建时以 user turn 写入 Map bootstrap；CEO 决策能力与交付编排
+仍由后续票交付。
 
 ## 安装
 
@@ -56,6 +58,9 @@ hermes maps transition \
   --map ISSUE_NODE_ID \
   --from authorized \
   --stage delivery
+
+# 解析/初始化 canonical 会话；Dashboard 卡片使用同一 application seam。
+hermes maps open --map ISSUE_NODE_ID --profile CEO_PROFILE
 ```
 
 重复执行同一条 bind 命令是幂等的。`refresh` 从 GitHub tracker truth 与最小 binding
@@ -68,13 +73,20 @@ registry 重新生成缓存；删除 projection rows 不会丢失 Map 绑定。
 completed 与 not-planned 关闭原因。Dashboard 使用服务器返回的合法下一阶段按钮，
 GitHub 写失败时保留旧卡片并显示错误。
 
+Canonical 会话使用不可变 GitHub Issue node id 派生的 exact title。唯一匹配会优先
+adopt；零匹配只创建和 bootstrap 一次；多个 exact 匹配会把卡片标为
+`repair_required`，不会猜测或删除会话。Registry 保存 lineage root，打开时通过 Hermes
+公开 session contract 解析当前 compression tip，因此重复点击、renderer reconnect、
+backend restart 与 context compression 都继续同一段历史。Map 内容只写入首个 user
+turn；board refresh 不更新已有会话的 system prompt 或 toolset。
+
 ## 架构壳
 
 - `MapGovernanceApplication` 是 REST、dashboard 和诊断入口共同调用的应用 seam。
 - `hermes maps health` 与 `/api/plugins/map-governance/health` 返回同一 readiness。
 - `/api/plugins/map-governance/board` 提供按 GitHub Project 分组的 board 投影；
-  `/projects`、`/bindings`、`/refresh` 与 `/transitions` POST routes 是同一应用接口的
-  薄适配器。
+  `/projects`、`/bindings`、`/refresh`、`/transitions`、Map detail 与 canonical session
+  open routes 是同一应用接口的薄适配器。
 - `registry.db` 属于 `map-governance` 命名空间，由请求中的 profile 选择，且与
   `<PROFILE_HOME>/kanban.db` 隔离。
 

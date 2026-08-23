@@ -45,6 +45,7 @@
   function MapsPage() {
     const [state, setState] = useState({ status: "loading" });
     const [transitionState, setTransitionState] = useState({ status: "idle" });
+    const [sessionState, setSessionState] = useState({ status: "idle" });
 
     const load = useCallback(function () {
       setState({ status: "loading" });
@@ -119,6 +120,47 @@
               ? error.message
               : "GitHub did not commit the requested transition",
           });
+        },
+      );
+    }, [load]);
+
+    const openCEOSession = useCallback(function (mapId) {
+      setSessionState({ status: "pending", mapId: mapId });
+      let requestedProfile = "default";
+      requestProfile().then(function (profile) {
+        requestedProfile = profile;
+        const encodedProfile = encodeURIComponent(profile);
+        return fetchJSON(
+          "/api/plugins/map-governance/maps/" + encodeURIComponent(mapId)
+            + "/session?profile=" + encodedProfile,
+          { method: "POST" },
+        );
+      }).then(function (result) {
+        if (!SDK.host || typeof SDK.host.openSession !== "function") {
+          throw new Error("This Hermes Desktop version cannot open stored sessions");
+        }
+        return SDK.host.openSession(result.ceo_session.live_session_id, {
+          profile: requestedProfile,
+          intent: "main",
+          keepAllProfilesScope: false,
+          awaitHydration: true,
+          expectHistory: true,
+          retryHydrationTimeoutOnce: true,
+        });
+      }).then(
+        function () {
+          setSessionState({ status: "idle" });
+          load();
+        },
+        function (error) {
+          setSessionState({
+            status: "error",
+            mapId: mapId,
+            message: error && error.message
+              ? error.message
+              : "Unable to open the canonical CEO session",
+          });
+          load();
         },
       );
     }, [load]);
@@ -272,6 +314,29 @@
                     null,
                     "CEO session: " + card.ceo_session.state,
                   ),
+                  card.ceo_session.last_activity_at
+                    ? React.createElement(
+                        "p",
+                        null,
+                        "CEO last activity: ",
+                        React.createElement(
+                          "time",
+                          { dateTime: card.ceo_session.last_activity_at },
+                          card.ceo_session.last_activity_at,
+                        ),
+                      )
+                    : null,
+                  card.ceo_session.repair
+                    ? React.createElement(
+                        "p",
+                        { role: "alert", className: "text-sm text-destructive" },
+                        "Session repair required: "
+                          + card.ceo_session.repair.reason
+                          + " ("
+                          + card.ceo_session.repair.candidate_count
+                          + " exact candidates)",
+                      )
+                    : null,
                   React.createElement(
                     "p",
                     null,
@@ -289,9 +354,28 @@
                         transitionState.message,
                       )
                     : null,
+                  sessionState.status === "error" && sessionState.mapId === card.id
+                    ? React.createElement(
+                        "p",
+                        { role: "alert", className: "text-sm text-destructive" },
+                        sessionState.message,
+                      )
+                    : null,
                   React.createElement(
                     "div",
-                    { className: "flex flex-wrap gap-2", "aria-label": "Available stage transitions" },
+                    { className: "flex flex-wrap gap-2", "aria-label": "Map actions" },
+                    React.createElement(
+                      Button,
+                      {
+                        type: "button",
+                        disabled: card.ceo_session.state === "repair_required"
+                          || (sessionState.status === "pending" && sessionState.mapId === card.id),
+                        onClick: function () { openCEOSession(card.id); },
+                      },
+                      card.ceo_session.state === "repair_required"
+                        ? "Repair required"
+                        : "Open CEO session",
+                    ),
                     (card.available_transitions || []).map(function (stage) {
                       const pending = transitionState.status === "pending" && transitionState.mapId === card.id;
                       return React.createElement(

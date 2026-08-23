@@ -1,6 +1,8 @@
 """Public application seam for the Hermes Map Governance plugin."""
 
 from .application import (
+    CEOSessionAmbiguityError,
+    CEOSessionRepairRequired,
     MapBindingError,
     MapGovernanceApplication,
     MapTransitionConflict,
@@ -8,6 +10,8 @@ from .application import (
 )
 
 __all__ = [
+    "CEOSessionAmbiguityError",
+    "CEOSessionRepairRequired",
     "MapBindingError",
     "MapGovernanceApplication",
     "MapTransitionConflict",

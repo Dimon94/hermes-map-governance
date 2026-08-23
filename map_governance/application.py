@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,12 @@ from .stages import (
     rejection_reason,
 )
 from .storage import PluginStorage
+from .sessions import (
+    CEOSessionRunner,
+    CanonicalSession,
+    canonical_session_identity,
+    canonical_session_title,
+)
 from .tracker import (
     GitHubTrackerAdapter,
     TrackerAdapter,
@@ -59,13 +66,41 @@ class MapTransitionConflict(MapTransitionError):
         return detail
 
 
+class CEOSessionRepairRequired(RuntimeError):
+    """Raised when canonical session identity cannot be resolved safely."""
+
+    def __init__(self, *, reason: str, candidate_count: int = 0) -> None:
+        self.reason = reason
+        self.candidate_count = candidate_count
+        super().__init__(f"Canonical CEO session requires repair: {reason}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "repair_required",
+            "reason": self.reason,
+            "candidate_count": self.candidate_count,
+            "retryable": False,
+        }
+
+
+class CEOSessionAmbiguityError(CEOSessionRepairRequired):
+    """Raised when more than one exact canonical session candidate exists."""
+
+
 _TRANSITION_LOCKS: dict[str, RLock] = {}
 _TRANSITION_LOCKS_GUARD = Lock()
+_SESSION_LOCKS: dict[str, RLock] = {}
+_SESSION_LOCKS_GUARD = Lock()
 
 
 def _transition_lock(map_id: str) -> RLock:
     with _TRANSITION_LOCKS_GUARD:
         return _TRANSITION_LOCKS.setdefault(map_id, RLock())
+
+
+def _session_lock(map_id: str) -> RLock:
+    with _SESSION_LOCKS_GUARD:
+        return _SESSION_LOCKS.setdefault(map_id, RLock())
 
 
 class MapGovernanceApplication:
@@ -77,11 +112,15 @@ class MapGovernanceApplication:
         plugin_root: Path,
         storage_root: Path,
         tracker: TrackerAdapter | None = None,
+        session_runner: CEOSessionRunner | None = None,
+        profile_name: str | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._plugin_root = plugin_root.resolve()
         self._storage = PluginStorage(storage_root)
         self._tracker = tracker or GitHubTrackerAdapter()
+        self._session_runner = session_runner
+        self._profile_name = profile_name
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def health(self) -> dict[str, Any]:
@@ -158,6 +197,243 @@ class MapGovernanceApplication:
                 ),
             },
         }
+
+    def map_detail(self, *, map_id: str) -> dict[str, Any]:
+        """Return one Map projection without session-inventory disclosure."""
+        for card in self.board()["maps"]:
+            if card["id"] == map_id:
+                return card
+        raise MapBindingError(f"Map is not bound: {map_id}")
+
+    def open_map(self, *, map_id: str) -> dict[str, Any]:
+        """Resolve, initialize and return the Map's one canonical CEO session."""
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _session_lock(lock_key):
+            with self._storage.ceo_session_lease(map_id):
+                return self._open_map(map_id=map_id)
+
+    def _open_map(self, *, map_id: str) -> dict[str, Any]:
+        if self._session_runner is None or not self._profile_name:
+            raise MapBindingError(
+                "Opening a CEO session requires an explicit Hermes profile"
+            )
+        context = self._storage.map_session_context(map_id)
+        if context is None:
+            raise MapBindingError(f"Map is not bound: {map_id}")
+
+        identity = canonical_session_identity(
+            profile_name=self._profile_name,
+            map_id=map_id,
+        )
+        title = canonical_session_title(map_id)
+        bootstrap = self._ceo_bootstrap(context, canonical_identity=identity)
+        bootstrap_hash = hashlib.sha256(bootstrap.encode()).hexdigest()
+        idempotency_key = f"{identity}:bootstrap:{bootstrap_hash}"
+        existing_binding = self._storage.ceo_session_binding(map_id)
+
+        if existing_binding is not None:
+            if existing_binding["profile_name"] != self._profile_name:
+                return self._repair_required(
+                    map_id=map_id,
+                    identity=identity,
+                    title=title,
+                    reason="canonical_profile_mismatch",
+                )
+            root_session_id = existing_binding["root_session_id"]
+            if root_session_id:
+                resolved = self._session_runner.resolve(
+                    root_session_id=root_session_id,
+                )
+                if resolved is not None and resolved.title == title:
+                    return self._ready_session(
+                        map_id=map_id,
+                        identity=identity,
+                        title=title,
+                        session=resolved,
+                        bootstrap_hash=bootstrap_hash,
+                    )
+
+            # Repair state is a projection, not a permanent gate. Reconcile on
+            # every open so a restored backend or manually repaired ambiguity
+            # can recover without rewriting or forking decision history.
+            recovered = self._session_runner.find_exact(title=title)
+            if len(recovered) > 1:
+                return self._repair_required(
+                    map_id=map_id,
+                    identity=identity,
+                    title=title,
+                    reason="multiple_exact_canonical_sessions",
+                    candidate_count=len(recovered),
+                    ambiguity=True,
+                )
+            if recovered:
+                initialized = self._session_runner.initialize(
+                    recovered[0],
+                    bootstrap=bootstrap,
+                    idempotency_key=idempotency_key,
+                )
+                return self._ready_session(
+                    map_id=map_id,
+                    identity=identity,
+                    title=title,
+                    session=initialized,
+                    bootstrap_hash=bootstrap_hash,
+                )
+            return self._repair_required(
+                map_id=map_id,
+                identity=identity,
+                title=title,
+                reason="recorded_session_lineage_missing_or_mismatched",
+            )
+
+        matches = self._session_runner.find_exact(title=title)
+        if len(matches) > 1:
+            return self._repair_required(
+                map_id=map_id,
+                identity=identity,
+                title=title,
+                reason="multiple_exact_canonical_sessions",
+                candidate_count=len(matches),
+                ambiguity=True,
+            )
+        if matches:
+            session = self._session_runner.initialize(
+                matches[0],
+                bootstrap=bootstrap,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            try:
+                session = self._session_runner.mint(
+                    identity=identity,
+                    title=title,
+                    profile_name=self._profile_name,
+                    bootstrap=bootstrap,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError:
+                # A separate process may have won the exact-title race between
+                # lookup and mint. Re-read the registry; never suffix or guess.
+                converged = self._session_runner.find_exact(title=title)
+                if len(converged) != 1:
+                    return self._repair_required(
+                        map_id=map_id,
+                        identity=identity,
+                        title=title,
+                        reason="concurrent_canonical_session_conflict",
+                        candidate_count=len(converged),
+                        ambiguity=len(converged) > 1,
+                    )
+                session = self._session_runner.initialize(
+                    converged[0],
+                    bootstrap=bootstrap,
+                    idempotency_key=idempotency_key,
+                )
+
+        exact_after_initialization = self._session_runner.find_exact(title=title)
+        if len(exact_after_initialization) != 1:
+            return self._repair_required(
+                map_id=map_id,
+                identity=identity,
+                title=title,
+                reason="canonical_session_did_not_converge",
+                candidate_count=len(exact_after_initialization),
+                ambiguity=len(exact_after_initialization) > 1,
+            )
+        return self._ready_session(
+            map_id=map_id,
+            identity=identity,
+            title=title,
+            session=session,
+            bootstrap_hash=bootstrap_hash,
+        )
+
+    def _ready_session(
+        self,
+        *,
+        map_id: str,
+        identity: str,
+        title: str,
+        session: CanonicalSession,
+        bootstrap_hash: str,
+    ) -> dict[str, Any]:
+        self._storage.save_ceo_session_ready(
+            map_id=map_id,
+            profile_name=self._profile_name or "",
+            canonical_identity=identity,
+            canonical_title=title,
+            root_session_id=session.root_session_id,
+            live_session_id=session.live_session_id,
+            last_activity_at=session.last_activity_at,
+            bootstrap_hash=bootstrap_hash,
+            updated_at=self._synchronized_at(),
+        )
+        return {
+            "map_id": map_id,
+            "ceo_session": {
+                "state": "ready",
+                "root_session_id": session.root_session_id,
+                "live_session_id": session.live_session_id,
+                "last_activity_at": session.last_activity_at,
+            },
+        }
+
+    def _repair_required(
+        self,
+        *,
+        map_id: str,
+        identity: str,
+        title: str,
+        reason: str,
+        candidate_count: int = 0,
+        ambiguity: bool = False,
+    ):
+        self._storage.save_ceo_session_repair_required(
+            map_id=map_id,
+            profile_name=self._profile_name or "",
+            canonical_identity=identity,
+            canonical_title=title,
+            reason=reason,
+            candidate_count=candidate_count,
+            updated_at=self._synchronized_at(),
+        )
+        error_type = CEOSessionAmbiguityError if ambiguity else CEOSessionRepairRequired
+        raise error_type(reason=reason, candidate_count=candidate_count)
+
+    def _ceo_bootstrap(
+        self,
+        context: dict[str, Any],
+        *,
+        canonical_identity: str,
+    ) -> str:
+        return "\n".join(
+            (
+                "Hermes Map Governance canonical CEO-session bootstrap.",
+                f"Canonical identity: {canonical_identity}",
+                f"CEO profile: {self._profile_name}",
+                f"Map Issue: {context['issue_url']}",
+                (
+                    "Tracker identity: "
+                    f"{context['repository']}#{context['issue_number']}"
+                ),
+                f"Map title at binding: {context['title']}",
+                f"Executive stage at binding: {context['stage']}",
+                "Load and follow the map-governance:ceo Skill when available.",
+                (
+                    "Authority envelope: govern product and operations only "
+                    "within the Map's authorized bounds."
+                ),
+                (
+                    "Escalate chairman-required budget, scope, schedule, "
+                    "cancellation, publication, and acceptance actions; never "
+                    "self-approve them."
+                ),
+                (
+                    "Treat this user turn as the durable Map context. Re-read "
+                    "tracker truth for later board changes."
+                ),
+            )
+        )
 
     def configure_project(self, *, project_url: str) -> dict[str, Any]:
         """Configure one existing GitHub Project as a CEO project."""
@@ -422,6 +698,26 @@ class MapGovernanceApplication:
             "title": row["title"],
             "stage": row["stage"],
             "available_transitions": list(available_transitions(row["stage"])),
-            "ceo_session": {"state": row["ceo_session_state"]},
+            "ceo_session": MapGovernanceApplication._session_projection(row),
             "last_synchronized_at": row["synchronized_at"],
         }
+
+    @staticmethod
+    def _session_projection(row: dict[str, Any]) -> dict[str, Any]:
+        state = row["ceo_session_state"]
+        if state == "ready":
+            return {
+                "state": "ready",
+                "last_activity_at": row.get("ceo_session_last_activity_at"),
+            }
+        if state == "repair_required":
+            return {
+                "state": "repair_required",
+                "repair": {
+                    "reason": row.get("ceo_session_repair_reason"),
+                    "candidate_count": int(
+                        row.get("ceo_session_candidate_count") or 0
+                    ),
+                },
+            }
+        return {"state": "unbound"}

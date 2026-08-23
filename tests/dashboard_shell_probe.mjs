@@ -7,6 +7,7 @@ const bundlePath = process.argv[2];
 const mode = process.argv[3] || "empty";
 const requestedPaths = [];
 const requestedOptions = [];
+const openedSessions = [];
 const effects = [];
 const state = [];
 let hookIndex = 0;
@@ -40,6 +41,17 @@ function fetchJSON(path, options) {
     }
     return Promise.resolve({ stage: "delivery" });
   }
+  if (path.includes("/maps/I_atlas_41/session?profile=")) {
+    return Promise.resolve({
+      map_id: "I_atlas_41",
+      ceo_session: {
+        state: "ready",
+        root_session_id: "canonical-root",
+        live_session_id: "canonical-tip",
+        last_activity_at: "2026-08-23T09:05:00Z",
+      },
+    });
+  }
   if (path.includes("/refresh?profile=")) {
     return Promise.resolve({ refreshed: true });
   }
@@ -60,7 +72,9 @@ function fetchJSON(path, options) {
         title: "Map the Atlas launch",
         stage: "authorized",
         available_transitions: ["delivery", "parked"],
-        ceo_session: { state: "unbound" },
+        ceo_session: mode === "ready" || mode === "hydration-retry"
+          ? { state: "ready", last_activity_at: "2026-08-23T09:05:00Z" }
+          : { state: "unbound" },
         last_synchronized_at: "2026-08-23T07:30:00Z",
       };
       return Promise.resolve({
@@ -109,6 +123,20 @@ globalThis.window = {
       CardContent: "CardContent",
       CardHeader: "CardHeader",
       CardTitle: "CardTitle",
+    },
+    host: {
+      openSession(sessionId, options) {
+        openedSessions.push({
+          sessionId,
+          options,
+          hydrationAttempts: mode === "hydration-retry" ? 2 : 1,
+          transientHydrationFailures: mode === "hydration-retry" ? 1 : 0,
+        });
+        if (mode === "hydration-retry" && !options.retryHydrationTimeoutOnce) {
+          return Promise.reject(new Error("transient hydration timeout"));
+        }
+        return Promise.resolve();
+      },
     },
   },
   __HERMES_PLUGINS__: {
@@ -172,7 +200,45 @@ if (mode !== "empty") {
   assert.match(renderedText, /Map the Atlas launch/);
   assert.match(renderedText, /acme\/atlas#41/);
   assert.match(renderedText, /authorized/);
-  assert.match(renderedText, /CEO session: unbound/);
+  if (mode === "ready" || mode === "hydration-retry") {
+    assert.match(renderedText, /CEO session: ready/);
+    assert.match(renderedText, /2026-08-23T09:05:00Z/);
+    const openButton = findNode(
+      readyTree,
+      (node) => node.type === "Button" && /Open CEO session/.test(textContent(node)),
+    );
+    assert.ok(openButton, "ready Map card opens its canonical CEO session");
+    openButton.props.onClick();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    const openIndex = requestedPaths.findIndex((path) => path.includes("/maps/I_atlas_41/session?"));
+    assert.notEqual(openIndex, -1);
+    assert.equal(
+      requestedPaths[openIndex],
+      "/api/plugins/map-governance/maps/I_atlas_41/session?profile=worker",
+    );
+    assert.equal(requestedOptions[openIndex].method, "POST");
+    assert.equal(openedSessions.length, 1);
+    assert.deepEqual(openedSessions[0].sessionId, "canonical-tip");
+    assert.deepEqual(openedSessions[0].options, {
+        profile: "worker",
+        intent: "main",
+        keepAllProfilesScope: false,
+        awaitHydration: true,
+        expectHistory: true,
+        retryHydrationTimeoutOnce: true,
+    });
+    assert.equal(
+      openedSessions[0].hydrationAttempts,
+      mode === "hydration-retry" ? 2 : 1,
+    );
+    assert.equal(
+      openedSessions[0].transientHydrationFailures,
+      mode === "hydration-retry" ? 1 : 0,
+    );
+  } else {
+    assert.match(renderedText, /CEO session: unbound/);
+  }
   assert.match(renderedText, /2026-08-23T07:30:00Z/);
   const transitionButton = findNode(
     readyTree,
@@ -229,6 +295,10 @@ assert.deepEqual(JSON.parse(requestedOptions[refreshIndex].body), {});
 process.stdout.write(
   mode === "empty"
     ? "dashboard shell ready\n"
+    : mode === "ready"
+      ? "dashboard session open ready\n"
+    : mode === "hydration-retry"
+      ? "dashboard hydration retry ready\n"
     : mode === "transition-failure"
       ? "dashboard transition failure ready\n"
       : "dashboard board ready\n",

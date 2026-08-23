@@ -27,3 +27,14 @@ The commands use authenticated, read-only `gh api graphql` requests. Repeating a
 bind is idempotent. Run `hermes maps refresh` to rebuild dashboard projections
 from GitHub and the plugin-owned binding registry. The GitHub token needs the
 `read:project` scope.
+
+Open the bound Map from its dashboard card, or resolve the same canonical
+conversation explicitly:
+
+```bash
+hermes maps open --map ISSUE_NODE_ID --profile CEO_PROFILE
+```
+
+The first open adopts one exact prior session or creates and bootstraps one.
+`repair_required` means multiple exact candidates were found; the plugin does
+not choose or delete one automatically.

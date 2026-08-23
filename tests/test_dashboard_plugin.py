@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI
 
-from map_governance import MapTransitionError
+from map_governance import CEOSessionRepairRequired, MapTransitionError
 from map_governance.tracker import TrackerError
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +122,14 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
             calls.append(("transition_map", arguments))
             return {"operation": "transition_map"}
 
+        def map_detail(self, **arguments):
+            calls.append(("map_detail", arguments))
+            return {"operation": "map_detail"}
+
+        def open_map(self, **arguments):
+            calls.append(("open_map", arguments))
+            return {"operation": "open_map"}
+
     monkeypatch.setattr(
         adapter,
         "application_for_profile",
@@ -157,19 +165,38 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
                     "requested_stage": "delivery",
                 },
             )
-        return configured, bound, refreshed, transitioned
+            detail = await client.get(
+                "/api/plugins/map-governance/maps/I_atlas_41?profile=ceo"
+            )
+            opened = await client.post(
+                "/api/plugins/map-governance/maps/I_atlas_41/session?profile=ceo"
+            )
+        return configured, bound, refreshed, transitioned, detail, opened
 
-    configured, bound, refreshed, transitioned = asyncio.run(exercise_routes())
+    configured, bound, refreshed, transitioned, detail, opened = asyncio.run(
+        exercise_routes()
+    )
 
     assert configured.status_code == 200
     assert bound.status_code == 200
     assert refreshed.status_code == 200
     assert transitioned.status_code == 200
-    assert [configured.json(), bound.json(), refreshed.json(), transitioned.json()] == [
+    assert detail.status_code == 200
+    assert opened.status_code == 200
+    assert [
+        configured.json(),
+        bound.json(),
+        refreshed.json(),
+        transitioned.json(),
+        detail.json(),
+        opened.json(),
+    ] == [
         {"operation": "configure_project"},
         {"operation": "bind_map"},
         {"operation": "refresh"},
         {"operation": "transition_map"},
+        {"operation": "map_detail"},
+        {"operation": "open_map"},
     ]
     assert calls == [
         ("profile", "ceo"),
@@ -196,6 +223,10 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
                 "requested_stage": "delivery",
             },
         ),
+        ("profile", "ceo"),
+        ("map_detail", {"map_id": "I_atlas_41"}),
+        ("profile", "ceo"),
+        ("open_map", {"map_id": "I_atlas_41"}),
     ]
 
 
@@ -258,3 +289,44 @@ def test_rest_transition_preserves_policy_and_tracker_failure_details(
     assert failed.json()["detail"] == (
         "GitHub write failed; verify issue-write permission"
     )
+
+
+def test_rest_session_open_preserves_repair_required_detail(
+    tmp_path, monkeypatch, hermes_host_root
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    adapter = _load_dashboard_adapter()
+    api = FastAPI()
+    api.include_router(adapter.router, prefix="/api/plugins/map-governance")
+
+    class ApplicationProbe:
+        def open_map(self, *, map_id):
+            raise CEOSessionRepairRequired(
+                reason="multiple_exact_canonical_sessions",
+                candidate_count=2,
+            )
+
+    monkeypatch.setattr(
+        adapter,
+        "application_for_profile",
+        lambda profile: ApplicationProbe(),
+    )
+
+    async def exercise_route():
+        transport = httpx.ASGITransport(app=api)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            return await client.post(
+                "/api/plugins/map-governance/maps/I_atlas_41/session?profile=ceo"
+            )
+
+    response = asyncio.run(exercise_route())
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "type": "repair_required",
+        "reason": "multiple_exact_canonical_sessions",
+        "candidate_count": 2,
+        "retryable": False,
+    }

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .application import MapGovernanceApplication
+from .sessions import HermesSessionAdapter, HermesSessionDatabaseBackend
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -15,11 +16,23 @@ class ProfileResolutionError(ValueError):
     """Raised when a request does not identify an existing Hermes profile."""
 
 
-def application_for_storage(storage_root: Path) -> MapGovernanceApplication:
+def application_for_storage(
+    storage_root: Path,
+    *,
+    profile_name: str | None = None,
+    state_database: Path | None = None,
+) -> MapGovernanceApplication:
     """Build the application for an explicitly selected storage directory."""
+    session_runner = (
+        HermesSessionAdapter(HermesSessionDatabaseBackend(state_database))
+        if profile_name is not None and state_database is not None
+        else None
+    )
     return MapGovernanceApplication(
         plugin_root=PLUGIN_ROOT,
         storage_root=storage_root,
+        session_runner=session_runner,
+        profile_name=profile_name,
     )
 
 
@@ -51,4 +64,8 @@ def application_for_profile(profile: str) -> MapGovernanceApplication:
     finally:
         reset_hermes_home_override(token)
 
-    return application_for_storage(storage_root)
+    return application_for_storage(
+        storage_root,
+        profile_name=canonical_profile,
+        state_database=profile_home / "state.db",
+    )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -9,7 +11,7 @@ from typing import Any, Iterator
 
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class PluginStorage:
@@ -126,6 +128,146 @@ class PluginStorage:
                 (map_id,),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def map_session_context(self, map_id: str) -> dict[str, Any] | None:
+        """Return the bound Map fields needed to establish session content."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    binding.map_id,
+                    binding.project_id,
+                    binding.issue_url,
+                    projection.repository,
+                    projection.issue_number,
+                    projection.title,
+                    projection.stage
+                FROM map_bindings AS binding
+                JOIN map_projections AS projection USING(map_id)
+                WHERE binding.map_id = ?
+                """,
+                (map_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def ceo_session_binding(self, map_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    map_id, profile_name, canonical_identity, canonical_title,
+                    root_session_id, live_session_id, state, last_activity_at,
+                    bootstrap_hash, repair_reason, repair_candidate_count,
+                    updated_at
+                FROM ceo_session_bindings
+                WHERE map_id = ?
+                """,
+                (map_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    @contextmanager
+    def ceo_session_lease(self, map_id: str) -> Iterator[None]:
+        """Serialize one Map's adopt-or-mint flow across plugin processes."""
+        lease_root = self.root / ".session-leases"
+        lease_root.mkdir(parents=True, exist_ok=True)
+        lease_name = hashlib.sha256(map_id.encode()).hexdigest()
+        lease_path = lease_root / f"{lease_name}.lock"
+        with lease_path.open("a+b") as lease:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+
+    def save_ceo_session_ready(
+        self,
+        *,
+        map_id: str,
+        profile_name: str,
+        canonical_identity: str,
+        canonical_title: str,
+        root_session_id: str,
+        live_session_id: str,
+        last_activity_at: str | None,
+        bootstrap_hash: str,
+        updated_at: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ceo_session_bindings(
+                    map_id, profile_name, canonical_identity, canonical_title,
+                    root_session_id, live_session_id, state, last_activity_at,
+                    bootstrap_hash, repair_reason, repair_candidate_count,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, NULL, NULL, ?)
+                ON CONFLICT(map_id) DO UPDATE SET
+                    profile_name = excluded.profile_name,
+                    canonical_identity = excluded.canonical_identity,
+                    canonical_title = excluded.canonical_title,
+                    root_session_id = excluded.root_session_id,
+                    live_session_id = excluded.live_session_id,
+                    state = 'ready',
+                    last_activity_at = excluded.last_activity_at,
+                    bootstrap_hash = excluded.bootstrap_hash,
+                    repair_reason = NULL,
+                    repair_candidate_count = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    map_id,
+                    profile_name,
+                    canonical_identity,
+                    canonical_title,
+                    root_session_id,
+                    live_session_id,
+                    last_activity_at,
+                    bootstrap_hash,
+                    updated_at,
+                ),
+            )
+
+    def save_ceo_session_repair_required(
+        self,
+        *,
+        map_id: str,
+        profile_name: str,
+        canonical_identity: str,
+        canonical_title: str,
+        reason: str,
+        candidate_count: int,
+        updated_at: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ceo_session_bindings(
+                    map_id, profile_name, canonical_identity, canonical_title,
+                    root_session_id, live_session_id, state, last_activity_at,
+                    bootstrap_hash, repair_reason, repair_candidate_count,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, 'repair_required', NULL,
+                          NULL, ?, ?, ?)
+                ON CONFLICT(map_id) DO UPDATE SET
+                    profile_name = excluded.profile_name,
+                    canonical_identity = excluded.canonical_identity,
+                    canonical_title = excluded.canonical_title,
+                    state = 'repair_required',
+                    repair_reason = excluded.repair_reason,
+                    repair_candidate_count = excluded.repair_candidate_count,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    map_id,
+                    profile_name,
+                    canonical_identity,
+                    canonical_title,
+                    reason,
+                    candidate_count,
+                    updated_at,
+                ),
+            )
 
     def save_project_projection(
         self,
@@ -244,10 +386,25 @@ class PluginStorage:
                 for row in connection.execute(
                     """
                     SELECT
-                        map_id, project_id, repository, issue_number, issue_url,
-                        title, stage, ceo_session_state, synchronized_at
-                    FROM map_projections
-                    ORDER BY project_id, repository, issue_number, map_id
+                        projection.map_id,
+                        projection.project_id,
+                        projection.repository,
+                        projection.issue_number,
+                        projection.issue_url,
+                        projection.title,
+                        projection.stage,
+                        COALESCE(session.state, 'unbound') AS ceo_session_state,
+                        session.last_activity_at AS ceo_session_last_activity_at,
+                        session.repair_reason AS ceo_session_repair_reason,
+                        session.repair_candidate_count AS ceo_session_candidate_count,
+                        projection.synchronized_at
+                    FROM map_projections AS projection
+                    LEFT JOIN ceo_session_bindings AS session USING(map_id)
+                    ORDER BY
+                        projection.project_id,
+                        projection.repository,
+                        projection.issue_number,
+                        projection.map_id
                     """
                 )
             ]
@@ -338,6 +495,24 @@ class PluginStorage:
                 stage TEXT NOT NULL,
                 ceo_session_state TEXT NOT NULL,
                 synchronized_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ceo_session_bindings (
+                map_id TEXT PRIMARY KEY REFERENCES map_bindings(map_id),
+                profile_name TEXT NOT NULL,
+                canonical_identity TEXT NOT NULL UNIQUE,
+                canonical_title TEXT NOT NULL,
+                root_session_id TEXT UNIQUE,
+                live_session_id TEXT,
+                state TEXT NOT NULL CHECK(state IN ('ready', 'repair_required')),
+                last_activity_at TEXT,
+                bootstrap_hash TEXT,
+                repair_reason TEXT,
+                repair_candidate_count INTEGER,
+                updated_at TEXT NOT NULL
             )
             """
         )

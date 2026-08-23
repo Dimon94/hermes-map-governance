@@ -6,8 +6,12 @@ import json
 import sys
 from argparse import ArgumentParser, Namespace
 
-from .application import MapBindingError, MapTransitionError
-from .runtime import application_for_storage
+from .application import (
+    CEOSessionRepairRequired,
+    MapBindingError,
+    MapTransitionError,
+)
+from .runtime import application_for_profile, application_for_storage
 from .tracker import TrackerError
 
 
@@ -15,6 +19,15 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
     commands = parser.add_subparsers(dest="maps_command", required=True)
     commands.add_parser("health", help="Check Map Governance readiness")
     commands.add_parser("board", help="Read the current Maps board")
+    detail = commands.add_parser("detail", help="Read one Map detail projection")
+    detail.add_argument("--map", required=True, help="Bound Map Issue node id")
+    open_session = commands.add_parser(
+        "open", help="Resolve and bootstrap a Map's canonical CEO session"
+    )
+    open_session.add_argument("--map", required=True, help="Bound Map Issue node id")
+    open_session.add_argument(
+        "--profile", required=True, help="Explicit Hermes CEO profile"
+    )
 
     project = commands.add_parser("project", help="Manage CEO projects")
     project_commands = project.add_subparsers(dest="project_command", required=True)
@@ -55,6 +68,21 @@ def register(ctx) -> None:
             return 0
         if args.maps_command == "board":
             print(json.dumps(application.board(), sort_keys=True))
+            return 0
+        if args.maps_command == "detail":
+            report = application.map_detail(map_id=args.map)
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        if args.maps_command == "open":
+            try:
+                report = application_for_profile(args.profile).open_map(map_id=args.map)
+            except CEOSessionRepairRequired as error:
+                print(
+                    json.dumps({"error": error.as_dict()}, sort_keys=True),
+                    file=sys.stderr,
+                )
+                return 1
+            print(json.dumps(report, sort_keys=True))
             return 0
         if args.maps_command == "project" and args.project_command == "configure":
             report = application.configure_project(project_url=args.url)

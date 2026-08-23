@@ -18,7 +18,11 @@ from map_governance.runtime import (  # noqa: E402
     ProfileResolutionError,
     application_for_profile,
 )
-from map_governance import MapBindingError, MapTransitionError  # noqa: E402
+from map_governance import (  # noqa: E402
+    CEOSessionRepairRequired,
+    MapBindingError,
+    MapTransitionError,
+)
 from map_governance.tracker import TrackerError  # noqa: E402
 
 
@@ -57,6 +61,8 @@ def _operation(profile: str, method: str, **arguments):
         return getattr(application, method)(**arguments)
     except MapTransitionError as error:
         raise HTTPException(status_code=409, detail=error.as_dict()) from error
+    except CEOSessionRepairRequired as error:
+        raise HTTPException(status_code=409, detail=error.as_dict()) from error
     except MapBindingError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except TrackerError as error:
@@ -71,6 +77,21 @@ async def health(profile: str = Query(min_length=1)):
 @router.get("/board")
 async def board(profile: str = Query(min_length=1)):
     return _application(profile).board()
+
+
+@router.get("/maps/{map_id}")
+async def map_detail(map_id: str, profile: str = Query(min_length=1)):
+    return _operation(profile, "map_detail", map_id=map_id)
+
+
+@router.post("/maps/{map_id}/session")
+async def open_map_session(map_id: str, profile: str = Query(min_length=1)):
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "open_map",
+        map_id=map_id,
+    )
 
 
 @router.post("/projects")

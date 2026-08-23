@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import map_governance.native as native
-from map_governance import MapTransitionError
+from map_governance import CEOSessionRepairRequired, MapTransitionError
 
 
 def test_native_health_uses_context_scoped_plugin_storage(tmp_path, capsys):
@@ -64,7 +64,21 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
             calls.append(("transition_map", arguments))
             return {"operation": "transition_map"}
 
+        def map_detail(self, **arguments):
+            calls.append(("map_detail", arguments))
+            return {"operation": "map_detail"}
+
+        def open_map(self, **arguments):
+            calls.append(("open_map", arguments))
+            return {"operation": "open_map"}
+
     monkeypatch.setattr(native, "application_for_storage", lambda root: ApplicationProbe())
+    monkeypatch.setattr(
+        native,
+        "application_for_profile",
+        lambda profile: calls.append(("profile", {"profile": profile}))
+        or ApplicationProbe(),
+    )
     registrations = []
     context = SimpleNamespace(
         state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
@@ -101,9 +115,21 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
             ]
         ),
         parser.parse_args(["board"]),
+        parser.parse_args(["detail", "--map", "I_atlas_41"]),
+        parser.parse_args(
+            ["open", "--map", "I_atlas_41", "--profile", "ceo"]
+        ),
     ]
 
-    assert [command["handler_fn"](args) for args in arguments] == [0, 0, 0, 0, 0]
+    assert [command["handler_fn"](args) for args in arguments] == [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
     reports = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert reports == [
         {"operation": "configure_project"},
@@ -111,6 +137,8 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
         {"operation": "refresh"},
         {"operation": "transition_map"},
         {"operation": "board"},
+        {"operation": "map_detail"},
+        {"operation": "open_map"},
     ]
     assert calls == [
         (
@@ -134,6 +162,9 @@ def test_native_maps_commands_delegate_to_the_application(tmp_path, monkeypatch,
             },
         ),
         ("board", {}),
+        ("map_detail", {"map_id": "I_atlas_41"}),
+        ("profile", {"profile": "ceo"}),
+        ("open_map", {"map_id": "I_atlas_41"}),
     ]
 
 
@@ -177,6 +208,45 @@ def test_native_transition_prints_structured_policy_failure(tmp_path, monkeypatc
             "current_stage": "authorized",
             "requested_stage": "acceptance",
             "reason": "acceptance can only be entered from delivery",
+            "retryable": False,
+        }
+    }
+
+
+def test_native_open_prints_structured_session_repair_failure(
+    tmp_path, monkeypatch, capsys
+):
+    class ApplicationProbe:
+        def open_map(self, **arguments):
+            raise CEOSessionRepairRequired(
+                reason="multiple_exact_canonical_sessions",
+                candidate_count=2,
+            )
+
+    monkeypatch.setattr(
+        native,
+        "application_for_profile",
+        lambda profile: ApplicationProbe(),
+    )
+    registrations = []
+    context = SimpleNamespace(
+        state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
+        register_cli_command=lambda **command: registrations.append(command),
+    )
+    native.register(context)
+    parser = ArgumentParser()
+    registrations[0]["setup_fn"](parser)
+
+    result = registrations[0]["handler_fn"](
+        parser.parse_args(["open", "--map", "I_atlas_41", "--profile", "ceo"])
+    )
+
+    assert result == 1
+    assert json.loads(capsys.readouterr().err) == {
+        "error": {
+            "type": "repair_required",
+            "reason": "multiple_exact_canonical_sessions",
+            "candidate_count": 2,
             "retryable": False,
         }
     }
