@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +42,62 @@ def main() -> int:
         )
     )
     assert diagnostic_report["status"] == "ready"
+
+    def run_maps(*arguments: str) -> dict:
+        result = subprocess.run(
+            [str(hermes), "maps", *arguments],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return json.loads(
+            next(
+                line
+                for line in reversed(result.stdout.splitlines())
+                if line.startswith("{")
+            )
+        )
+
+    project = run_maps(
+        "project",
+        "configure",
+        "--url",
+        "https://github.com/orgs/acme/projects/7",
+    )
+    first_card = run_maps(
+        "bind",
+        "--project",
+        project["id"],
+        "--issue",
+        "https://github.com/acme/atlas/issues/41",
+    )
+    second_card = run_maps(
+        "bind",
+        "--project",
+        project["id"],
+        "--issue",
+        "https://github.com/acme/atlas/issues/41",
+    )
+    assert first_card["id"] == second_card["id"] == "I_atlas_41"
+    cli_board = run_maps("board")
+    assert len(cli_board["projects"]) == 1
+    assert len(cli_board["maps"]) == 1
+    assert cli_board["maps"][0]["tracker"]["identity"] == "acme/atlas#41"
+    assert cli_board["maps"][0]["stage"] == "authorized"
+    assert cli_board["maps"][0]["ceo_session"] == {"state": "unbound"}
+
+    registry_database = Path(
+        diagnostic_report["components"]["storage"]["database"]
+    )
+    with sqlite3.connect(registry_database) as connection:
+        connection.execute("DELETE FROM map_projections")
+        connection.execute("DELETE FROM project_projections")
+    assert run_maps("board")["maps"] == []
+    rebuilt = run_maps("refresh", "--project", project["id"])
+    assert len(rebuilt["maps"]) == 1
+    assert rebuilt["maps"][0]["tracker"]["id"] == first_card["tracker"]["id"]
+    assert not (hermes_home / "kanban.db").exists()
 
     from hermes_cli import web_server
     from starlette.testclient import TestClient
@@ -86,13 +143,12 @@ def main() -> int:
         headers=auth,
     )
     assert board.status_code == 200, board.text
-    assert board.json()["maps"] == []
-    assert board.json()["empty_state"]["title"] == "No Maps are bound"
+    assert len(board.json()["projects"]) == 1
+    assert len(board.json()["maps"]) == 1
+    assert board.json()["maps"][0]["tracker"]["identity"] == "acme/atlas#41"
     assert not (hermes_home / "kanban.db").exists()
 
-    registry_database = Path(
-        health.json()["components"]["storage"]["database"]
-    )
+    registry_database = Path(health.json()["components"]["storage"]["database"])
     assert registry_database.is_file()
     removed = subprocess.run(
         [str(hermes), "plugins", "remove", "map-governance"],
@@ -120,6 +176,7 @@ def main() -> int:
         json.dumps(
             {
                 "installed": True,
+                "map_bound": True,
                 "native_discovered": True,
                 "dashboard_discovered": True,
                 "opened": True,

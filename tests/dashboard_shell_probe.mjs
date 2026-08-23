@@ -4,7 +4,9 @@ import vm from "node:vm";
 
 
 const bundlePath = process.argv[2];
+const mode = process.argv[3] || "empty";
 const requestedPaths = [];
+const requestedOptions = [];
 const effects = [];
 const state = [];
 let hookIndex = 0;
@@ -29,10 +31,47 @@ function useState(initialValue) {
   ];
 }
 
-function fetchJSON(path) {
+function fetchJSON(path, options) {
   requestedPaths.push(path);
+  requestedOptions.push(options || {});
+  if (path.includes("/refresh?profile=")) {
+    return Promise.resolve({ refreshed: true });
+  }
   if (path.includes("/board?profile=")) {
+    if (mode === "populated") {
+      const card = {
+        id: "I_atlas_41",
+        project: {
+          id: "PVT_acme_7",
+          url: "https://github.com/orgs/acme/projects/7",
+        },
+        tracker: {
+          provider: "github",
+          id: "I_atlas_41",
+          identity: "acme/atlas#41",
+          url: "https://github.com/acme/atlas/issues/41",
+        },
+        title: "Map the Atlas launch",
+        stage: "authorized",
+        ceo_session: { state: "unbound" },
+        last_synchronized_at: "2026-08-23T07:30:00Z",
+      };
+      return Promise.resolve({
+        projects: [{
+          id: "PVT_acme_7",
+          title: "Acme CEO portfolio",
+          tracker: {
+            owner: "acme",
+            number: 7,
+            url: "https://github.com/orgs/acme/projects/7",
+          },
+          maps: [card],
+        }],
+        maps: [card],
+      });
+    }
     return Promise.resolve({
+      projects: [],
       maps: [],
       empty_state: {
         title: "No Maps are bound",
@@ -87,6 +126,9 @@ hookIndex = 0;
 const readyTree = registeredPage();
 
 function textContent(node) {
+  if (Array.isArray(node)) {
+    return node.map(textContent).join(" ");
+  }
   if (typeof node === "string") {
     return node;
   }
@@ -96,13 +138,53 @@ function textContent(node) {
   return node.children.map(textContent).join(" ");
 }
 
+function findNode(node, predicate) {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const match = findNode(child, predicate);
+      if (match) return match;
+    }
+    return null;
+  }
+  if (!node || typeof node === "string") {
+    return null;
+  }
+  if (predicate(node)) {
+    return node;
+  }
+  return findNode(node.children || [], predicate);
+}
+
 const renderedText = textContent(readyTree);
 assert.deepEqual(requestedPaths, [
   "/api/plugins/map-governance/board?profile=worker",
   "/api/plugins/map-governance/health?profile=worker",
 ]);
-assert.match(renderedText, /No Maps are bound/);
-assert.match(renderedText, /Bind an existing GitHub Map Issue/);
-assert.match(renderedText, /Plugin ready/);
+if (mode === "populated") {
+  assert.match(renderedText, /Acme CEO portfolio/);
+  assert.match(renderedText, /Map the Atlas launch/);
+  assert.match(renderedText, /acme\/atlas#41/);
+  assert.match(renderedText, /authorized/);
+  assert.match(renderedText, /CEO session: unbound/);
+  assert.match(renderedText, /2026-08-23T07:30:00Z/);
+} else {
+  assert.match(renderedText, /No Maps are bound/);
+  assert.match(renderedText, /Bind an existing GitHub Map Issue/);
+  assert.match(renderedText, /Plugin ready/);
+}
 
-process.stdout.write("dashboard shell ready\n");
+const refreshButton = findNode(
+  readyTree,
+  (node) => node.type === "Button" && /Refresh/.test(textContent(node)),
+);
+assert.ok(refreshButton, "Maps page exposes refresh in populated and empty states");
+refreshButton.props.onClick();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+const refreshIndex = requestedPaths.findIndex((path) => path.includes("/refresh?profile="));
+assert.notEqual(refreshIndex, -1);
+assert.equal(requestedPaths[refreshIndex], "/api/plugins/map-governance/refresh?profile=worker");
+assert.equal(requestedOptions[refreshIndex].method, "POST");
+assert.deepEqual(JSON.parse(requestedOptions[refreshIndex].body), {});
+
+process.stdout.write(mode === "populated" ? "dashboard board ready\n" : "dashboard shell ready\n");

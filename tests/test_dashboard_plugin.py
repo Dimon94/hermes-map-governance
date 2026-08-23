@@ -90,3 +90,84 @@ def test_profile_scoped_applications_use_isolated_storage(
     assert default_database != worker_database
     assert default_database.is_relative_to(hermes_home / "plugin-data")
     assert worker_database.is_relative_to(worker_home / "plugin-data")
+
+
+def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
+    tmp_path, monkeypatch, hermes_host_root
+):
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _load_dashboard_adapter()
+    api = FastAPI()
+    api.include_router(adapter.router, prefix="/api/plugins/map-governance")
+    calls = []
+
+    class ApplicationProbe:
+        def configure_project(self, **arguments):
+            calls.append(("configure_project", arguments))
+            return {"operation": "configure_project"}
+
+        def bind_map(self, **arguments):
+            calls.append(("bind_map", arguments))
+            return {"operation": "bind_map"}
+
+        def refresh(self, **arguments):
+            calls.append(("refresh", arguments))
+            return {"operation": "refresh"}
+
+    monkeypatch.setattr(
+        adapter,
+        "application_for_profile",
+        lambda profile: calls.append(("profile", profile)) or ApplicationProbe(),
+    )
+
+    async def exercise_routes():
+        transport = httpx.ASGITransport(app=api)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            configured = await client.post(
+                "/api/plugins/map-governance/projects?profile=ceo",
+                json={"project_url": "https://github.com/orgs/acme/projects/7"},
+            )
+            bound = await client.post(
+                "/api/plugins/map-governance/bindings?profile=ceo",
+                json={
+                    "project_id": "PVT_acme_7",
+                    "issue_url": "https://github.com/acme/atlas/issues/41",
+                },
+            )
+            refreshed = await client.post(
+                "/api/plugins/map-governance/refresh?profile=ceo",
+                json={"project_id": "PVT_acme_7"},
+            )
+        return configured, bound, refreshed
+
+    configured, bound, refreshed = asyncio.run(exercise_routes())
+
+    assert configured.status_code == 200
+    assert bound.status_code == 200
+    assert refreshed.status_code == 200
+    assert [configured.json(), bound.json(), refreshed.json()] == [
+        {"operation": "configure_project"},
+        {"operation": "bind_map"},
+        {"operation": "refresh"},
+    ]
+    assert calls == [
+        ("profile", "ceo"),
+        (
+            "configure_project",
+            {"project_url": "https://github.com/orgs/acme/projects/7"},
+        ),
+        ("profile", "ceo"),
+        (
+            "bind_map",
+            {
+                "project_id": "PVT_acme_7",
+                "issue_url": "https://github.com/acme/atlas/issues/41",
+            },
+        ),
+        ("profile", "ceo"),
+        ("refresh", {"project_id": "PVT_acme_7"}),
+    ]

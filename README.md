@@ -11,8 +11,9 @@ Hermes Map Governance 是一个独立安装的 Hermes 治理插件。它把 Herm
 - GitHub Issue 单一治理真相源；
 - 与 Hermes 核心 Kanban 执行状态机隔离的独立插件架构。
 
-当前交付包含最小可安装插件壳：Hermes native plugin、Maps dashboard 页面、
-共享应用接口、独立存储命名空间和 readiness 诊断。Map 绑定及治理流程由后续票交付。
+当前交付包含可安装插件壳、GitHub Project / Issue 只读 adapter、Map binding registry、
+可重建董事会投影，以及 native CLI、dashboard API 和 Maps 页面。治理 transition、CEO
+会话与交付编排仍由后续票交付。
 
 ## 安装
 
@@ -30,11 +31,35 @@ Hermes Kanban task。插件数据位于当前请求 profile 的 Hermes 原生插
 本仓库是 standalone plugin，安装到
 `<HERMES_HOME>/plugins/map-governance/`，不要求也不会修改 Hermes core。
 
+## 绑定已有 Map
+
+先确保 `gh auth status` 可用且 token 具有 `read:project` scope，并且开放中的 Map
+Issue 恰好有一个受支持的 `map-stage/*` 标签。绑定流程只读取 GitHub Project 与
+Issue，不创建或复制 Issue，也不会向 GitHub Project、Hermes Kanban 或
+implementation ticket 写入内容。
+
+```bash
+hermes maps project configure \
+  --url https://github.com/orgs/OWNER/projects/PROJECT_NUMBER
+
+# 使用上一条命令返回的 Project node id。
+hermes maps bind \
+  --project PROJECT_NODE_ID \
+  --issue https://github.com/OWNER/REPOSITORY/issues/ISSUE_NUMBER
+
+hermes maps board
+hermes maps refresh --project PROJECT_NODE_ID
+```
+
+重复执行同一条 bind 命令是幂等的。`refresh` 从 GitHub tracker truth 与最小 binding
+registry 重新生成缓存；删除 projection rows 不会丢失 Map 绑定。
+
 ## 架构壳
 
 - `MapGovernanceApplication` 是 REST、dashboard 和诊断入口共同调用的应用 seam。
 - `hermes maps health` 与 `/api/plugins/map-governance/health` 返回同一 readiness。
-- `/api/plugins/map-governance/board` 提供当前空 board 投影；dashboard 只负责呈现。
+- `/api/plugins/map-governance/board` 提供按 GitHub Project 分组的 board 投影；
+  `/projects`、`/bindings` 与 `/refresh` POST routes 是同一应用接口的薄适配器。
 - `registry.db` 属于 `map-governance` 命名空间，由请求中的 profile 选择，且与
   `<PROFILE_HOME>/kanban.db` 隔离。
 

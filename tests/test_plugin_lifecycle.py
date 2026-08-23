@@ -21,7 +21,11 @@ def _run_git(*args: str, cwd: Path) -> None:
     )
 
 
-def test_black_box_install_discover_open_and_remove(tmp_path, hermes_host_root):
+def test_black_box_install_discover_open_and_remove(
+    tmp_path,
+    hermes_host_root,
+    fake_github_boundary,
+):
     hermes_agent_root = hermes_host_root
     hermes_python = hermes_agent_root / "venv" / "bin" / "python"
     if not hermes_python.is_file():
@@ -53,12 +57,15 @@ def test_black_box_install_discover_open_and_remove(tmp_path, hermes_host_root):
     bundled_plugins = tmp_path / "bundled-plugins"
     bundled_plugins.mkdir()
     env = os.environ.copy()
+    fake_gh, fake_gh_log = fake_github_boundary
     env.update(
         {
             "HERMES_HOME": str(hermes_home),
             "HERMES_BUNDLED_PLUGINS": str(bundled_plugins),
             "HERMES_DASHBOARD_SESSION_TOKEN": "map-governance-lifecycle-token",
             "PYTHONPATH": str(hermes_agent_root),
+            "PATH": f"{fake_gh.parent}{os.pathsep}{env['PATH']}",
+            "MAP_GOVERNANCE_FAKE_GH_LOG": str(fake_gh_log),
         }
     )
     env.pop("HERMES_ENABLE_PROJECT_PLUGINS", None)
@@ -82,6 +89,7 @@ def test_black_box_install_discover_open_and_remove(tmp_path, hermes_host_root):
     assert report == {
         "dashboard_discovered": True,
         "installed": True,
+        "map_bound": True,
         "native_discovered": True,
         "opened": True,
         "removed": True,

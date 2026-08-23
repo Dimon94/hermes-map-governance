@@ -1,5 +1,5 @@
 """Public application seam for the Hermes Map Governance plugin."""
 
-from .application import MapGovernanceApplication
+from .application import MapBindingError, MapGovernanceApplication
 
-__all__ = ["MapGovernanceApplication"]
+__all__ = ["MapBindingError", "MapGovernanceApplication"]
