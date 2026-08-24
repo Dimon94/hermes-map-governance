@@ -257,6 +257,8 @@ def test_bounded_dispatch_bridge_injects_identity_and_accepts_one_lane_contract(
         "dispatch",
         "collect",
     ]
+    lane_schema = bridge["schema"]["parameters"]["properties"]["lane"]["properties"]
+    assert lane_schema["worker_kind"]["enum"] == ["codex", "claude"]
     schema_text = json.dumps(bridge["schema"], sort_keys=True).lower()
     for forbidden in ("map_id", "profile", "session", "coordinator", "chairman"):
         assert forbidden not in schema_text
@@ -272,10 +274,13 @@ def test_bounded_dispatch_bridge_injects_identity_and_accepts_one_lane_contract(
         "integration": {
             "worktree": "/tmp/atlas-map-1",
             "branch": "feature/map-41",
+            "order": 2,
+            "total": 2,
+            "predecessor_ticket_urls": ["https://github.com/acme/atlas/issues/39"],
         },
         "execution": {
             "working_directory": "/tmp/atlas-map-1-issue-41",
-            "branch": "codex/issue-42",
+            "branch": "claude/issue-42",
             "base_commit": "a" * 40,
         },
         "owner": {
@@ -283,7 +288,7 @@ def test_bounded_dispatch_bridge_injects_identity_and_accepts_one_lane_contract(
             "skill_path": "/tmp/implement/SKILL.md",
             "invocation_label": "$implement",
         },
-        "worker_kind": "codex",
+        "worker_kind": "claude",
         "validation": {"argv": ["python3", "-m", "pytest", "-q"]},
         "completion_contract": "one-local-commit-integrated-and-validated",
         "known_limitations": ["Remote publication remains separately governed."],
@@ -315,6 +320,12 @@ def test_bounded_dispatch_bridge_injects_identity_and_accepts_one_lane_contract(
         "-m",
         "pytest",
         "-q",
+    )
+    assert calls[0]["lane"].worker_kind == "claude"
+    assert calls[0]["lane"].integration_order == 2
+    assert calls[0]["lane"].integration_total == 2
+    assert calls[0]["lane"].integration_predecessor_ticket_urls == (
+        "https://github.com/acme/atlas/issues/39",
     )
 
 

@@ -32,6 +32,13 @@ ROUTING_INTEGRATIONS = {
     "claude": frozenset(("hermes", "claude")),
     "mixed": frozenset(("hermes", "codex", "claude")),
 }
+DEFAULT_ROUTING_ATTRIBUTE_WORKERS = {
+    "backend": "codex",
+    "design": "claude",
+    "frontend": "claude",
+    "general-code": "codex",
+}
+_ROUTING_ATTRIBUTE_RE = re.compile(r"^[a-z0-9][a-z0-9/_-]{0,63}$")
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _COORDINATE_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _EXECUTABLE_RE = re.compile(r"^[A-Za-z0-9_.+-]+$")
@@ -206,6 +213,26 @@ def _normalize_desired(value: Mapping[str, Any]) -> dict[str, Any]:
     policy = _non_empty(routing.get("policy"), name="routing.policy").lower()
     if policy not in ROUTING_INTEGRATIONS:
         raise ValueError("routing.policy must be codex, claude, or mixed")
+    default_worker = _non_empty(
+        routing.get(
+            "default_worker",
+            "claude" if policy == "claude" else "codex",
+        ),
+        name="routing.default_worker",
+    ).lower()
+    allowed_workers = {
+        "codex": {"codex"},
+        "claude": {"claude"},
+        "mixed": {"codex", "claude"},
+    }[policy]
+    if default_worker not in allowed_workers:
+        raise ValueError("routing.default_worker must be allowed by routing.policy")
+    unavailable_worker = _non_empty(
+        routing.get("unavailable_worker", "blocked"),
+        name="routing.unavailable_worker",
+    ).lower()
+    if unavailable_worker not in {"blocked", "fallback"}:
+        raise ValueError("routing.unavailable_worker must be blocked or fallback")
 
     github = _mapping(desired.get("github"), name="github")
     hostname = _non_empty(github.get("hostname"), name="github.hostname").lower()
@@ -278,6 +305,37 @@ def _normalize_desired(value: Mapping[str, Any]) -> dict[str, Any]:
         for flag in ("worker_write_required", "publication_required"):
             if not isinstance(repository.get(flag), bool):
                 raise ValueError(f"github.repositories[{index}].{flag} must be boolean")
+        repository_routing = _mapping(
+            repository.get(
+                "routing",
+                {"attribute_workers": DEFAULT_ROUTING_ATTRIBUTE_WORKERS},
+            ),
+            name=f"github.repositories[{index}].routing",
+        )
+        raw_attribute_workers = _mapping(
+            repository_routing.get("attribute_workers"),
+            name=f"github.repositories[{index}].routing.attribute_workers",
+        )
+        if not raw_attribute_workers:
+            raise ValueError("Repository routing attribute_workers must not be empty")
+        attribute_workers: dict[str, str] = {}
+        for raw_attribute, raw_worker in raw_attribute_workers.items():
+            attribute = _non_empty(
+                raw_attribute,
+                name=(f"github.repositories[{index}].routing.attribute_workers key"),
+            ).lower()
+            worker_kind = _non_empty(
+                raw_worker,
+                name=(
+                    f"github.repositories[{index}].routing.attribute_workers."
+                    f"{attribute}"
+                ),
+            ).lower()
+            if not _ROUTING_ATTRIBUTE_RE.fullmatch(attribute):
+                raise ValueError("Repository routing attribute is invalid")
+            if worker_kind not in {"codex", "claude"}:
+                raise ValueError("Repository routing worker must be codex or claude")
+            attribute_workers[attribute] = worker_kind
         normalized_repositories.append(
             {
                 "coordinate": coordinate,
@@ -287,6 +345,9 @@ def _normalize_desired(value: Mapping[str, Any]) -> dict[str, Any]:
                 ),
                 "worker_write_required": repository["worker_write_required"],
                 "publication_required": repository["publication_required"],
+                "routing": {
+                    "attribute_workers": dict(sorted(attribute_workers.items()))
+                },
             }
         )
 
@@ -353,7 +414,11 @@ def _normalize_desired(value: Mapping[str, Any]) -> dict[str, Any]:
             "plugin": list(REQUIRED_PLUGIN_SKILLS),
             "external": normalized_external,
         },
-        "routing": {"policy": policy},
+        "routing": {
+            "policy": policy,
+            "default_worker": default_worker,
+            "unavailable_worker": unavailable_worker,
+        },
         "github": {
             "hostname": hostname,
             "projects": normalized_projects,

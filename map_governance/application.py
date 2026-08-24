@@ -82,6 +82,7 @@ from .coordinator import (
     DeliveryLaneSpec,
     DeliveryRuntimeRequest,
     RootRuntimeRequest,
+    delivery_confirmed_dispatch_id,
     delivery_dispatch_id,
     validate_delivery_lane_registry,
 )
@@ -2283,6 +2284,23 @@ class MapGovernanceApplication:
         lane: DeliveryLaneSpec,
     ) -> dict[str, Any]:
         """Hand one delivery-pipeline lane to the bounded Herdr runtime."""
+        if not isinstance(lane, DeliveryLaneSpec) or not lane.ticket_url:
+            raise TypeError("A delivery lane with a ticket URL is required")
+        lock_key = f"{self._storage.database}:{lane.ticket_url}"
+        with _operation_lock("delivery-lane", lock_key):
+            with self._storage.delivery_lane_lease(lane.ticket_url):
+                return self._dispatch_pm_delivery_lane(
+                    request_identity=request_identity,
+                    lane=lane,
+                )
+
+    def _dispatch_pm_delivery_lane(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+        lane: DeliveryLaneSpec,
+    ) -> dict[str, Any]:
+        """Dispatch after winning the ticket-scoped authoritative reread lease."""
         assignment = self._storage.pm_assignment_for_request(
             profile_name=request_identity.profile_name,
             session_id=request_identity.session_id,
@@ -2297,7 +2315,10 @@ class MapGovernanceApplication:
         map_id = str(assignment["map_id"])
         self._ensure_map_writable(map_id=map_id)
         if assignment["state"] != "active" or not assignment.get("active_turn_id"):
-            raise ValueError("PM delivery dispatch requires an active coordinator turn")
+            raise CoordinatorRuntimeError(
+                reason="delivery_lane_ownership_conflict",
+                retryable=True,
+            )
         if (
             self._commissioning_prerequisites is None
             or self._coordinator_runtime is None
@@ -2322,51 +2343,101 @@ class MapGovernanceApplication:
                 lane=lane,
                 map_issue=issue,
             )
+            existing_registry = self._latest_delivery_lane_registry(
+                project_id=str(binding["project_id"]),
+                ticket_url=lane.ticket_url,
+                lane=lane,
+            )
+            routing = self._delivery_worker_routing(
+                ticket=ticket,
+                lane=lane,
+                context=context,
+                existing_registry=existing_registry,
+            )
+            integration_expected_head, integration_predecessor_commits = (
+                self._delivery_integration_frontier(
+                    project_id=str(binding["project_id"]),
+                    lane=lane,
+                    repository=issue.repository,
+                    require_all=False,
+                )
+            )
             runtime_request = DeliveryRuntimeRequest(
                 map_id=map_id,
                 map_url=issue.url,
                 context=context,
                 lane=lane,
                 registry_timestamp=str(assignment["updated_at"]),
+                integration_expected_head=integration_expected_head,
+                integration_predecessor_commits=integration_predecessor_commits,
             )
-            existing_registry = self._latest_delivery_lane_registry(
-                project_id=str(binding["project_id"]),
-                ticket_url=lane.ticket_url,
-                lane=lane,
-            )
-            if existing_registry is None:
-                prepared = self._coordinator_runtime.prepare_lane(runtime_request)
-                self._validate_delivery_prepare_outcome(
-                    outcome=prepared,
-                    request=runtime_request,
-                )
-                existing_registry = DeliveryLaneRegistry.from_payload(
-                    prepared.get("registry", {})
-                )
-                self._validate_application_lane_registry(
-                    lane=lane,
-                    registry=existing_registry,
-                    allowed_states={"created"},
-                )
-                self._confirm_delivery_lane_registry(
-                    project_id=str(binding["project_id"]),
-                    ticket=ticket,
-                    lane=lane,
-                    registry=existing_registry,
-                )
-            else:
-                self._validate_application_lane_registry(
-                    lane=lane,
-                    registry=existing_registry,
-                    allowed_states={"created", "running", "blocked"},
-                )
-            runtime_request = replace(runtime_request, registry=existing_registry)
-            outcome = self._coordinator_runtime.dispatch_lane(runtime_request)
+            try:
+                if existing_registry is None:
+                    prepared = self._coordinator_runtime.prepare_lane(runtime_request)
+                    self._validate_delivery_prepare_outcome(
+                        outcome=prepared,
+                        request=runtime_request,
+                    )
+                    existing_registry = DeliveryLaneRegistry.from_payload(
+                        prepared.get("registry", {})
+                    )
+                    if existing_registry.dispatch_id != delivery_dispatch_id(
+                        runtime_request
+                    ):
+                        raise RuntimeError(
+                            "Delivery lane registry conflicts with the dispatch identity"
+                        )
+                    self._validate_application_lane_registry(
+                        lane=lane,
+                        registry=existing_registry,
+                        allowed_states={"created"},
+                    )
+                    self._confirm_delivery_lane_registry(
+                        project_id=str(binding["project_id"]),
+                        ticket=ticket,
+                        lane=lane,
+                        registry=existing_registry,
+                    )
+                else:
+                    self._validate_application_lane_registry(
+                        lane=lane,
+                        registry=existing_registry,
+                        allowed_states={"created", "running", "blocked"},
+                    )
+                runtime_request = replace(runtime_request, registry=existing_registry)
+                outcome = self._coordinator_runtime.dispatch_lane(runtime_request)
+            except CoordinatorRuntimeError as error:
+                if error.reason in {
+                    "delivery_base_mismatch",
+                    "overlapping_integration_ownership",
+                }:
+                    refreshed_frontier = self._delivery_integration_frontier(
+                        project_id=str(binding["project_id"]),
+                        lane=lane,
+                        repository=issue.repository,
+                        require_all=False,
+                    )
+                    if refreshed_frontier != (
+                        integration_expected_head,
+                        integration_predecessor_commits,
+                    ):
+                        raise CoordinatorRuntimeError(
+                            reason="integration_frontier_stale",
+                            retryable=True,
+                        ) from error
+                raise
             self._validate_delivery_dispatch_outcome(
                 outcome=outcome,
                 request=runtime_request,
             )
             registry = DeliveryLaneRegistry.from_payload(outcome.get("registry", {}))
+            if registry.dispatch_id not in {
+                None,
+                delivery_confirmed_dispatch_id(runtime_request),
+            }:
+                raise RuntimeError(
+                    "Delivery lane registry conflicts with the dispatch identity"
+                )
             self._validate_application_lane_registry(
                 lane=lane,
                 registry=registry,
@@ -2387,29 +2458,50 @@ class MapGovernanceApplication:
                     ).encode()
                 ).hexdigest()[:32]
             )
-            missing_worker = error.reason in {
-                "supported_worker_integration_missing",
-                "supported_worker_routing_missing",
-            }
+            missing_integration = error.reason == "supported_worker_integration_missing"
+            routing_conflict = error.reason == "supported_worker_routing_missing"
+            selected_worker = next(
+                (
+                    check.removeprefix("herdr.integration.").removeprefix(
+                        "routing.worker."
+                    )
+                    for check in error.failed_checks
+                    if check.startswith(("herdr.integration.", "routing.worker."))
+                ),
+                lane.worker_kind,
+            )
+            selected_worker_label = selected_worker.capitalize()
+            if missing_integration:
+                summary = (
+                    f"Delivery is blocked because the selected "
+                    f"{selected_worker_label} Herdr integration is not ready."
+                )
+                continuation = (
+                    f"Restore the {selected_worker_label} integration or change "
+                    "the configured future-dispatch fallback policy."
+                )
+            elif routing_conflict:
+                summary = (
+                    f"Delivery is blocked because the selected "
+                    f"{selected_worker_label} worker conflicts with the configured "
+                    "routing policy."
+                )
+                continuation = (
+                    "Align the future-dispatch ticket/repository route with the "
+                    "configured routing policy."
+                )
+            else:
+                summary = "Delivery is blocked by an unmet commissioning prerequisite."
+                continuation = "Repair the failed commissioning prerequisite and rerun verification."
             report_result = self.report_pm(
                 request_identity=request_identity,
                 report=PMReportDraft(
                     record_id=record_id,
                     report_type="blocker",
-                    summary=(
-                        "Delivery is blocked because no plugin-supported Codex Herdr "
-                        "route is configured and verified."
-                        if missing_worker
-                        else "Delivery is blocked by an unmet commissioning prerequisite."
-                    ),
+                    summary=summary,
                     timestamp=str(assignment["updated_at"]),
                     blocking=True,
-                    continuation_requirement=(
-                        "Select Codex or mixed routing and verify the Codex Herdr "
-                        "integration."
-                        if missing_worker
-                        else "Repair the failed commissioning prerequisite and rerun verification."
-                    ),
+                    continuation_requirement=continuation,
                 ),
             )
             return {
@@ -2424,7 +2516,7 @@ class MapGovernanceApplication:
             turn_id=str(assignment["active_turn_id"]),
             dispatch_id=str(outcome["dispatch_id"]),
         )
-        return {**outcome, **completion}
+        return {**outcome, "routing": routing, **completion}
 
     def collect_pm_delivery_lane(
         self,
@@ -2445,15 +2537,38 @@ class MapGovernanceApplication:
                 reason="pm_assignment_missing",
             )
         map_id = str(assignment["map_id"])
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("delivery-integration", lock_key):
+            with self._storage.delivery_integration_lease(map_id):
+                return self._collect_pm_delivery_lane(
+                    request_identity=request_identity,
+                    lane=lane,
+                )
+
+    def _collect_pm_delivery_lane(
+        self,
+        *,
+        request_identity: GovernanceRequestIdentity,
+        lane: DeliveryLaneSpec,
+    ) -> dict[str, Any]:
+        """Collect after winning the Map-scoped integration writer lease."""
+        assignment = self._storage.pm_assignment_for_request(
+            profile_name=request_identity.profile_name,
+            session_id=request_identity.session_id,
+        )
+        if assignment is None:
+            self._deny_governance_request(
+                map_id="unassigned",
+                action="pm:collect_lane",
+                request_identity=request_identity,
+                reason="pm_assignment_missing",
+            )
+        map_id = str(assignment["map_id"])
         self._ensure_map_writable(map_id=map_id)
         if assignment["state"] != "active" or not assignment.get("active_turn_id"):
             raise ValueError(
                 "PM delivery collection requires an active coordinator turn"
             )
-        if assignment.get("last_outcome") != "dispatch" or not assignment.get(
-            "last_outcome_id"
-        ):
-            raise ValueError("PM delivery collection has no confirmed dispatch handoff")
         if (
             self._commissioning_prerequisites is None
             or self._coordinator_runtime is None
@@ -2479,15 +2594,6 @@ class MapGovernanceApplication:
             lane=lane,
             registry_timestamp=str(assignment["updated_at"]),
         )
-        if delivery_dispatch_id(runtime_request) != assignment.get("last_outcome_id"):
-            raise ValueError(
-                "Collected delivery lane does not match the dispatch handoff"
-            )
-        ticket = self._delivery_ticket(
-            project_id=str(binding["project_id"]),
-            lane=lane,
-            map_issue=issue,
-        )
         registry = self._latest_delivery_lane_registry(
             project_id=str(binding["project_id"]),
             ticket_url=lane.ticket_url,
@@ -2501,9 +2607,35 @@ class MapGovernanceApplication:
             allowed_states={"running", "blocked", "terminal", "integrated"},
         )
         runtime_request = replace(runtime_request, registry=registry)
+        expected_dispatch_id = delivery_confirmed_dispatch_id(runtime_request)
+        confirmed_dispatch_id = registry.dispatch_id or assignment.get(
+            "last_outcome_id"
+        )
+        if expected_dispatch_id != confirmed_dispatch_id:
+            raise ValueError(
+                "Collected delivery lane does not match the dispatch handoff"
+            )
+        ticket = self._delivery_ticket(
+            project_id=str(binding["project_id"]),
+            lane=lane,
+            map_issue=issue,
+        )
+        integration_expected_head, integration_predecessor_commits = (
+            self._delivery_integration_frontier(
+                project_id=str(binding["project_id"]),
+                lane=lane,
+                repository=issue.repository,
+                require_all=True,
+            )
+        )
+        runtime_request = replace(
+            runtime_request,
+            integration_expected_head=integration_expected_head,
+            integration_predecessor_commits=integration_predecessor_commits,
+        )
         outcome = self._coordinator_runtime.collect_lane(runtime_request)
         if outcome.get("state") == "blocked":
-            if outcome.get("dispatch_id") != assignment.get("last_outcome_id"):
+            if outcome.get("dispatch_id") != expected_dispatch_id:
                 raise ValueError(
                     "Collected delivery lane does not match the dispatch handoff"
                 )
@@ -2551,7 +2683,7 @@ class MapGovernanceApplication:
             return {**outcome, **report_result}
         if outcome.get("state") != "locally_validated":
             raise RuntimeError("Delivery lane did not reach local validation")
-        if outcome.get("dispatch_id") != assignment.get("last_outcome_id"):
+        if outcome.get("dispatch_id") != expected_dispatch_id:
             raise ValueError(
                 "Collected delivery lane does not match the dispatch handoff"
             )
@@ -2593,17 +2725,25 @@ class MapGovernanceApplication:
                 registry=integrated_registry,
             )
         dispatch_id = str(outcome["dispatch_id"])
+        final_lane = lane.integration_order == lane.integration_total
         record_id = (
-            "delivery-acceptance-"
-            + hashlib.sha256(dispatch_id.encode()).hexdigest()[:32]
+            "delivery-acceptance-" if final_lane else "delivery-integrated-"
+        ) + hashlib.sha256(dispatch_id.encode()).hexdigest()[:32]
+        evidence = (
+            self._delivery_acceptance_evidence(outcome=outcome, lane=lane)
+            if final_lane
+            else ()
         )
-        evidence = self._delivery_acceptance_evidence(outcome=outcome, lane=lane)
         report_result = self.report_pm(
             request_identity=request_identity,
             report=PMReportDraft(
                 record_id=record_id,
-                report_type="acceptance",
-                summary="Local delivery is validated and ready for acceptance review.",
+                report_type="acceptance" if final_lane else "checkpoint",
+                summary=(
+                    "Local delivery is validated and ready for acceptance review."
+                    if final_lane
+                    else "One ordered local delivery outcome is integrated and validated."
+                ),
                 timestamp=str(assignment["updated_at"]),
                 evidence=evidence,
             ),
@@ -2680,7 +2820,250 @@ class MapGovernanceApplication:
                     or dependency.state != "closed"
                 ):
                     raise ValueError("Delivery ticket is not independently grabbable")
+        integration_fields_present = (
+            re.search(
+                r"(?im)^##\s+Integration (?:order|total|after)\s*$",
+                ticket.body,
+            )
+            is not None
+        )
+        if (
+            integration_fields_present
+            or lane.integration_order != 1
+            or lane.integration_total != 1
+            or lane.integration_predecessor_ticket_urls
+        ):
+            order = self._delivery_ticket_field(ticket.body, "Integration order")
+            total = self._delivery_ticket_field(ticket.body, "Integration total")
+            after = self._delivery_ticket_field(ticket.body, "Integration after")
+            if not order.isdigit() or not total.isdigit():
+                raise ValueError("Delivery ticket integration order is invalid")
+            predecessor_urls = (
+                ()
+                if re.fullmatch(r"(?is)(?:[-*]\s*)?none[.\s]*", after)
+                else self._delivery_dependency_urls(
+                    after,
+                    repository=map_issue.repository,
+                )
+            )
+            if (
+                int(order) != lane.integration_order
+                or int(total) != lane.integration_total
+                or predecessor_urls != lane.integration_predecessor_ticket_urls
+            ):
+                raise ValueError(
+                    "Delivery ticket integration order does not match tracker authority"
+                )
         return ticket
+
+    def _delivery_integration_frontier(
+        self,
+        *,
+        project_id: str,
+        lane: DeliveryLaneSpec,
+        repository: str,
+        require_all: bool,
+    ) -> tuple[str, tuple[str, ...]]:
+        """Read one authoritative ordered predecessor chain and its Git frontier."""
+        if lane.integration_order == 1:
+            return lane.base_commit, ()
+        commits: list[str] = []
+        incomplete = False
+        for index, ticket_url in enumerate(
+            lane.integration_predecessor_ticket_urls,
+            start=1,
+        ):
+            ticket = self._tracker_read(
+                project_id=project_id,
+                operation=lambda url=ticket_url: self._tracker.get_issue(url),
+            )
+            parent = self._delivery_ticket_field(ticket.body, "Parent")
+            order = self._delivery_ticket_field(ticket.body, "Integration order")
+            total = self._delivery_ticket_field(ticket.body, "Integration total")
+            after = self._delivery_ticket_field(ticket.body, "Integration after")
+            predecessor_urls = (
+                ()
+                if re.fullmatch(r"(?is)(?:[-*]\s*)?none[.\s]*", after)
+                else self._delivery_dependency_urls(after, repository=repository)
+            )
+            expected_predecessors = lane.integration_predecessor_ticket_urls[
+                : index - 1
+            ]
+            if (
+                ticket.repository != repository
+                or ticket.url != ticket_url
+                or ticket.state != "open"
+                or "implementation" not in ticket.labels
+                or re.fullmatch(
+                    rf"(?:[-*]\s*)?{re.escape(lane.parent_spec_url)}",
+                    parent,
+                )
+                is None
+                or not order.isdigit()
+                or int(order) != index
+                or not total.isdigit()
+                or int(total) != lane.integration_total
+                or predecessor_urls != expected_predecessors
+            ):
+                raise ValueError(
+                    "Delivery integration predecessor does not match tracker authority"
+                )
+            records = self._tracker_read(
+                project_id=project_id,
+                operation=lambda url=ticket_url: (
+                    self._tracker.list_delivery_lane_registries(url)
+                ),
+            )
+            registry = records[-1].registry if records else None
+            if registry is None or registry.state != "integrated":
+                incomplete = True
+                if require_all:
+                    raise CoordinatorRuntimeError(
+                        reason="integration_order_not_ready",
+                        retryable=True,
+                    )
+                continue
+            if incomplete:
+                raise ValueError("Delivery integration predecessor chain is not linear")
+            if (
+                registry.work_item != ticket_url
+                or registry.role != "implementation"
+                or registry.lane_id != f"implementation-{ticket.number}"
+                or registry.base_commit != lane.base_commit
+                or registry.runtime not in {"herdr-codex-pane", "herdr-claude-pane"}
+                or not isinstance(registry.integrated_commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", registry.integrated_commit) is None
+            ):
+                raise ValueError(
+                    "Delivery integration predecessor registry conflicts with tracker truth"
+                )
+            commits.append(registry.integrated_commit)
+        if require_all and len(commits) != lane.integration_order - 1:
+            raise CoordinatorRuntimeError(
+                reason="integration_order_not_ready",
+                retryable=True,
+            )
+        if not commits:
+            if require_all:
+                raise CoordinatorRuntimeError(
+                    reason="integration_order_not_ready",
+                    retryable=True,
+                )
+            return lane.base_commit, ()
+        return commits[-1], tuple(commits)
+
+    @staticmethod
+    def _delivery_worker_routing(
+        *,
+        ticket: TrackerIssue,
+        lane: DeliveryLaneSpec,
+        context: CommissioningContext,
+        existing_registry: DeliveryLaneRegistry | None,
+    ) -> dict[str, Any]:
+        """Resolve one explicit, repository-scoped worker route before mutation."""
+        if existing_registry is not None:
+            worker_kind = existing_registry.runtime.removeprefix("herdr-").removesuffix(
+                "-pane"
+            )
+            if lane.worker_kind != worker_kind:
+                raise ValueError(
+                    "Delivery worker kind conflicts with the active lane registry"
+                )
+            return {
+                "worker_kind": worker_kind,
+                "source": "active_lane_registry",
+                "ticket_attributes": [],
+                "integration_ready": worker_kind in context.supported_worker_kinds,
+                "fallback": False,
+            }
+
+        allowed_workers = {
+            "codex": ("codex",),
+            "claude": ("claude",),
+            "mixed": ("codex", "claude"),
+        }.get(context.routing_policy)
+        if allowed_workers is None:
+            raise CommissioningPrerequisiteError(
+                reason="supported_worker_routing_missing",
+                failed_checks=("routing.policy",),
+            )
+        labels = tuple(
+            dict.fromkeys(
+                str(label).strip().lower()
+                for label in ticket.labels
+                if str(label).strip()
+            )
+        )
+        explicit_workers = tuple(
+            worker for worker in ("codex", "claude") if f"worker/{worker}" in labels
+        )
+        if len(explicit_workers) > 1:
+            raise ValueError("Delivery ticket declares conflicting worker attributes")
+
+        attribute_workers = dict(context.routing_attribute_workers)
+        matched_attributes = tuple(
+            attribute for attribute in labels if attribute in attribute_workers
+        )
+        matched_workers = tuple(
+            dict.fromkeys(
+                attribute_workers[attribute] for attribute in matched_attributes
+            )
+        )
+        if len(matched_workers) > 1:
+            raise ValueError("Delivery ticket attributes map to conflicting workers")
+        if explicit_workers:
+            selected = explicit_workers[0]
+            source = "ticket_worker_attribute"
+            evidence_attributes = [f"worker/{selected}"]
+        elif matched_workers:
+            selected = matched_workers[0]
+            source = "repository_attribute_policy"
+            evidence_attributes = list(matched_attributes)
+        else:
+            selected = context.routing_default_worker
+            source = "configured_default"
+            evidence_attributes = []
+        if selected not in allowed_workers:
+            raise CommissioningPrerequisiteError(
+                reason="supported_worker_routing_missing",
+                failed_checks=(f"routing.worker.{selected}",),
+            )
+
+        ready_workers = tuple(
+            worker
+            for worker in allowed_workers
+            if worker in context.supported_worker_kinds
+        )
+        fallback = False
+        if selected not in ready_workers:
+            if context.routing_unavailable_behavior == "fallback":
+                candidates = tuple(
+                    worker
+                    for worker in (
+                        context.routing_default_worker,
+                        "codex",
+                        "claude",
+                    )
+                    if worker in ready_workers
+                )
+                if candidates:
+                    selected = candidates[0]
+                    source = "integration_readiness_fallback"
+                    fallback = True
+            if selected not in ready_workers:
+                raise CommissioningPrerequisiteError(
+                    reason="supported_worker_integration_missing",
+                    failed_checks=(f"herdr.integration.{selected}",),
+                )
+        if lane.worker_kind != selected:
+            raise ValueError("Delivery worker kind conflicts with routing policy")
+        return {
+            "worker_kind": selected,
+            "source": source,
+            "ticket_attributes": evidence_attributes,
+            "integration_ready": True,
+            "fallback": fallback,
+        }
 
     @staticmethod
     def _delivery_ticket_field(body: str, field: str) -> str:
@@ -2716,7 +3099,7 @@ class MapGovernanceApplication:
             not isinstance(outcome, Mapping)
             or outcome.get("state") != "prepared"
             or outcome.get("map_id") != request.map_id
-            or outcome.get("dispatch_id") != delivery_dispatch_id(request)
+            or outcome.get("dispatch_id") != delivery_confirmed_dispatch_id(request)
             or outcome.get("worker_kind") != request.lane.worker_kind
             or outcome.get("remote_actions") != "forbidden"
         ):
@@ -2733,7 +3116,7 @@ class MapGovernanceApplication:
             not isinstance(outcome, Mapping)
             or outcome.get("state") != "dispatched"
             or outcome.get("map_id") != request.map_id
-            or outcome.get("dispatch_id") != delivery_dispatch_id(request)
+            or outcome.get("dispatch_id") != delivery_confirmed_dispatch_id(request)
             or outcome.get("worker_kind") != lane.worker_kind
             or outcome.get("completion_contract") != lane.completion_contract
             or outcome.get("remote_actions") != "forbidden"
@@ -2755,7 +3138,7 @@ class MapGovernanceApplication:
         if (
             outcome.get("state") != "blocked"
             or outcome.get("map_id") != request.map_id
-            or outcome.get("dispatch_id") != delivery_dispatch_id(request)
+            or outcome.get("dispatch_id") != delivery_confirmed_dispatch_id(request)
             or outcome.get("worker_kind") != request.lane.worker_kind
             or outcome.get("remote_actions") != "forbidden"
             or outcome.get("blocker") != expected_blocker
@@ -2812,7 +3195,7 @@ class MapGovernanceApplication:
         )
         if (
             outcome.get("map_id") != request.map_id
-            or outcome.get("dispatch_id") != delivery_dispatch_id(request)
+            or outcome.get("dispatch_id") != delivery_confirmed_dispatch_id(request)
             or outcome.get("worker_kind") != lane.worker_kind
             or outcome.get("remote_actions") != "forbidden"
             or outcome.get("acceptance_recommendation") != "accept"
@@ -2907,6 +3290,7 @@ class MapGovernanceApplication:
             "worktree",
             "branch",
             "base_commit",
+            "dispatch_id",
         )
         allowed_transitions = {
             ("created", "running"),
@@ -3009,6 +3393,7 @@ class MapGovernanceApplication:
             "worktree",
             "branch",
             "base_commit",
+            "dispatch_id",
         )
         if latest is not None and any(
             getattr(latest, field) != getattr(registry, field)

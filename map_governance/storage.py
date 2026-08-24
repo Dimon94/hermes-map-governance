@@ -255,6 +255,18 @@ class PluginStorage:
         with self._map_lease(namespace="pm-turn", map_id=map_id):
             yield
 
+    @contextmanager
+    def delivery_lane_lease(self, ticket_url: str) -> Iterator[None]:
+        """Serialize authoritative reread and dispatch for one implementation ticket."""
+        with self._map_lease(namespace="delivery-lane", map_id=ticket_url):
+            yield
+
+    @contextmanager
+    def delivery_integration_lease(self, map_id: str) -> Iterator[None]:
+        """Serialize ordered writes to one Map Integration Worktree."""
+        with self._map_lease(namespace="delivery-integration", map_id=map_id):
+            yield
+
     def save_pm_assignment(
         self,
         *,
@@ -519,6 +531,11 @@ class PluginStorage:
                 (map_id,),
             ).fetchone()
             if existing is not None:
+                stable_values = {
+                    name: value
+                    for name, value in values.items()
+                    if name != "routing_policy"
+                }
                 same = all(
                     str(existing[name]) == value
                     for name, value in {
@@ -527,7 +544,7 @@ class PluginStorage:
                         "agent_id": agent_id,
                         "ownership_marker": ownership_marker,
                         "lifecycle_id": lifecycle_id,
-                        **values,
+                        **stable_values,
                     }.items()
                 )
                 if not same:

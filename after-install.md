@@ -104,7 +104,9 @@ hermes maps runtime status \
 
 Commissioning fails before Herdr mutation unless the request-scoped CEO
 identity, consumed authorization, Project/repository binding, PM profile,
-Skills, routing policy, and selected Herdr integrations all pass. The plugin
+Skills, routing policy, and base Herdr integration all pass. Provider integration
+readiness is recorded per worker kind and enforced at each future dispatch through
+the configured blocked/fallback policy. The plugin
 creates or resumes only its deterministic owned namespace; a same-name resource
 without durable ownership proof is reported as `repair_required` and is never
 attached, renamed, killed, or deleted. A started PM does not make the Map active:
@@ -156,20 +158,28 @@ stays in the active turn for identical-payload retry. The PM contract fixes
 `dispatch_runtime: herdr`. `delivery-pipeline` remains the lane/worktree/registry
 owner. Once it has prepared exactly one independently grabbable lane, the bounded
 `map_governance_pm_dispatch` tool validates the declared Integration and Execution
-Worktrees, resolved `implement` owner, configured Codex integration,
-validation argv, and local-only completion contract. Before any worker starts, the
+Worktrees, resolved `implement` owner, ticket/repository routing evidence, selected
+Codex or Claude integration, declared integration order, validation argv, and
+local-only completion contract. Before any worker starts, the
 prepared Herdr coordinates are tracker-confirmed as a `created` registry; `dispatch`
 then reconciles those exact coordinates, starts or resumes the worker, confirms the
 `running` registry, and leaves the PM idle. A later coordinator turn calls `collect`
 with the identical payload to consume one bounded Herdr final report plus one local
-commit, cherry-pick once, validate, read back `terminal` and `integrated`, and write either
-a whole-Map blocker or acceptance recommendation. No push, PR, merge, release,
+commit. Siblings may run concurrently in distinct panes/worktrees, but collect checks
+every declared predecessor registry and serializes Map Integration Worktree writes in
+the explicit order. Non-final lanes report checkpoints; the final lane may recommend
+acceptance. No push, PR, merge, release,
 Issue closure, or lane cleanup is performed, and lane coordinates never become
 Map cards.
 Dispatch also reads back the ticket's implementation label, exact Spec `Parent`
 backlink, and closed `Blocked by` dependencies. A worker-reported blocker can resume
 only after governed Map state returns to `delivery`; resume revalidates the same
 registered Herdr worker and Git ownership before `blocked -> running`.
-This proof lane supports Codex CLI and records canonical `bootstrap_authority: none`;
-Claude-only routing is reported as a prerequisite to select Codex/mixed routing and
-verify the Codex Herdr integration.
+Both Codex CLI and Claude Code lanes record canonical `bootstrap_authority: none`;
+Claude uses the declared fully authorized agent mode. Missing integrations follow the
+configured blocked/fallback policy, while adapter-owned capacity and provider cooldown
+failures remain retryable on the same lane identity. Routing changes affect future
+dispatch only and never migrate or terminate an active lane. Pre-upgrade active
+registries without `dispatch_id` retain their original packet identity, while a sibling
+dispatched after earlier integration starts from the tracker-confirmed contiguous
+predecessor frontier without rebasing its isolated execution worktree.

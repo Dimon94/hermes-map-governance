@@ -38,6 +38,9 @@ class CommissioningContext:
     pm_storage_root: str | None = None
     supported_worker_kinds: tuple[str, ...] = ()
     implement_skill_path: str | None = None
+    routing_default_worker: str = "codex"
+    routing_attribute_workers: tuple[tuple[str, str], ...] = ()
+    routing_unavailable_behavior: str = "blocked"
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,9 @@ class DeliveryLaneSpec:
     validation_argv: tuple[str, ...]
     completion_contract: str
     known_limitations: tuple[str, ...] = ()
+    integration_order: int = 1
+    integration_total: int = 1
+    integration_predecessor_ticket_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,12 +92,13 @@ class DeliveryLaneRegistry:
     head_commit: str | None
     integrated_commit: str | None
     updated_at: str
+    dispatch_id: str | None = None
     evidence_source: str | None = None
     final_report_digest: str | None = None
     blocker_summary: str | None = None
 
     def payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "work_item": self.work_item,
             "role": self.role,
             "lane_id": self.lane_id,
@@ -114,6 +121,9 @@ class DeliveryLaneRegistry:
             "final_report_digest": self.final_report_digest,
             "blocker_summary": self.blocker_summary,
         }
+        if self.dispatch_id is not None:
+            payload["dispatch_id"] = self.dispatch_id
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "DeliveryLaneRegistry":
@@ -130,6 +140,8 @@ class DeliveryRuntimeRequest:
     lane: DeliveryLaneSpec
     registry_timestamp: str = "1970-01-01T00:00:00Z"
     registry: DeliveryLaneRegistry | None = None
+    integration_expected_head: str | None = None
+    integration_predecessor_commits: tuple[str, ...] = ()
 
 
 def delivery_lane_packet(request: DeliveryRuntimeRequest) -> dict[str, Any]:
@@ -154,6 +166,9 @@ def delivery_lane_packet(request: DeliveryRuntimeRequest) -> dict[str, Any]:
             "worktree": lane.integration_worktree,
             "branch": lane.integration_branch,
             "base_commit": lane.base_commit,
+            "order": lane.integration_order,
+            "total": lane.integration_total,
+            "predecessor_ticket_urls": list(lane.integration_predecessor_ticket_urls),
         },
         "execution": {
             "working_directory": lane.execution_worktree,
@@ -189,8 +204,13 @@ def delivery_worker_prompt(
 ) -> dict[str, Any]:
     """Augment stable lane identity with verified Herdr/runtime report context."""
     lane = request.lane
+    packet = (
+        _legacy_delivery_lane_packet(request)
+        if registry.dispatch_id is None
+        else delivery_lane_packet(request)
+    )
     return {
-        **delivery_lane_packet(request),
+        **packet,
         "runtime_context": {
             "repository": {
                 "coordinate": request.context.repository,
@@ -248,6 +268,26 @@ def delivery_dispatch_id(request: DeliveryRuntimeRequest) -> str:
     """Return the stable identity that binds dispatch and collection payloads."""
     serialized = json.dumps(
         delivery_lane_packet(request), ensure_ascii=False, sort_keys=True
+    )
+    return "delivery-dispatch:" + hashlib.sha256(serialized.encode()).hexdigest()[:32]
+
+
+def _legacy_delivery_lane_packet(request: DeliveryRuntimeRequest) -> dict[str, Any]:
+    """Rebuild the #14 packet only when tracker truth proves a legacy lane."""
+    packet = delivery_lane_packet(request)
+    integration = dict(packet["integration"])
+    for field in ("order", "total", "predecessor_ticket_urls"):
+        integration.pop(field)
+    return {**packet, "integration": integration}
+
+
+def delivery_confirmed_dispatch_id(request: DeliveryRuntimeRequest) -> str:
+    """Use tracker-bound identity, including the exact pre-#17 packet shape."""
+    registry = request.registry
+    if registry is None or registry.dispatch_id is not None:
+        return delivery_dispatch_id(request)
+    serialized = json.dumps(
+        _legacy_delivery_lane_packet(request), ensure_ascii=False, sort_keys=True
     )
     return "delivery-dispatch:" + hashlib.sha256(serialized.encode()).hexdigest()[:32]
 
@@ -502,6 +542,12 @@ def validate_delivery_lane_registry(
                 registry.updated_at,
             )
         )
+    ):
+        raise ValueError("Delivery lane registry conflicts with the lane contract")
+    if (
+        registry.dispatch_id is not None
+        and re.fullmatch(r"delivery-dispatch:[0-9a-f]{32}", registry.dispatch_id)
+        is None
     ):
         raise ValueError("Delivery lane registry conflicts with the lane contract")
     if registry.state in {"created", "running", "blocked"} and (
@@ -1509,9 +1555,26 @@ class CoordinatorRuntime:
                 prefix=prefix,
                 registry=registry,
             )
+            integration_head = self._local_result(
+                [
+                    "git",
+                    "-C",
+                    request.lane.integration_worktree,
+                    "rev-parse",
+                    "HEAD",
+                ]
+            )
+            if integration_head != (
+                request.integration_expected_head or request.lane.base_commit
+            ):
+                self._raise_integration_head_mismatch(
+                    request,
+                    actual_head=integration_head,
+                    fallback_reason="overlapping_integration_ownership",
+                )
             worker_name = self.delivery_agent_name(
                 str(record["lifecycle_id"]),
-                delivery_dispatch_id(request),
+                delivery_confirmed_dispatch_id(request),
                 request.lane.worker_kind,
             )
             occupants = self._delivery_pane_occupants(prefix=prefix, pane=pane)
@@ -1564,23 +1627,6 @@ class CoordinatorRuntime:
                 if self._result(payload).get("type") != "agent_started":
                     raise self._malformed("worker_start_unconfirmed")
                 worker = self._agent_from(payload)
-            if (
-                self._local_result(
-                    [
-                        "git",
-                        "-C",
-                        request.lane.integration_worktree,
-                        "rev-parse",
-                        "HEAD",
-                    ]
-                )
-                != request.lane.base_commit
-            ):
-                raise CoordinatorRuntimeError(
-                    reason="overlapping_integration_ownership",
-                    retryable=False,
-                    repair_required=True,
-                )
             self._validate_worker_agent(
                 worker,
                 worker_name=worker_name,
@@ -1672,7 +1718,7 @@ class CoordinatorRuntime:
         return {
             "map_id": request.map_id,
             "state": "dispatched",
-            "dispatch_id": delivery_dispatch_id(request),
+            "dispatch_id": delivery_confirmed_dispatch_id(request),
             "worker_kind": request.lane.worker_kind,
             "completion_contract": request.lane.completion_contract,
             "checkpoint": "dispatch_handoff",
@@ -1685,6 +1731,13 @@ class CoordinatorRuntime:
     def collect_lane(self, request: DeliveryRuntimeRequest) -> dict[str, Any]:
         """Collect durable lane evidence, integrate once, and validate locally."""
         self._validate_delivery_request(request)
+        if len(request.integration_predecessor_commits) != (
+            request.lane.integration_order - 1
+        ):
+            raise CoordinatorRuntimeError(
+                reason="integration_order_not_ready",
+                retryable=True,
+            )
         registry = self._validate_delivery_registry(
             request,
             allowed_states={"running", "blocked", "terminal", "integrated"},
@@ -1739,24 +1792,9 @@ class CoordinatorRuntime:
             integration_head = self._local_result(
                 ["git", "-C", lane.integration_worktree, "rev-parse", "HEAD"]
             )
-            integration_count = self._local_result(
-                [
-                    "git",
-                    "-C",
-                    lane.integration_worktree,
-                    "rev-list",
-                    "--count",
-                    f"{lane.base_commit}..{integration_head}",
-                ]
-            )
+            expected_parent = request.integration_expected_head or lane.base_commit
             already_integrated = False
-            if integration_head != lane.base_commit:
-                if integration_count != "1":
-                    raise CoordinatorRuntimeError(
-                        reason="overlapping_integration_ownership",
-                        retryable=False,
-                        repair_required=True,
-                    )
+            if integration_head != expected_parent:
                 already_integrated = self._patch_is_integrated(
                     lane=lane,
                     integration_head=integration_head,
@@ -1781,7 +1819,7 @@ class CoordinatorRuntime:
             if not already_integrated:
                 self._require_integration_ready_for_cherry_pick(
                     lane,
-                    expected_head=integration_head,
+                    expected_head=expected_parent,
                 )
                 try:
                     self._local_result(
@@ -1806,6 +1844,7 @@ class CoordinatorRuntime:
                 lane=lane,
                 integration_commit=integration_commit,
                 execution_commit=execution_commit,
+                expected_parent=expected_parent,
             )
             self._require_clean_integration(lane.integration_worktree)
             try:
@@ -1862,7 +1901,7 @@ class CoordinatorRuntime:
             return {
                 "map_id": request.map_id,
                 "state": "locally_validated",
-                "dispatch_id": delivery_dispatch_id(request),
+                "dispatch_id": delivery_confirmed_dispatch_id(request),
                 "worker_kind": lane.worker_kind,
                 "terminal_registry": terminal_registry.payload(),
                 "integrated_registry": integrated_registry.payload(),
@@ -1888,7 +1927,7 @@ class CoordinatorRuntime:
         return {
             "map_id": request.map_id,
             "state": "blocked",
-            "dispatch_id": delivery_dispatch_id(request),
+            "dispatch_id": delivery_confirmed_dispatch_id(request),
             "worker_kind": request.lane.worker_kind,
             "blocked_registry": registry.payload(),
             "blocker": {
@@ -1930,6 +1969,7 @@ class CoordinatorRuntime:
             head_commit=None,
             integrated_commit=None,
             updated_at=request.registry_timestamp,
+            dispatch_id=delivery_dispatch_id(request),
         )
 
     @staticmethod
@@ -2037,6 +2077,7 @@ class CoordinatorRuntime:
         lane: DeliveryLaneSpec,
         integration_commit: str,
         execution_commit: str,
+        expected_parent: str | None = None,
     ) -> None:
         actual_head = cls._local_result(
             ["git", "-C", lane.integration_worktree, "rev-parse", "HEAD"]
@@ -2065,7 +2106,7 @@ class CoordinatorRuntime:
                 lane.integration_worktree,
                 "rev-list",
                 "--count",
-                f"{lane.base_commit}..{actual_head}",
+                f"{expected_parent or lane.base_commit}..{actual_head}",
             ]
         )
         if (
@@ -2214,7 +2255,7 @@ class CoordinatorRuntime:
         ]
         worker_name = self.delivery_agent_name(
             str(record["lifecycle_id"]),
-            delivery_dispatch_id(request),
+            delivery_confirmed_dispatch_id(request),
             request.lane.worker_kind,
         )
         pane = self._registered_delivery_pane_or_none(
@@ -2629,7 +2670,6 @@ class CoordinatorRuntime:
             "repository": request.context.repository,
             "repository_path": request.context.repository_path,
             "pm_profile": request.context.pm_profile,
-            "routing_policy": request.context.routing_policy,
             "herdr_executable": request.context.herdr_executable,
         }
         if any(
@@ -2880,6 +2920,7 @@ class CoordinatorRuntime:
         allow_active_execution: bool = False,
     ) -> None:
         lane = request.lane
+        cls._validate_integration_frontier(request)
         integration = str(Path(lane.integration_worktree).resolve())
         execution = str(Path(lane.execution_worktree).resolve())
         repository = str(Path(request.context.repository_path).resolve())
@@ -2938,16 +2979,131 @@ class CoordinatorRuntime:
                     repair_required=True,
                 )
         if not collecting:
-            for path in (integration, execution):
-                if (
-                    cls._local_result(["git", "-C", path, "rev-parse", "HEAD"])
-                    != lane.base_commit
-                ):
+            expected_heads = (
+                (integration, request.integration_expected_head or lane.base_commit),
+                (execution, lane.base_commit),
+            )
+            for path, expected_head in expected_heads:
+                actual_head = cls._local_result(
+                    ["git", "-C", path, "rev-parse", "HEAD"]
+                )
+                if actual_head != expected_head:
+                    if path == integration:
+                        cls._raise_integration_head_mismatch(
+                            request,
+                            actual_head=actual_head,
+                            fallback_reason="delivery_base_mismatch",
+                        )
                     raise CoordinatorRuntimeError(
                         reason="delivery_base_mismatch",
                         retryable=False,
                         repair_required=True,
                     )
+
+    @classmethod
+    def _raise_integration_head_mismatch(
+        cls,
+        request: DeliveryRuntimeRequest,
+        *,
+        actual_head: str,
+        fallback_reason: str,
+    ) -> NoReturn:
+        """Distinguish one serialized integration awaiting tracker confirmation."""
+        lane = request.lane
+        expected_head = request.integration_expected_head or lane.base_commit
+        unconfirmed_predecessors = (
+            lane.integration_order - 1 - len(request.integration_predecessor_commits)
+        )
+        if unconfirmed_predecessors > 0:
+            try:
+                merge_base = cls._local_result(
+                    [
+                        "git",
+                        "-C",
+                        lane.integration_worktree,
+                        "merge-base",
+                        expected_head,
+                        actual_head,
+                    ]
+                )
+                commit_count = cls._local_result(
+                    [
+                        "git",
+                        "-C",
+                        lane.integration_worktree,
+                        "rev-list",
+                        "--count",
+                        f"{expected_head}..{actual_head}",
+                    ]
+                )
+            except CoordinatorRuntimeError:
+                pass
+            else:
+                if merge_base == expected_head and commit_count == "1":
+                    raise CoordinatorRuntimeError(
+                        reason="integration_frontier_pending",
+                        retryable=True,
+                    )
+        raise CoordinatorRuntimeError(
+            reason=fallback_reason,
+            retryable=False,
+            repair_required=True,
+        )
+
+    @classmethod
+    def _validate_integration_frontier(
+        cls,
+        request: DeliveryRuntimeRequest,
+    ) -> None:
+        """Prove every tracker-confirmed predecessor commit is one linear chain."""
+        lane = request.lane
+        expected_head = request.integration_expected_head or lane.base_commit
+        commits = request.integration_predecessor_commits
+        if (
+            len(commits) > lane.integration_order - 1
+            or any(re.fullmatch(r"[0-9a-f]{40}", commit) is None for commit in commits)
+            or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None
+            or (commits and commits[-1] != expected_head)
+            or (not commits and expected_head != lane.base_commit)
+        ):
+            raise CoordinatorRuntimeError(
+                reason="integration_order_not_ready",
+                retryable=True,
+            )
+        previous = lane.base_commit
+        for commit in commits:
+            try:
+                merge_base = cls._local_result(
+                    [
+                        "git",
+                        "-C",
+                        lane.integration_worktree,
+                        "merge-base",
+                        previous,
+                        commit,
+                    ]
+                )
+                commit_count = cls._local_result(
+                    [
+                        "git",
+                        "-C",
+                        lane.integration_worktree,
+                        "rev-list",
+                        "--count",
+                        f"{previous}..{commit}",
+                    ]
+                )
+            except CoordinatorRuntimeError as error:
+                raise CoordinatorRuntimeError(
+                    reason="integration_order_not_ready",
+                    retryable=True,
+                ) from error
+            if merge_base != previous or commit_count != "1":
+                raise CoordinatorRuntimeError(
+                    reason="integration_order_not_ready",
+                    retryable=True,
+                )
+            previous = commit
 
     @classmethod
     def _validate_delivery_request(cls, request: DeliveryRuntimeRequest) -> None:
@@ -3000,6 +3156,49 @@ class CoordinatorRuntime:
         if lane.completion_contract != "one-local-commit-integrated-and-validated":
             raise ValueError("Delivery completion contract is not supported")
         if (
+            isinstance(lane.integration_order, bool)
+            or not isinstance(lane.integration_order, int)
+            or isinstance(lane.integration_total, bool)
+            or not isinstance(lane.integration_total, int)
+            or lane.integration_order < 1
+            or lane.integration_total < lane.integration_order
+            or lane.integration_total > 1000
+            or len(lane.integration_predecessor_ticket_urls)
+            != lane.integration_order - 1
+            or len(set(lane.integration_predecessor_ticket_urls))
+            != len(lane.integration_predecessor_ticket_urls)
+            or lane.ticket_url in lane.integration_predecessor_ticket_urls
+        ):
+            raise ValueError("Delivery integration order is invalid")
+        if any(
+            re.fullmatch(
+                re.escape(repository_issue_prefix) + r"[1-9][0-9]*",
+                predecessor_url,
+            )
+            is None
+            for predecessor_url in lane.integration_predecessor_ticket_urls
+        ):
+            raise ValueError("Delivery integration predecessor is invalid")
+        if (
+            not isinstance(request.integration_predecessor_commits, tuple)
+            or len(request.integration_predecessor_commits)
+            > len(lane.integration_predecessor_ticket_urls)
+            or any(
+                not isinstance(commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+                for commit in request.integration_predecessor_commits
+            )
+            or (
+                request.integration_expected_head is not None
+                and (
+                    not isinstance(request.integration_expected_head, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", request.integration_expected_head)
+                    is None
+                )
+            )
+        ):
+            raise ValueError("Delivery integration frontier is invalid")
+        if (
             lane.owner_skill_name != "implement"
             or lane.owner_invocation_label != "$implement"
         ):
@@ -3026,12 +3225,10 @@ class CoordinatorRuntime:
             ) from error
         if not re.search(r"(?m)^name:\s*[\"']?implement[\"']?\s*$", owner_text):
             raise ValueError("Delivery lane owner frontmatter does not match implement")
-        if lane.worker_kind != "codex":
-            raise CommissioningPrerequisiteError(
-                reason="supported_worker_routing_missing",
-                failed_checks=("delivery.worker.codex",),
-            )
-        if lane.worker_kind not in request.context.supported_worker_kinds:
+        if (
+            request.registry is None
+            and lane.worker_kind not in request.context.supported_worker_kinds
+        ):
             raise CommissioningPrerequisiteError(
                 reason="supported_worker_integration_missing",
                 failed_checks=(f"herdr.integration.{lane.worker_kind}",),
@@ -3553,6 +3750,26 @@ class CoordinatorRuntime:
         if result.timed_out:
             raise CoordinatorRuntimeError(reason="command_timeout", retryable=True)
         if result.returncode != 0:
+            try:
+                failure = json.loads(result.stdout)
+            except (TypeError, ValueError):
+                failure = None
+            error = failure.get("error") if isinstance(failure, Mapping) else None
+            code = error.get("code") if isinstance(error, Mapping) else None
+            transient_reasons = {
+                "capacity_saturated": "provider_capacity_saturated",
+                "provider_capacity_saturated": "provider_capacity_saturated",
+                "provider_rate_limited": "provider_rate_limited",
+            }
+            if (
+                isinstance(error, Mapping)
+                and code in transient_reasons
+                and error.get("retryable") is True
+            ):
+                raise CoordinatorRuntimeError(
+                    reason=transient_reasons[str(code)],
+                    retryable=True,
+                )
             raise CoordinatorRuntimeError(reason="command_failed", retryable=True)
         try:
             payload = json.loads(result.stdout)

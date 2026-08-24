@@ -606,6 +606,7 @@ def test_delivery_lane_registry_marker_round_trips_the_public_contract():
         head_commit=None,
         integrated_commit=None,
         updated_at="2026-08-24T00:00:00Z",
+        dispatch_id="delivery-dispatch:" + "d" * 32,
     )
 
     body = GitHubTrackerAdapter._delivery_lane_registry_body(registry)

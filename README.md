@@ -24,7 +24,8 @@ Skill 与 `map-governance-pm` toolset。PM request 只能使用持久 assignment
 PM contract 固定 `dispatch_runtime: herdr`。显式 commission 会在 plugin-owned Herdr
 session 中创建或恢复该 Map 唯一的 workspace 与 root Hermes PM。`delivery-pipeline`
 准备一张 ticket 的 Map Integration / Execution Worktree 与 durable lane registry 后，PM 通过
-bounded `map_governance_pm_dispatch` bridge 派发一个 configured Codex worker；下一次
+bounded `map_governance_pm_dispatch` bridge 按 authoritative ticket attributes、repository
+policy、integration readiness 与 configured default 派发一个 Codex 或 Claude worker；下一次
 coordinator turn 使用 byte-identical lane payload 收集一个本地 commit、幂等 cherry-pick、运行
 declared focused validation，并写入 blocker 或 acceptance recommendation。启动 worker 前会把
 Herdr 坐标写入 implementation ticket 的 `wayfinder-lane-registry:v1` created checkpoint 并 readback；
@@ -67,6 +68,8 @@ desired-state 文件，内容包含：
 - plugin Skills `map-governance:ceo`、`map-governance:pm`，以及既有外部 owner
   Skills `delivery-pipeline`、`implement` 的绝对 `SKILL.md` 路径；
 - `codex`、`claude` 或 `mixed` routing policy；
+- routing default、missing-integration 的 `blocked` / `fallback` 行为，以及每个 repository 的
+  attribute-to-worker policy；
 - 已选择的 GitHub Project identity、repository coordinate 与本地 repository path；
 - `local_git` worker authority 和独立的 publisher provider reference；
 - Herdr executable 名称或绝对路径。
@@ -223,7 +226,8 @@ worktree、lane 或 worker log。
 
 一个 delivery turn 只接受 `delivery-pipeline/herdr-implementation-v1` 的单 lane contract：
 implementation ticket、resolved `implement` owner、Map Integration Worktree、独立 Execution
-Worktree、Base commit、configured Codex worker kind、固定 validation argv 与
+Worktree、Base commit、policy-selected Codex/Claude worker kind、显式 integration
+order/total/predecessors、固定 validation argv 与
 `one-local-commit-integrated-and-validated` completion contract。dispatch readback 后 PM 立即 idle；
 terminal evidence 唤醒的后续 turn 才 collect。collect 前会比较 byte-stable dispatch identity，拒绝
 payload drift；ticket 必须有 implementation label、精确 Spec `Parent` 回链，且 `Blocked by` 依赖均已
@@ -237,14 +241,18 @@ Base 到 HEAD 只允许这一张 lane patch，validation 后再次验证 HEAD
 未改变且 clean；
 任何重叠写入或 check side effect 都 fail closed。成功只把 sanitized outcome-level evidence、
 limitations 与 acceptance recommendation 写到 Map；board 不呈现 ticket、pane、worktree、commit 或
-check command。缺少 plugin-supported Codex Herdr route 时，在任何 lane mutation 前写入
-明确 whole-Map blocker。worker blocker 的原始安全摘要只持久化到 ticket registry，Map PM blocker report
+check command。缺少所选 worker integration 时，在任何 lane mutation 前按配置 fallback 或写入
+明确 whole-Map blocker；capacity saturation 与 provider rate limit 只作为 adapter 后的 retryable
+outcome 保留同一 created lane。worker blocker 的原始安全摘要只持久化到 ticket registry，Map PM blocker report
 始终使用不含 lane detail 的高管摘要；只在 Map 经治理流程回到 delivery 后才允许向同一 worker
 发送有界 resume prompt。resume 必须重新核对同一 registry、
 Herdr pane occupants 与 Git ownership，并在 `blocked -> running` 时清除旧 blocker receipt。
-当前证明的 execution worker 仅为 Codex CLI，registry 使用 delivery-pipeline canonical
-`bootstrap_authority: none`；Claude-only routing 会明确要求改选 Codex/mixed 并验证 Codex integration，
-不会宣称已执行 Claude workspace-trust/import bootstrap。
+Codex 与 Claude 都使用 delivery-pipeline canonical `bootstrap_authority: none`；Claude lane
+固定使用 `dangerously-skip-permissions` agent mode。Routing policy 只约束 future dispatch，active
+registry 始终沿原 worker kind 恢复，不会 migrate、restart 或 terminate。升级前没有
+`dispatch_id` 的 active registry 继续使用其原始 #14 packet identity；新 order 字段不会使既有
+worker 漂移。晚于前序集成才 dispatch 的 sibling 会从 tracker-confirmed contiguous predecessor
+commit frontier 启动，Execution Worktree 仍保持共同 Base，最终 integration chain 逐 commit 验证。
 
 Commissioning 使用稳定、冲突安全的 plugin lifecycle namespace。任何同名但缺少本地
 ownership proof 的 Herdr session 或 workspace 都会返回 `repair_required`，不会 attach、删除
@@ -406,6 +414,23 @@ node --check dashboard/dist/index.js
 
 测试会从一次性本地 Git repo 执行真实的安装、native/dashboard 发现、页面打开和
 卸载流程，不读取开发机现有 Hermes profile。
+
+真实 Herdr mixed-worker smoke 不属于默认门禁，也不会被 pytest 发现。它必须由 operator
+显式 opt-in，并要求一个已经发现 `map-governance:pm`、`delivery-pipeline`、`herdr` 的隔离
+PM profile，以及绝对的 `implement/SKILL.md` 路径：
+
+```bash
+PYTHONPATH=. python tests/real_herdr_mixed_smoke.py \
+  --confirm-isolated-real-herdr \
+  --pm-profile ISOLATED_PM_PROFILE \
+  --implement-skill /absolute/path/to/implement/SKILL.md
+```
+
+脚本只创建一次性本地 Git repository/worktrees 与随机 plugin lifecycle 所派生的唯一 Herdr
+session；清理前会重新验证该 session 的 plugin ownership，不会 attach、stop 或 delete 其他
+session/workspace。输出 JSON 记录 worker kind、lane/pane identity、completion commit evidence、
+latency、retry count、deterministic integration order、duplicate-lane count 和 cleanup readback。
+模型输出具有非确定性，因此该 smoke 只提供人工/周期性证据，不能成为普通 PR 的单次硬门禁。
 
 
 ## License

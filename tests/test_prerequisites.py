@@ -18,8 +18,6 @@ from map_governance.prerequisites import (
     SetupApplyError,
     YamlConfigRepository,
 )
-from map_governance.coordinator import CommissioningPrerequisiteError
-
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 8, 24, 1, 30, tzinfo=timezone.utc)
@@ -102,7 +100,11 @@ def _desired(
                 {"id": "implement", "path": str(implement_skill)},
             ],
         },
-        "routing": {"policy": routing_policy},
+        "routing": {
+            "policy": routing_policy,
+            "default_worker": ("claude" if routing_policy == "claude" else "codex"),
+            "unavailable_worker": "blocked",
+        },
         "github": {
             "hostname": "github.com",
             "projects": [
@@ -121,6 +123,14 @@ def _desired(
                     "path": str(repository),
                     "worker_write_required": True,
                     "publication_required": publication_required,
+                    "routing": {
+                        "attribute_workers": {
+                            "backend": "codex",
+                            "design": "claude",
+                            "frontend": "claude",
+                            "general-code": "codex",
+                        }
+                    },
                 }
             ],
         },
@@ -218,7 +228,9 @@ def test_commissioning_context_consumes_selected_doctor_confirmed_coordinates(
     )
 
 
-def test_claude_only_routing_has_no_supported_issue_14_worker(tmp_path, monkeypatch):
+def test_claude_only_routing_exposes_the_configured_claude_worker(
+    tmp_path, monkeypatch
+):
     repository = tmp_path / "repository"
     repository.mkdir()
     skills = tmp_path / "skills"
@@ -246,10 +258,13 @@ def test_claude_only_routing_has_no_supported_issue_14_worker(tmp_path, monkeypa
     )
 
     assert context.routing_policy == "claude"
-    assert context.supported_worker_kinds == ()
+    assert context.supported_worker_kinds == ("claude",)
 
 
-def test_commissioning_context_rejects_failed_doctor_evidence(tmp_path, monkeypatch):
+def test_mixed_commissioning_context_carries_repository_routes_and_readiness(
+    tmp_path,
+    monkeypatch,
+):
     repository = tmp_path / "repository"
     repository.mkdir()
     skills = tmp_path / "skills"
@@ -257,6 +272,67 @@ def test_commissioning_context_rejects_failed_doctor_evidence(tmp_path, monkeypa
         delivery_skill=_skill(skills, "delivery-pipeline"),
         implement_skill=_skill(skills, "implement"),
         repository=repository,
+        routing_policy="mixed",
+    )
+    desired["routing"].update(
+        default_worker="codex",
+        unavailable_worker="fallback",
+    )
+    desired["github"]["repositories"][0]["routing"] = {
+        "attribute_workers": {
+            "frontend": "claude",
+            "design": "claude",
+            "backend": "codex",
+            "general-code": "codex",
+        }
+    }
+    application = PrerequisiteApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data",
+        config_repository=ReadConfig({"prerequisites": desired}),
+        profile_resolver=lambda profile: tmp_path / "profiles" / profile,
+    )
+    monkeypatch.setattr(
+        application,
+        "doctor",
+        lambda: {
+            "status": "fail",
+            "checks": [
+                {"id": "herdr.integration.codex", "status": "pass"},
+                {"id": "herdr.integration.claude", "status": "fail"},
+            ],
+        },
+    )
+
+    context = application.commissioning_context(
+        project_id="PVT_acme_7",
+        repository="acme/atlas",
+    )
+
+    assert context.routing_policy == "mixed"
+    assert context.routing_default_worker == "codex"
+    assert context.routing_unavailable_behavior == "fallback"
+    assert context.routing_attribute_workers == (
+        ("backend", "codex"),
+        ("design", "claude"),
+        ("frontend", "claude"),
+        ("general-code", "codex"),
+    )
+    assert context.supported_worker_kinds == ("codex",)
+
+
+def test_commissioning_context_preserves_missing_worker_readiness_for_dispatch(
+    tmp_path,
+    monkeypatch,
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    skills = tmp_path / "skills"
+    desired = _desired(
+        delivery_skill=_skill(skills, "delivery-pipeline"),
+        implement_skill=_skill(skills, "implement"),
+        repository=repository,
+        routing_policy="codex",
     )
     application = PrerequisiteApplication(
         plugin_root=PLUGIN_ROOT,
@@ -276,14 +352,13 @@ def test_commissioning_context_rejects_failed_doctor_evidence(tmp_path, monkeypa
         },
     )
 
-    with pytest.raises(CommissioningPrerequisiteError) as raised:
-        application.commissioning_context(
-            project_id="PVT_acme_7",
-            repository="acme/atlas",
-        )
+    context = application.commissioning_context(
+        project_id="PVT_acme_7",
+        repository="acme/atlas",
+    )
 
-    assert raised.value.reason == "supported_worker_integration_missing"
-    assert raised.value.failed_checks == ("herdr.integration.codex",)
+    assert context.supported_worker_kinds == ()
+    assert context.routing_unavailable_behavior == "blocked"
 
 
 def test_mixed_context_ignores_claude_failure_when_codex_is_ready(
@@ -659,8 +734,10 @@ def test_plugin_owned_config_serializes_competing_setup_writers(isolated, monkey
     )
     first_desired = copy.deepcopy(isolated["desired"])
     first_desired["routing"]["policy"] = "codex"
+    first_desired["routing"]["default_worker"] = "codex"
     second_desired = copy.deepcopy(isolated["desired"])
     second_desired["routing"]["policy"] = "claude"
+    second_desired["routing"]["default_worker"] = "claude"
     first_plan = first.setup_plan(desired=first_desired)
     second_plan = second.setup_plan(desired=second_desired)
     entered_commit = threading.Event()
@@ -1085,6 +1162,7 @@ def test_doctor_classifies_required_herdr_integrations_by_routing_policy(
 ):
     desired = isolated["desired"]
     desired["routing"]["policy"] = routing
+    desired["routing"]["default_worker"] = "claude" if routing == "claude" else "codex"
     application = _application(isolated)
     plan = application.setup_plan(desired=desired)
     application.setup_apply(plan=plan, selected_action_ids=["config.prerequisites"])

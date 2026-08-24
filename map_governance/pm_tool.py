@@ -134,6 +134,12 @@ PM_DISPATCH_TOOL_SCHEMA = {
                         "properties": {
                             "worktree": {"type": "string", "minLength": 1},
                             "branch": {"type": "string", "minLength": 1},
+                            "order": {"type": "integer", "minimum": 1},
+                            "total": {"type": "integer", "minimum": 1},
+                            "predecessor_ticket_urls": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1},
+                            },
                         },
                         "required": ["worktree", "branch"],
                         "additionalProperties": False,
@@ -166,7 +172,7 @@ PM_DISPATCH_TOOL_SCHEMA = {
                     },
                     "worker_kind": {
                         "type": "string",
-                        "enum": ["codex"],
+                        "enum": ["codex", "claude"],
                     },
                     "validation": {
                         "type": "object",
@@ -231,9 +237,23 @@ def _delivery_lane(raw: Any) -> DeliveryLaneSpec:
     owner = object_field("owner")
     validation = object_field("validation")
     validation_argv = validation.get("argv")
+    predecessor_ticket_urls = integration.get("predecessor_ticket_urls", [])
     limitations = raw.get("known_limitations", [])
-    if not isinstance(validation_argv, list) or not isinstance(limitations, list):
+    if (
+        not isinstance(validation_argv, list)
+        or not isinstance(limitations, list)
+        or not isinstance(predecessor_ticket_urls, list)
+    ):
         raise ValueError("lane validation and limitations must be arrays")
+    integration_order = integration.get("order", 1)
+    integration_total = integration.get("total", 1)
+    if (
+        isinstance(integration_order, bool)
+        or not isinstance(integration_order, int)
+        or isinstance(integration_total, bool)
+        or not isinstance(integration_total, int)
+    ):
+        raise ValueError("lane integration order and total must be integers")
     return DeliveryLaneSpec(
         protocol=string_field(raw.get("protocol"), "lane.protocol"),
         lane_id=string_field(raw.get("lane_id"), "lane.lane_id"),
@@ -267,6 +287,9 @@ def _delivery_lane(raw: Any) -> DeliveryLaneSpec:
             raw.get("completion_contract"), "lane.completion_contract"
         ),
         known_limitations=tuple(limitations),
+        integration_order=integration_order,
+        integration_total=integration_total,
+        integration_predecessor_ticket_urls=tuple(predecessor_ticket_urls),
     )
 
 

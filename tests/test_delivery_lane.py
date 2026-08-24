@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+import os
 import subprocess
+import threading
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +22,7 @@ from map_governance.coordinator import (
     DeliveryLaneRegistry,
     DeliveryLaneSpec,
     DeliveryRuntimeRequest,
+    delivery_confirmed_dispatch_id,
     delivery_dispatch_id,
     delivery_worker_prompt,
 )
@@ -36,6 +40,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 MAP_ID = "I_atlas_41"
 ISSUE_URL = "https://github.com/acme/atlas/issues/41"
 TICKET_URL = "https://github.com/acme/atlas/issues/42"
+SECOND_TICKET_URL = "https://github.com/acme/atlas/issues/43"
 SPEC_URL = "https://github.com/acme/atlas/issues/40"
 PROJECT_URL = "https://github.com/orgs/acme/projects/7"
 PM_IDENTITY = GovernanceRequestIdentity("pm", "pm-session-atlas")
@@ -101,6 +106,8 @@ class DeliveryTracker:
             ),
         )
         self.registries: list[TrackerDeliveryLaneRegistryRecord] = []
+        self.extra_tickets: dict[str, TrackerIssue] = {}
+        self.extra_registries: dict[str, list[TrackerDeliveryLaneRegistryRecord]] = {}
         self.dependencies: dict[str, TrackerIssue] = {}
         self.spec = TrackerIssue(
             id="I_atlas_40",
@@ -131,6 +138,8 @@ class DeliveryTracker:
             return self.spec
         if url in self.dependencies:
             return self.dependencies[url]
+        if url in self.extra_tickets:
+            return self.extra_tickets[url]
         assert url == TICKET_URL
         return self.ticket
 
@@ -158,18 +167,24 @@ class DeliveryTracker:
         return record
 
     def list_delivery_lane_registries(self, url: str):
-        assert url == TICKET_URL
-        return list(self.registries)
+        if url == TICKET_URL:
+            return list(self.registries)
+        assert url in self.extra_tickets
+        return list(self.extra_registries.setdefault(url, []))
 
     def append_delivery_lane_registry(self, url: str, *, issue_id: str, registry):
-        assert url == TICKET_URL
-        assert issue_id == self.ticket.id
+        if url == TICKET_URL:
+            records = self.registries
+            assert issue_id == self.ticket.id
+        else:
+            assert issue_id == self.extra_tickets[url].id
+            records = self.extra_registries.setdefault(url, [])
         record = TrackerDeliveryLaneRegistryRecord(
             registry=registry,
-            tracker_record_id=f"IC_registry_{len(self.registries) + 1}",
-            tracker_record_url=f"{TICKET_URL}#issuecomment-registry-{len(self.registries) + 1}",
+            tracker_record_id=f"IC_registry_{len(records) + 1}",
+            tracker_record_url=f"{url}#issuecomment-registry-{len(records) + 1}",
         )
-        self.registries.append(record)
+        records.append(record)
         return record
 
     def transition_issue_stage(
@@ -209,6 +224,8 @@ def _registry_for_request(
     integrated_commit: str | None = None,
 ) -> DeliveryLaneRegistry:
     terminal = state in {"terminal", "integrated"}
+    ticket_number = int(request.lane.ticket_url.rsplit("/", 1)[-1])
+    pane_id = f"wA:p{ticket_number - 40}"
     return DeliveryLaneRegistry(
         work_item=request.lane.ticket_url,
         role="implementation",
@@ -217,17 +234,22 @@ def _registry_for_request(
         state=state,
         workspace_id="wA",
         tab_id="wA:t1",
-        pane_id="wA:p2",
+        pane_id=pane_id,
         herdr_session_name="mapgov-test",
         herdr_session_owned=True,
         bootstrap_authority="none",
-        agent_permission_mode="default",
+        agent_permission_mode=(
+            "dangerously-skip-permissions"
+            if request.lane.worker_kind == "claude"
+            else "default"
+        ),
         worktree=request.lane.execution_worktree,
         branch=request.lane.execution_branch,
         base_commit=request.lane.base_commit,
         head_commit=head_commit,
         integrated_commit=integrated_commit,
         updated_at=request.registry_timestamp,
+        dispatch_id=delivery_dispatch_id(request),
         evidence_source="herdr-final-report" if terminal else None,
         final_report_digest="sha256:" + "d" * 64 if terminal else None,
     )
@@ -236,6 +258,7 @@ def _registry_for_request(
 class DeliveryRuntimeProbe:
     def __init__(self, *, recovered: bool = False) -> None:
         self.requests: list[DeliveryRuntimeRequest] = []
+        self.integration_heads: list[str | None] = []
         self.recovered = recovered
 
     def status(self, *, map_id: str):
@@ -269,6 +292,7 @@ class DeliveryRuntimeProbe:
 
     def collect_lane(self, request: DeliveryRuntimeRequest):
         self.requests.append(request)
+        self.integration_heads.append(request.integration_expected_head)
         terminal = _registry_for_request(
             request,
             state="terminal",
@@ -323,6 +347,79 @@ class DeliveryRuntimeProbe:
             "remote_actions": "forbidden",
             "idempotent": False,
         }
+
+
+class LegacyActiveRuntime(DeliveryRuntimeProbe):
+    def prepare_lane(self, request: DeliveryRuntimeRequest):
+        raise AssertionError("legacy active lane must not prepare a replacement")
+
+    def dispatch_lane(self, request: DeliveryRuntimeRequest):
+        self.requests.append(request)
+        assert request.registry is not None
+        assert request.registry.dispatch_id is None
+        return {
+            "map_id": request.map_id,
+            "state": "dispatched",
+            "dispatch_id": delivery_confirmed_dispatch_id(request),
+            "worker_kind": request.lane.worker_kind,
+            "completion_contract": request.lane.completion_contract,
+            "registry": request.registry.payload(),
+            "remote_actions": "forbidden",
+            "idempotent": True,
+        }
+
+
+class CrossProcessDeliveryRuntime(DeliveryRuntimeProbe):
+    def __init__(self, *, messages, entered, release, hold: bool) -> None:
+        super().__init__()
+        self.messages = messages
+        self.entered = entered
+        self.release = release
+        self.hold = hold
+
+    def prepare_lane(self, request: DeliveryRuntimeRequest):
+        self.messages.put(("prepare", os.getpid()))
+        if self.hold:
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+        return super().prepare_lane(request)
+
+
+def _cross_process_dispatch(
+    *,
+    storage_root: str,
+    tracker: DeliveryTracker,
+    lane: DeliveryLaneSpec,
+    context: CommissioningContext,
+    messages,
+    entered,
+    release,
+    hold: bool,
+) -> None:
+    runtime = CrossProcessDeliveryRuntime(
+        messages=messages,
+        entered=entered,
+        release=release,
+        hold=hold,
+    )
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=Path(storage_root),
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 24, tzinfo=timezone.utc),
+        commissioning_prerequisites=StaticDeliveryPrerequisites(context),
+        coordinator_runtime=runtime,
+    )
+    try:
+        result = application.dispatch_pm_delivery_lane(
+            request_identity=PM_IDENTITY,
+            lane=lane,
+        )
+    except CoordinatorRuntimeError as error:
+        messages.put(("error", error.reason, error.retryable))
+    else:
+        messages.put(("success", result["state"]))
 
 
 class MissingWorkerRuntime(DeliveryRuntimeProbe):
@@ -527,15 +624,14 @@ def _delivery_application(tmp_path, *, runtime, prerequisites=None):
         skills=("map-governance:pm", "delivery-pipeline", "herdr"),
         supported_worker_kinds=("codex",),
     )
+    resolved_prerequisites = prerequisites or StaticDeliveryPrerequisites(context)
     application = MapGovernanceApplication(
         plugin_root=PLUGIN_ROOT,
         storage_root=tmp_path / "plugin-data",
         tracker=tracker,
         profile_name="pm",
         clock=lambda: datetime(2026, 8, 24, tzinfo=timezone.utc),
-        commissioning_prerequisites=(
-            prerequisites or StaticDeliveryPrerequisites(context)
-        ),
+        commissioning_prerequisites=resolved_prerequisites,
         coordinator_runtime=runtime,
     )
     project = application.configure_project(project_url=PROJECT_URL)
@@ -546,6 +642,909 @@ def _delivery_application(tmp_path, *, runtime, prerequisites=None):
         coordinator_id="coordinator-atlas",
     )
     return application, tracker, _lane(tmp_path)
+
+
+def _mixed_delivery_application(
+    tmp_path,
+    *,
+    runtime,
+    supported_worker_kinds=("codex", "claude"),
+    unavailable_behavior="blocked",
+):
+    tracker = DeliveryTracker()
+    context = CommissioningContext(
+        project_id="PVT_acme_7",
+        project_url=PROJECT_URL,
+        repository="acme/atlas",
+        repository_path=str(tmp_path),
+        pm_profile="pm",
+        routing_policy="mixed",
+        herdr_executable="herdr-test",
+        skills=("map-governance:pm", "delivery-pipeline", "herdr"),
+        supported_worker_kinds=supported_worker_kinds,
+        routing_default_worker="codex",
+        routing_attribute_workers=(
+            ("frontend", "claude"),
+            ("design", "claude"),
+            ("backend", "codex"),
+            ("general-code", "codex"),
+        ),
+        routing_unavailable_behavior=unavailable_behavior,
+    )
+    prerequisites = StaticDeliveryPrerequisites(context)
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data",
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 24, tzinfo=timezone.utc),
+        commissioning_prerequisites=prerequisites,
+        coordinator_runtime=runtime,
+    )
+    project = application.configure_project(project_url=PROJECT_URL)
+    application.bind_map(project_id=project["id"], issue_url=ISSUE_URL)
+    application.assign_pm(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+    )
+    return application, tracker, _lane(tmp_path), prerequisites
+
+
+def test_mixed_policy_routes_authoritative_frontend_ticket_to_claude(tmp_path):
+    runtime = DeliveryRuntimeProbe()
+    application, tracker, lane, _prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        labels=("implementation", "frontend"),
+    )
+    claude_lane = replace(
+        lane,
+        worker_kind="claude",
+        execution_branch="claude/issue-42",
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="mixed-frontend-dispatch-42",
+    )
+
+    result = application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=claude_lane,
+    )
+
+    assert result["worker_kind"] == "claude"
+    assert result["routing"] == {
+        "worker_kind": "claude",
+        "source": "repository_attribute_policy",
+        "ticket_attributes": ["frontend"],
+        "integration_ready": True,
+        "fallback": False,
+    }
+    assert runtime.requests[0].lane.worker_kind == "claude"
+
+
+def test_mixed_policy_rejects_pm_worker_guess_that_conflicts_with_ticket_route(
+    tmp_path,
+):
+    runtime = DeliveryRuntimeProbe()
+    application, tracker, lane, _prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        labels=("implementation", "design"),
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="mixed-design-wrong-worker-42",
+    )
+
+    with pytest.raises(ValueError, match="worker kind conflicts with routing policy"):
+        application.dispatch_pm_delivery_lane(
+            request_identity=PM_IDENTITY,
+            lane=lane,
+        )
+
+    assert runtime.requests == []
+    assert tracker.registries == []
+
+
+def test_missing_selected_integration_uses_configured_fallback_before_mutation(
+    tmp_path,
+):
+    runtime = DeliveryRuntimeProbe()
+    application, tracker, lane, _prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+        supported_worker_kinds=("codex",),
+        unavailable_behavior="fallback",
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        labels=("implementation", "frontend"),
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="mixed-frontend-fallback-42",
+    )
+
+    result = application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=lane,
+    )
+
+    assert result["routing"] == {
+        "worker_kind": "codex",
+        "source": "integration_readiness_fallback",
+        "ticket_attributes": ["frontend"],
+        "integration_ready": True,
+        "fallback": True,
+    }
+    assert runtime.requests[0].lane.worker_kind == "codex"
+    assert [record.registry.runtime for record in tracker.registries] == [
+        "herdr-codex-pane",
+        "herdr-codex-pane",
+    ]
+
+
+def test_missing_selected_integration_reports_configured_blocked_route(tmp_path):
+    runtime = DeliveryRuntimeProbe()
+    application, tracker, lane, _prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+        supported_worker_kinds=("codex",),
+        unavailable_behavior="blocked",
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        labels=("implementation", "design"),
+    )
+    claude_lane = replace(
+        lane,
+        worker_kind="claude",
+        execution_branch="claude/issue-42",
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="mixed-design-blocked-42",
+    )
+
+    result = application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=claude_lane,
+    )
+
+    assert result["state"] == "blocked"
+    assert result["blocker"]["failed_checks"] == ["herdr.integration.claude"]
+    assert tracker.registries == []
+    assert runtime.requests == []
+    assert tracker.reports[-1].report.content.summary == (
+        "Delivery is blocked because the selected Claude Herdr integration is "
+        "not ready."
+    )
+    assert tracker.reports[-1].report.content.continuation_requirement == (
+        "Restore the Claude integration or change the configured future-dispatch "
+        "fallback policy."
+    )
+
+
+def test_ticket_route_outside_repository_policy_reports_explicit_blocker(tmp_path):
+    runtime = DeliveryRuntimeProbe()
+    application, tracker, lane, prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        labels=("implementation", "frontend"),
+    )
+    prerequisites.context = replace(
+        prerequisites.context,
+        routing_policy="codex",
+        routing_default_worker="codex",
+    )
+    claude_lane = replace(
+        lane,
+        worker_kind="claude",
+        execution_branch="claude/issue-42",
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="codex-policy-frontend-blocked-42",
+    )
+
+    result = application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=claude_lane,
+    )
+
+    assert result["state"] == "blocked"
+    assert result["blocker"]["failed_checks"] == ["routing.worker.claude"]
+    assert tracker.registries == []
+    assert runtime.requests == []
+    assert tracker.reports[-1].report.content.summary == (
+        "Delivery is blocked because the selected Claude worker conflicts with the "
+        "configured routing policy."
+    )
+    assert tracker.reports[-1].report.content.continuation_requirement == (
+        "Align the future-dispatch ticket/repository route with the configured routing "
+        "policy."
+    )
+
+
+def test_policy_change_keeps_an_active_lane_on_its_original_worker(tmp_path):
+    runtime = DeliveryRuntimeProbe()
+    application, tracker, lane, prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        labels=("implementation", "frontend"),
+    )
+    claude_lane = replace(
+        lane,
+        worker_kind="claude",
+        execution_branch="claude/issue-42",
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="mixed-before-policy-change-42",
+    )
+    application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=claude_lane,
+    )
+    prerequisites.context = replace(
+        prerequisites.context,
+        routing_policy="codex",
+        routing_default_worker="codex",
+        supported_worker_kinds=("codex",),
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="mixed-after-policy-change-42",
+    )
+
+    resumed = application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=claude_lane,
+    )
+
+    assert resumed["worker_kind"] == "claude"
+    assert resumed["routing"] == {
+        "worker_kind": "claude",
+        "source": "active_lane_registry",
+        "ticket_attributes": [],
+        "integration_ready": False,
+        "fallback": False,
+    }
+    assert runtime.requests[-1].registry is not None
+    assert runtime.requests[-1].registry.runtime == "herdr-claude-pane"
+
+
+def test_pre_issue_17_active_registry_resumes_with_its_original_packet_identity(
+    tmp_path,
+):
+    runtime = LegacyActiveRuntime()
+    application, tracker, lane = _delivery_application(tmp_path, runtime=runtime)
+    context = CommissioningContext(
+        project_id="PVT_acme_7",
+        project_url=PROJECT_URL,
+        repository="acme/atlas",
+        repository_path=str(tmp_path),
+        pm_profile="pm",
+        routing_policy="codex",
+        herdr_executable="herdr-test",
+        skills=("map-governance:pm", "delivery-pipeline", "herdr"),
+        supported_worker_kinds=("codex",),
+    )
+    bare_request = DeliveryRuntimeRequest(
+        map_id=MAP_ID,
+        map_url=ISSUE_URL,
+        context=context,
+        lane=lane,
+        registry_timestamp="2026-08-24T00:00:00Z",
+    )
+    legacy_registry = replace(
+        _registry_for_request(bare_request, state="running"),
+        dispatch_id=None,
+    )
+    tracker.append_delivery_lane_registry(
+        TICKET_URL,
+        issue_id=tracker.ticket.id,
+        registry=replace(legacy_registry, state="created"),
+    )
+    tracker.append_delivery_lane_registry(
+        TICKET_URL,
+        issue_id=tracker.ticket.id,
+        registry=legacy_registry,
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="resume-pre-issue-17-lane-42",
+    )
+
+    result = application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=lane,
+    )
+
+    resumed_request = runtime.requests[-1]
+    assert result["state"] == "dispatched"
+    assert result["registry"]["state"] == "running"
+    assert "dispatch_id" not in result["registry"]
+    assert delivery_confirmed_dispatch_id(resumed_request) != delivery_dispatch_id(
+        resumed_request
+    )
+    assert delivery_worker_prompt(resumed_request, legacy_registry)["integration"] == {
+        "worktree": lane.integration_worktree,
+        "branch": lane.integration_branch,
+        "base_commit": lane.base_commit,
+    }
+
+
+def test_concurrent_dispatch_race_starts_exactly_one_active_lane(tmp_path):
+    class SlowPrepareRuntime(DeliveryRuntimeProbe):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.prepare_count = 0
+
+        def prepare_lane(self, request):
+            self.prepare_count += 1
+            if self.prepare_count == 1:
+                self.entered.set()
+                assert self.release.wait(timeout=2)
+            return super().prepare_lane(request)
+
+    runtime = SlowPrepareRuntime()
+    application, tracker, lane = _delivery_application(tmp_path, runtime=runtime)
+    context = CommissioningContext(
+        project_id="PVT_acme_7",
+        project_url=PROJECT_URL,
+        repository="acme/atlas",
+        repository_path=str(tmp_path),
+        pm_profile="pm",
+        routing_policy="codex",
+        herdr_executable="herdr-test",
+        skills=("map-governance:pm", "delivery-pipeline", "herdr"),
+        supported_worker_kinds=("codex",),
+    )
+    competing_process = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data",
+        tracker=tracker,
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 24, tzinfo=timezone.utc),
+        commissioning_prerequisites=StaticDeliveryPrerequisites(context),
+        coordinator_runtime=runtime,
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="concurrent-dispatch-42",
+    )
+    outcomes = []
+
+    def dispatch(candidate):
+        try:
+            outcomes.append(
+                candidate.dispatch_pm_delivery_lane(
+                    request_identity=PM_IDENTITY,
+                    lane=lane,
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - the assertion inspects the boundary
+            outcomes.append(error)
+
+    first = threading.Thread(target=dispatch, args=(application,))
+    second = threading.Thread(target=dispatch, args=(competing_process,))
+    first.start()
+    assert runtime.entered.wait(timeout=2)
+    second.start()
+    runtime.release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert runtime.prepare_count == 1
+    assert sum(isinstance(outcome, dict) for outcome in outcomes) == 1
+    conflict = next(
+        outcome for outcome in outcomes if isinstance(outcome, CoordinatorRuntimeError)
+    )
+    assert conflict.as_dict() == {
+        "type": "coordinator_runtime_error",
+        "reason": "delivery_lane_ownership_conflict",
+        "retryable": True,
+        "repair_required": False,
+        "resource_disposition": "retained_verified_owned_runtime_for_retry",
+    }
+    assert [record.registry.state for record in tracker.registries] == [
+        "created",
+        "running",
+    ]
+
+
+def test_cross_process_dispatch_race_has_one_prepare_and_stable_loser_evidence(
+    tmp_path,
+):
+    application, tracker, lane = _delivery_application(
+        tmp_path,
+        runtime=DeliveryRuntimeProbe(),
+    )
+    context = CommissioningContext(
+        project_id="PVT_acme_7",
+        project_url=PROJECT_URL,
+        repository="acme/atlas",
+        repository_path=str(tmp_path),
+        pm_profile="pm",
+        routing_policy="codex",
+        herdr_executable="herdr-test",
+        skills=("map-governance:pm", "delivery-pipeline", "herdr"),
+        supported_worker_kinds=("codex",),
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="cross-process-dispatch-42",
+    )
+    process_context = multiprocessing.get_context("fork")
+    messages = process_context.Queue()
+    entered = process_context.Event()
+    release = process_context.Event()
+    arguments = {
+        "storage_root": str(tmp_path / "plugin-data"),
+        "tracker": tracker,
+        "lane": lane,
+        "context": context,
+        "messages": messages,
+        "entered": entered,
+        "release": release,
+    }
+    first = process_context.Process(
+        target=_cross_process_dispatch,
+        kwargs={**arguments, "hold": True},
+    )
+    second = process_context.Process(
+        target=_cross_process_dispatch,
+        kwargs={**arguments, "hold": False},
+    )
+    first.start()
+    assert entered.wait(timeout=5)
+    second.start()
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    evidence = [messages.get(timeout=3) for _ in range(3)]
+    assert sum(item[0] == "prepare" for item in evidence) == 1
+    assert ("success", "dispatched") in evidence
+    assert ("error", "delivery_lane_ownership_conflict", True) in evidence
+
+
+def test_deterministic_mixed_worker_e2e_integrates_siblings_in_declared_order(
+    tmp_path,
+):
+    runtime = DeliveryRuntimeProbe()
+    application, tracker, base_lane, _prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        title="Build the frontend delivery surface",
+        labels=("implementation", "frontend"),
+        body=(
+            f"## Parent\n\n{SPEC_URL}\n\n"
+            "## Blocked by\n\nNone - can start immediately\n\n"
+            "## Integration order\n\n1\n\n"
+            "## Integration total\n\n2\n\n"
+            "## Integration after\n\nNone\n"
+        ),
+    )
+    tracker.extra_tickets[SECOND_TICKET_URL] = TrackerIssue(
+        id="I_atlas_43",
+        repository="acme/atlas",
+        number=43,
+        title="Build the backend delivery surface",
+        url=SECOND_TICKET_URL,
+        state="open",
+        state_reason=None,
+        labels=("implementation", "backend"),
+        body=(
+            f"## Parent\n\n{SPEC_URL}\n\n"
+            "## Blocked by\n\nNone - can start immediately\n\n"
+            "## Integration order\n\n2\n\n"
+            "## Integration total\n\n2\n\n"
+            f"## Integration after\n\n{TICKET_URL}\n"
+        ),
+    )
+    frontend_lane = replace(
+        base_lane,
+        ticket_title=tracker.ticket.title,
+        worker_kind="claude",
+        execution_branch="claude/issue-42",
+        integration_order=1,
+        integration_total=2,
+    )
+    backend_execution = tmp_path / "atlas-map-1-issue-43"
+    backend_execution.mkdir()
+    backend_lane = replace(
+        base_lane,
+        lane_id="implementation-43",
+        ticket_id="I_atlas_43",
+        ticket_title=tracker.extra_tickets[SECOND_TICKET_URL].title,
+        ticket_url=SECOND_TICKET_URL,
+        execution_worktree=str(backend_execution),
+        execution_branch="codex/issue-43",
+        integration_order=2,
+        integration_total=2,
+        integration_predecessor_ticket_urls=(TICKET_URL,),
+    )
+
+    for turn_id, lane in (
+        ("mixed-dispatch-frontend-42", frontend_lane),
+        ("mixed-dispatch-backend-43", backend_lane),
+    ):
+        application.begin_pm_turn(
+            map_id=MAP_ID,
+            request_identity=PM_IDENTITY,
+            coordinator_id="coordinator-atlas",
+            turn_id=turn_id,
+        )
+        dispatched = application.dispatch_pm_delivery_lane(
+            request_identity=PM_IDENTITY,
+            lane=lane,
+        )
+        assert dispatched["state"] == "dispatched"
+
+    assert tracker.registries[-1].registry.runtime == "herdr-claude-pane"
+    assert tracker.extra_registries[SECOND_TICKET_URL][-1].registry.runtime == (
+        "herdr-codex-pane"
+    )
+    assert tracker.registries[-1].registry.pane_id != (
+        tracker.extra_registries[SECOND_TICKET_URL][-1].registry.pane_id
+    )
+
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="mixed-collect-out-of-order-43",
+    )
+    with pytest.raises(CoordinatorRuntimeError) as out_of_order:
+        application.collect_pm_delivery_lane(
+            request_identity=PM_IDENTITY,
+            lane=backend_lane,
+        )
+    assert out_of_order.value.reason == "integration_order_not_ready"
+    assert out_of_order.value.retryable is True
+
+    first = application.collect_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=frontend_lane,
+    )
+    assert first["report"]["type"] == "checkpoint"
+    assert tracker.issue.labels == ("map", "map-stage/delivery")
+
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="mixed-collect-backend-43",
+    )
+    second = application.collect_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=backend_lane,
+    )
+
+    assert second["report"]["type"] == "acceptance"
+    assert runtime.integration_heads == [base_lane.base_commit, "c" * 40]
+    assert tracker.issue.labels == ("map", "map-stage/acceptance")
+    board_text = json.dumps(application.board(), sort_keys=True)
+    for forbidden in (
+        frontend_lane.lane_id,
+        backend_lane.lane_id,
+        frontend_lane.execution_worktree,
+        backend_lane.execution_worktree,
+    ):
+        assert forbidden not in board_text
+
+
+def test_ordered_sibling_can_dispatch_after_its_predecessor_is_integrated(tmp_path):
+    runtime = DeliveryRuntimeProbe()
+    application, tracker, base_lane, prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        labels=("implementation", "frontend"),
+        body=(
+            f"## Parent\n\n{SPEC_URL}\n\n"
+            "## Blocked by\n\nNone - can start immediately\n\n"
+            "## Integration order\n\n1\n\n"
+            "## Integration total\n\n2\n\n"
+            "## Integration after\n\nNone\n"
+        ),
+    )
+    tracker.extra_tickets[SECOND_TICKET_URL] = TrackerIssue(
+        id="I_atlas_43",
+        repository="acme/atlas",
+        number=43,
+        title="Build the backend after the frontend integration",
+        url=SECOND_TICKET_URL,
+        state="open",
+        state_reason=None,
+        labels=("implementation", "backend"),
+        body=(
+            f"## Parent\n\n{SPEC_URL}\n\n"
+            "## Blocked by\n\nNone - can start immediately\n\n"
+            "## Integration order\n\n2\n\n"
+            "## Integration total\n\n2\n\n"
+            f"## Integration after\n\n{TICKET_URL}\n"
+        ),
+    )
+    first_lane = replace(
+        base_lane,
+        worker_kind="claude",
+        execution_branch="claude/issue-42",
+        integration_order=1,
+        integration_total=2,
+    )
+    second_execution = tmp_path / "atlas-map-1-issue-43"
+    second_execution.mkdir()
+    second_lane = replace(
+        base_lane,
+        lane_id="implementation-43",
+        ticket_id="I_atlas_43",
+        ticket_title=tracker.extra_tickets[SECOND_TICKET_URL].title,
+        ticket_url=SECOND_TICKET_URL,
+        execution_worktree=str(second_execution),
+        execution_branch="codex/issue-43",
+        integration_order=2,
+        integration_total=2,
+        integration_predecessor_ticket_urls=(TICKET_URL,),
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="late-dispatch-first-42",
+    )
+    application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=first_lane,
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="late-collect-first-42",
+    )
+    application.collect_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=first_lane,
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="late-dispatch-second-43",
+    )
+
+    result = application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=second_lane,
+    )
+
+    assert result["state"] == "dispatched"
+    assert runtime.requests[-2].integration_expected_head == "c" * 40
+    assert runtime.requests[-2].integration_predecessor_commits == ("c" * 40,)
+    assert prerequisites.context.routing_policy == "mixed"
+
+
+def test_sibling_dispatch_reports_retryable_stale_frontier_when_integration_advances(
+    tmp_path,
+):
+    class FrontierAdvanceRuntime(DeliveryRuntimeProbe):
+        frontier_pending = True
+
+        def dispatch_lane(self, request: DeliveryRuntimeRequest):
+            if not self.frontier_pending:
+                return super().dispatch_lane(request)
+            self.requests.append(request)
+            self.frontier_pending = False
+            raise CoordinatorRuntimeError(
+                reason="integration_frontier_pending",
+                retryable=True,
+            )
+
+    runtime = FrontierAdvanceRuntime()
+    application, tracker, base_lane, prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        body=(
+            f"## Parent\n\n{SPEC_URL}\n\n"
+            "## Blocked by\n\nNone - can start immediately\n\n"
+            "## Integration order\n\n1\n\n"
+            "## Integration total\n\n2\n\n"
+            "## Integration after\n\nNone\n"
+        ),
+    )
+    tracker.extra_tickets[SECOND_TICKET_URL] = TrackerIssue(
+        id="I_atlas_43",
+        repository="acme/atlas",
+        number=43,
+        title="Build the backend after the frontend integration",
+        url=SECOND_TICKET_URL,
+        state="open",
+        state_reason=None,
+        labels=("implementation", "backend"),
+        body=(
+            f"## Parent\n\n{SPEC_URL}\n\n"
+            "## Blocked by\n\nNone - can start immediately\n\n"
+            "## Integration order\n\n2\n\n"
+            "## Integration total\n\n2\n\n"
+            f"## Integration after\n\n{TICKET_URL}\n"
+        ),
+    )
+    predecessor_request = DeliveryRuntimeRequest(
+        map_id=MAP_ID,
+        map_url=ISSUE_URL,
+        context=prerequisites.context,
+        lane=replace(base_lane, integration_order=1, integration_total=2),
+    )
+    second_execution = tmp_path / "atlas-map-1-issue-43"
+    second_execution.mkdir()
+    second_lane = replace(
+        base_lane,
+        lane_id="implementation-43",
+        ticket_id="I_atlas_43",
+        ticket_title=tracker.extra_tickets[SECOND_TICKET_URL].title,
+        ticket_url=SECOND_TICKET_URL,
+        execution_worktree=str(second_execution),
+        execution_branch="codex/issue-43",
+        integration_order=2,
+        integration_total=2,
+        integration_predecessor_ticket_urls=(TICKET_URL,),
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="stale-frontier-dispatch-43",
+    )
+
+    with pytest.raises(CoordinatorRuntimeError) as raised:
+        application.dispatch_pm_delivery_lane(
+            request_identity=PM_IDENTITY,
+            lane=second_lane,
+        )
+
+    assert raised.value.as_dict() == {
+        "type": "coordinator_runtime_error",
+        "reason": "integration_frontier_pending",
+        "retryable": True,
+        "repair_required": False,
+        "resource_disposition": "retained_verified_owned_runtime_for_retry",
+    }
+    assert [
+        record.registry.state for record in tracker.extra_registries[SECOND_TICKET_URL]
+    ] == ["created"]
+    created_dispatch_id = tracker.extra_registries[SECOND_TICKET_URL][
+        0
+    ].registry.dispatch_id
+    assert tracker.registries == []
+    tracker.registries.append(
+        TrackerDeliveryLaneRegistryRecord(
+            registry=_registry_for_request(
+                predecessor_request,
+                state="integrated",
+                head_commit="b" * 40,
+                integrated_commit="c" * 40,
+            ),
+            tracker_record_id="IC_frontier_advanced",
+            tracker_record_url=f"{TICKET_URL}#issuecomment-frontier-advanced",
+        )
+    )
+
+    recovered = application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=second_lane,
+    )
+
+    assert recovered["state"] == "dispatched"
+    assert recovered["dispatch_id"] == created_dispatch_id
+    assert recovered["registry"]["dispatch_id"] == created_dispatch_id
+    assert [
+        record.registry.state for record in tracker.extra_registries[SECOND_TICKET_URL]
+    ] == ["created", "running"]
+
+
+def test_integration_frontier_rejects_an_unrelated_predecessor_ticket(tmp_path):
+    runtime = DeliveryRuntimeProbe()
+    application, tracker, base_lane, prerequisites = _mixed_delivery_application(
+        tmp_path,
+        runtime=runtime,
+    )
+    tracker.ticket = replace(
+        tracker.ticket,
+        body=(
+            "## Parent\n\nhttps://github.com/acme/atlas/issues/38\n\n"
+            "## Blocked by\n\nNone - can start immediately\n\n"
+            "## Integration order\n\n1\n\n"
+            "## Integration total\n\n2\n\n"
+            "## Integration after\n\nNone\n"
+        ),
+    )
+    predecessor_request = DeliveryRuntimeRequest(
+        map_id=MAP_ID,
+        map_url=ISSUE_URL,
+        context=prerequisites.context,
+        lane=replace(base_lane, integration_order=1, integration_total=2),
+    )
+    tracker.registries.append(
+        TrackerDeliveryLaneRegistryRecord(
+            registry=_registry_for_request(
+                predecessor_request,
+                state="integrated",
+                head_commit="b" * 40,
+                integrated_commit="c" * 40,
+            ),
+            tracker_record_id="IC_unrelated_integrated",
+            tracker_record_url=f"{TICKET_URL}#issuecomment-unrelated",
+        )
+    )
+    ordered_lane = replace(
+        base_lane,
+        lane_id="implementation-43",
+        ticket_id="I_atlas_43",
+        ticket_url=SECOND_TICKET_URL,
+        execution_branch="codex/issue-43",
+        integration_order=2,
+        integration_total=2,
+        integration_predecessor_ticket_urls=(TICKET_URL,),
+    )
+
+    with pytest.raises(ValueError, match="does not match tracker authority"):
+        application._delivery_integration_frontier(
+            project_id="PVT_acme_7",
+            lane=ordered_lane,
+            repository="acme/atlas",
+            require_all=True,
+        )
 
 
 def test_public_dispatch_seam_hands_off_one_declared_lane_then_leaves_pm_idle(
@@ -1002,11 +2001,11 @@ def test_missing_supported_worker_records_a_clear_whole_map_blocker(tmp_path):
         {"type": "whole_map_blocker", "count": 1}
     ]
     assert card["delivery_summary"]["latest"]["summary"] == (
-        "Delivery is blocked because no plugin-supported Codex Herdr route is "
-        "configured and verified."
+        "Delivery is blocked because the selected Codex Herdr integration is not ready."
     )
     assert card["delivery_summary"]["latest"]["continuation_requirement"] == (
-        "Select Codex or mixed routing and verify the Codex Herdr integration."
+        "Restore the Codex integration or change the configured future-dispatch "
+        "fallback policy."
     )
 
 
@@ -1988,6 +2987,111 @@ def _delivery_git_lane(tmp_path: Path):
     return context, lane
 
 
+@pytest.mark.parametrize(
+    ("runtime_code", "expected_reason"),
+    [
+        ("capacity_saturated", "provider_capacity_saturated"),
+        ("provider_rate_limited", "provider_rate_limited"),
+    ],
+)
+def test_transient_provider_admission_preserves_lane_identity_and_recovers(
+    tmp_path,
+    runtime_code,
+    expected_reason,
+):
+    class TransientAdmissionRunner(HerdrDispatchRunner):
+        def __init__(self, **arguments):
+            super().__init__(**arguments)
+            self.transient_failure = True
+
+        def run(self, arguments, *, timeout):
+            command = tuple(arguments)[3:]
+            if self.transient_failure and command[:2] == ("agent", "start"):
+                self.transient_failure = False
+                self.calls.append(tuple(arguments))
+                return CoordinatorCommandResult(
+                    75,
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": runtime_code,
+                                "retryable": True,
+                            }
+                        }
+                    ),
+                )
+            return super().run(arguments, timeout=timeout)
+
+    context, lane = _delivery_git_lane(tmp_path)
+    storage = PluginStorage(tmp_path / "plugin-data")
+    lifecycle = storage.coordinator_lifecycle(created_at="2026-08-24T00:00:00Z")
+    namespace = CoordinatorRuntime.session_namespace(lifecycle)
+    label = CoordinatorRuntime.workspace_label(lifecycle, MAP_ID)
+    root_agent = CoordinatorRuntime.agent_name(lifecycle, MAP_ID)
+    storage.reserve_pm_runtime(
+        map_id=MAP_ID,
+        session_namespace=namespace,
+        workspace_label=label,
+        agent_id=root_agent,
+        ownership_marker=CoordinatorRuntime.ownership_marker(lifecycle, MAP_ID),
+        lifecycle_id=lifecycle,
+        context=context,
+        updated_at="2026-08-24T00:00:00Z",
+        session_ownership_marker=CoordinatorRuntime.session_ownership_marker(lifecycle),
+    )
+    storage.update_pm_runtime(
+        map_id=MAP_ID,
+        state="active",
+        workspace_id="wA",
+        window_id="wA:t1",
+        pane_id="wA:p1",
+        agent_session_id="pm-session-atlas",
+        ready_record_id="ready-1",
+        updated_at="2026-08-24T00:00:01Z",
+    )
+    runner = TransientAdmissionRunner(
+        namespace=namespace,
+        workspace_label=label,
+        root_agent_name=root_agent,
+        repository_path=context.repository_path,
+        execution_path=lane.execution_worktree,
+    )
+    runtime = CoordinatorRuntime(
+        storage=storage,
+        runner=runner,
+        clock=lambda: "2026-08-24T00:00:02Z",
+    )
+    request = DeliveryRuntimeRequest(
+        map_id=MAP_ID,
+        map_url=ISSUE_URL,
+        context=context,
+        lane=lane,
+        registry_timestamp="2026-08-24T00:00:02Z",
+    )
+    prepared = runtime.prepare_lane(request)
+    created_registry = DeliveryLaneRegistry.from_payload(prepared["registry"])
+    request = replace(
+        request,
+        context=replace(
+            context,
+            routing_policy="mixed",
+            routing_default_worker="claude",
+        ),
+        registry=created_registry,
+    )
+
+    with pytest.raises(CoordinatorRuntimeError) as raised:
+        runtime.dispatch_lane(request)
+
+    assert raised.value.reason == expected_reason
+    assert raised.value.retryable is True
+    assert runner.worker_started is False
+    recovered = runtime.dispatch_lane(request)
+    assert recovered["state"] == "dispatched"
+    assert recovered["registry"]["lane_id"] == created_registry.lane_id
+    assert recovered["registry"]["pane_id"] == created_registry.pane_id
+
+
 def test_delivery_git_paths_must_belong_to_the_configured_map_repository(tmp_path):
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -2008,6 +3112,135 @@ def test_delivery_git_paths_must_belong_to_the_configured_map_repository(tmp_pat
 
     with pytest.raises(CoordinatorRuntimeError, match="worktree_repository_mismatch"):
         CoordinatorRuntime._validate_delivery_git(request, collecting=False)
+
+
+def test_late_ordered_dispatch_accepts_the_integrated_predecessor_head(tmp_path):
+    context, lane = _delivery_git_lane(tmp_path)
+    integration = Path(lane.integration_worktree)
+    (integration / "predecessor.txt").write_text("integrated first\n", encoding="utf-8")
+    _git("add", "predecessor.txt", cwd=integration)
+    _git("commit", "-m", "integrate predecessor", cwd=integration)
+    predecessor_commit = _git("rev-parse", "HEAD", cwd=integration)
+    ordered_lane = replace(
+        lane,
+        integration_order=2,
+        integration_total=2,
+        integration_predecessor_ticket_urls=(
+            "https://github.com/acme/atlas/issues/39",
+        ),
+    )
+    request = DeliveryRuntimeRequest(
+        map_id=MAP_ID,
+        map_url=ISSUE_URL,
+        context=context,
+        lane=ordered_lane,
+        integration_expected_head=predecessor_commit,
+        integration_predecessor_commits=(predecessor_commit,),
+    )
+
+    CoordinatorRuntime._validate_delivery_git(request, collecting=False)
+
+
+def test_unconfirmed_linear_integration_frontier_is_retryable(tmp_path):
+    context, lane = _delivery_git_lane(tmp_path)
+    request = DeliveryRuntimeRequest(
+        map_id=MAP_ID,
+        map_url=ISSUE_URL,
+        context=context,
+        lane=replace(
+            lane,
+            integration_order=2,
+            integration_total=2,
+            integration_predecessor_ticket_urls=(
+                "https://github.com/acme/atlas/issues/39",
+            ),
+        ),
+        integration_expected_head=lane.base_commit,
+        integration_predecessor_commits=(),
+    )
+    integration = Path(lane.integration_worktree)
+    (integration / "pending-predecessor.txt").write_text(
+        "integrated before tracker confirmation\n",
+        encoding="utf-8",
+    )
+    _git("add", "pending-predecessor.txt", cwd=integration)
+    _git("commit", "-m", "pending predecessor", cwd=integration)
+
+    with pytest.raises(CoordinatorRuntimeError) as raised:
+        CoordinatorRuntime._validate_delivery_git(request, collecting=False)
+
+    assert raised.value.reason == "integration_frontier_pending"
+    assert raised.value.retryable is True
+    assert raised.value.repair_required is False
+
+
+def test_integration_frontier_rejects_non_linear_predecessor_commits(tmp_path):
+    context, lane = _delivery_git_lane(tmp_path)
+    integration = Path(lane.integration_worktree)
+    (integration / "first.txt").write_text("first\n", encoding="utf-8")
+    _git("add", "first.txt", cwd=integration)
+    _git("commit", "-m", "first predecessor", cwd=integration)
+    first_commit = _git("rev-parse", "HEAD", cwd=integration)
+    source = Path(context.repository_path)
+    (source / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    _git("add", "unrelated.txt", cwd=source)
+    _git("commit", "-m", "unrelated predecessor", cwd=source)
+    unrelated_commit = _git("rev-parse", "HEAD", cwd=source)
+    request = DeliveryRuntimeRequest(
+        map_id=MAP_ID,
+        map_url=ISSUE_URL,
+        context=context,
+        lane=replace(
+            lane,
+            integration_order=3,
+            integration_total=3,
+            integration_predecessor_ticket_urls=(
+                "https://github.com/acme/atlas/issues/38",
+                "https://github.com/acme/atlas/issues/39",
+            ),
+        ),
+        integration_expected_head=unrelated_commit,
+        integration_predecessor_commits=(first_commit, unrelated_commit),
+    )
+
+    with pytest.raises(CoordinatorRuntimeError) as raised:
+        CoordinatorRuntime._validate_integration_frontier(request)
+
+    assert raised.value.reason == "integration_order_not_ready"
+    assert raised.value.retryable is True
+
+
+def test_integration_frontier_rejects_unregistered_linear_commits(tmp_path):
+    context, lane = _delivery_git_lane(tmp_path)
+    integration = Path(lane.integration_worktree)
+    commits = []
+    for filename in ("first.txt", "unregistered.txt", "second.txt"):
+        (integration / filename).write_text(f"{filename}\n", encoding="utf-8")
+        _git("add", filename, cwd=integration)
+        _git("commit", "-m", filename, cwd=integration)
+        commits.append(_git("rev-parse", "HEAD", cwd=integration))
+    request = DeliveryRuntimeRequest(
+        map_id=MAP_ID,
+        map_url=ISSUE_URL,
+        context=context,
+        lane=replace(
+            lane,
+            integration_order=3,
+            integration_total=3,
+            integration_predecessor_ticket_urls=(
+                "https://github.com/acme/atlas/issues/38",
+                "https://github.com/acme/atlas/issues/39",
+            ),
+        ),
+        integration_expected_head=commits[-1],
+        integration_predecessor_commits=(commits[0], commits[-1]),
+    )
+
+    with pytest.raises(CoordinatorRuntimeError) as raised:
+        CoordinatorRuntime._validate_integration_frontier(request)
+
+    assert raised.value.reason == "integration_order_not_ready"
+    assert raised.value.retryable is True
 
 
 def test_delivery_lane_rejects_owner_and_worktree_symlink_aliases(tmp_path):
@@ -2061,7 +3294,7 @@ def test_delivery_validation_rejects_mutating_or_untrusted_argv(
         CoordinatorRuntime._validate_delivery_request(request)
 
 
-def test_claude_lane_reports_the_unimplemented_bootstrap_prerequisite(tmp_path):
+def test_claude_lane_uses_the_same_bounded_delivery_contract(tmp_path):
     context, lane = _delivery_git_lane(tmp_path)
     request = DeliveryRuntimeRequest(
         map_id=MAP_ID,
@@ -2074,11 +3307,7 @@ def test_claude_lane_reports_the_unimplemented_bootstrap_prerequisite(tmp_path):
         ),
     )
 
-    with pytest.raises(CommissioningPrerequisiteError) as raised:
-        CoordinatorRuntime._validate_delivery_request(request)
-
-    assert raised.value.reason == "supported_worker_routing_missing"
-    assert raised.value.failed_checks == ("delivery.worker.codex",)
+    CoordinatorRuntime._validate_delivery_request(request)
 
 
 def test_augmented_worker_prompt_retains_sensitive_material_guard(tmp_path):
@@ -2474,6 +3703,99 @@ def test_runtime_dispatches_one_codex_worker_with_fixed_argv_and_full_contract(
                 registry=DeliveryLaneRegistry.from_payload(resumed["registry"]),
             )
         )
+
+
+def test_runtime_created_lane_retries_until_integration_tracker_confirmation(tmp_path):
+    context, raw_lane = _delivery_git_lane(tmp_path)
+    lane = replace(
+        raw_lane,
+        integration_order=2,
+        integration_total=2,
+        integration_predecessor_ticket_urls=(
+            "https://github.com/acme/atlas/issues/39",
+        ),
+    )
+    storage = PluginStorage(tmp_path / "plugin-runtime")
+    lifecycle = storage.coordinator_lifecycle(created_at="2026-08-24T00:00:00Z")
+    namespace = CoordinatorRuntime.session_namespace(lifecycle)
+    label = CoordinatorRuntime.workspace_label(lifecycle, MAP_ID)
+    root_agent = CoordinatorRuntime.agent_name(lifecycle, MAP_ID)
+    storage.reserve_pm_runtime(
+        map_id=MAP_ID,
+        session_namespace=namespace,
+        workspace_label=label,
+        agent_id=root_agent,
+        ownership_marker=CoordinatorRuntime.ownership_marker(lifecycle, MAP_ID),
+        lifecycle_id=lifecycle,
+        context=context,
+        updated_at="2026-08-24T00:00:00Z",
+        session_ownership_marker=CoordinatorRuntime.session_ownership_marker(lifecycle),
+    )
+    storage.update_pm_runtime(
+        map_id=MAP_ID,
+        state="active",
+        workspace_id="wA",
+        window_id="wA:t1",
+        pane_id="wA:p1",
+        agent_session_id="pm-session-atlas",
+        ready_record_id="ready-1",
+        updated_at="2026-08-24T00:00:01Z",
+    )
+    runner = HerdrDispatchRunner(
+        namespace=namespace,
+        workspace_label=label,
+        root_agent_name=root_agent,
+        repository_path=context.repository_path,
+        execution_path=lane.execution_worktree,
+    )
+    runtime = CoordinatorRuntime(
+        storage=storage,
+        runner=runner,
+        clock=lambda: "2026-08-24T00:00:02Z",
+    )
+    request = DeliveryRuntimeRequest(
+        map_id=MAP_ID,
+        map_url=ISSUE_URL,
+        context=context,
+        lane=lane,
+        integration_expected_head=lane.base_commit,
+        integration_predecessor_commits=(),
+    )
+    prepared = runtime.prepare_lane(request)
+    created_registry = DeliveryLaneRegistry.from_payload(prepared["registry"])
+    integration = Path(lane.integration_worktree)
+    (integration / "pending-predecessor.txt").write_text(
+        "integrated before tracker confirmation\n",
+        encoding="utf-8",
+    )
+    _git("add", "pending-predecessor.txt", cwd=integration)
+    _git("commit", "-m", "pending predecessor", cwd=integration)
+    integrated_commit = _git("rev-parse", "HEAD", cwd=integration)
+
+    with pytest.raises(CoordinatorRuntimeError) as raised:
+        runtime.dispatch_lane(replace(request, registry=created_registry))
+
+    assert raised.value.as_dict() == {
+        "type": "coordinator_runtime_error",
+        "reason": "integration_frontier_pending",
+        "retryable": True,
+        "repair_required": False,
+        "resource_disposition": "retained_verified_owned_runtime_for_retry",
+    }
+    assert runner.worker_started is False
+
+    confirmed_request = replace(
+        request,
+        registry=created_registry,
+        integration_expected_head=integrated_commit,
+        integration_predecessor_commits=(integrated_commit,),
+    )
+    recovered = runtime.dispatch_lane(confirmed_request)
+
+    assert recovered["state"] == "dispatched"
+    assert recovered["dispatch_id"] == prepared["dispatch_id"]
+    assert recovered["registry"]["pane_id"] == created_registry.pane_id
+    assert runner.worker_started is True
 
 
 def test_runtime_collects_one_durable_commit_integrates_and_validates_idempotently(

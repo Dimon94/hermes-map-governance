@@ -21,7 +21,9 @@
     ]
   },
   "routing": {
-    "policy": "mixed"
+    "policy": "mixed",
+    "default_worker": "codex",
+    "unavailable_worker": "blocked"
   },
   "github": {
     "hostname": "github.com",
@@ -40,7 +42,15 @@
         "coordinate": "OWNER/REPOSITORY",
         "path": "/absolute/path/to/repository",
         "worker_write_required": true,
-        "publication_required": false
+        "publication_required": false,
+        "routing": {
+          "attribute_workers": {
+            "backend": "codex",
+            "design": "claude",
+            "frontend": "claude",
+            "general-code": "codex"
+          }
+        }
       }
     ]
   },

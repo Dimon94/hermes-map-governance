@@ -250,9 +250,6 @@ class PrerequisiteApplication:
             )
         report = self.doctor()
         policy = str(desired["routing"]["policy"])
-        delivery_worker_integrations = (
-            ("codex",) if policy in {"codex", "mixed"} else ()
-        )
         required_check_ids = {
             "configuration",
             "profiles.separation",
@@ -274,7 +271,6 @@ class PrerequisiteApplication:
             f"repository.{selected_repository['coordinate']}.governance",
             f"repository.{selected_repository['coordinate']}.worker",
             "herdr.binary",
-            *(f"herdr.integration.{name}" for name in delivery_worker_integrations),
         }
         failed = tuple(
             str(check["id"])
@@ -283,17 +279,8 @@ class PrerequisiteApplication:
             and str(check.get("id")) in required_check_ids
         )
         if failed:
-            missing_worker = any(
-                check_id == f"herdr.integration.{name}"
-                for name in delivery_worker_integrations
-                for check_id in failed
-            )
             raise CommissioningPrerequisiteError(
-                reason=(
-                    "supported_worker_integration_missing"
-                    if missing_worker
-                    else "doctor_failed"
-                ),
+                reason="doctor_failed",
                 failed_checks=failed,
             )
         repository_path = Path(str(selected_repository["path"]))
@@ -305,11 +292,26 @@ class PrerequisiteApplication:
         implement_skill = next(
             item for item in desired["skills"]["external"] if item["id"] == "implement"
         )
-        supported_worker_kinds = {
+        integration_checks = {
+            str(check.get("id")): str(check.get("status"))
+            for check in report["checks"]
+            if str(check.get("id"))
+            in {"herdr.integration.codex", "herdr.integration.claude"}
+        }
+        allowed_workers = {
             "codex": ("codex",),
-            "claude": (),
-            "mixed": ("codex",),
+            "claude": ("claude",),
+            "mixed": ("codex", "claude"),
         }[policy]
+        supported_worker_kinds = tuple(
+            worker
+            for worker in ("codex", "claude")
+            if integration_checks.get(f"herdr.integration.{worker}") == "pass"
+            or (
+                f"herdr.integration.{worker}" not in integration_checks
+                and worker in allowed_workers
+            )
+        )
         return CommissioningContext(
             project_id=project_id,
             project_url=str(project["url"]),
@@ -327,6 +329,19 @@ class PrerequisiteApplication:
             ),
             supported_worker_kinds=supported_worker_kinds,
             implement_skill_path=str(Path(str(implement_skill["path"])).resolve()),
+            routing_default_worker=str(desired["routing"]["default_worker"]),
+            routing_attribute_workers=tuple(
+                sorted(
+                    (
+                        str(attribute),
+                        str(worker),
+                    )
+                    for attribute, worker in selected_repository["routing"][
+                        "attribute_workers"
+                    ].items()
+                )
+            ),
+            routing_unavailable_behavior=str(desired["routing"]["unavailable_worker"]),
         )
 
     def doctor(self) -> dict[str, Any]:
