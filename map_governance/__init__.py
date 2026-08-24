@@ -15,6 +15,7 @@ from .application import (
     StructuredDecisionConflict,
     StaleProjectionError,
     PMReportConflict,
+    PublicationRepairRequired,
     TrackerPMReportConfirmationError,
     TrackerDecisionConfirmationError,
     TrackerApprovalConfirmationError,
@@ -26,6 +27,13 @@ from .approvals import (
 )
 from .tracker import StructuredDecision
 from .reports import PMDecisionResponse, PMReport, PMReportDraft
+from .publication import (
+    AcceptanceEvidence,
+    ApprovedPublicationAction,
+    PublicationAction,
+    PublicationPartialFailure,
+    RemotePublicationEvidence,
+)
 from .coordinator import (
     CommissioningContext,
     CommissioningAuthorizationError,
@@ -43,6 +51,8 @@ from .prerequisites import (
 )
 
 __all__ = [
+    "AcceptanceEvidence",
+    "ApprovedPublicationAction",
     "ApprovalEnforcementError",
     "ApprovalPacket",
     "ApprovalRequestConflict",
@@ -70,6 +80,10 @@ __all__ = [
     "PMDecisionResponse",
     "PMReportConflict",
     "PMReportDraft",
+    "PublicationAction",
+    "PublicationPartialFailure",
+    "PublicationRepairRequired",
+    "RemotePublicationEvidence",
     "PrerequisiteApplication",
     "SetupApplyError",
     "StructuredDecision",

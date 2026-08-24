@@ -8,11 +8,12 @@ import os
 import re
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Callable, Mapping, NoReturn, cast
+from typing import Any, Callable, Iterator, Mapping, NoReturn, cast
 
 from .approvals import (
     APPROVAL_DECISIONS,
@@ -37,7 +38,10 @@ from .effects import (
     TRACKER_APPROVAL_EVENT,
     TRACKER_DECISION,
     TRACKER_PM_REPORT,
+    TRACKER_PUBLICATION_RECORD,
+    TRACKER_ISSUE_CLOSE,
     TRACKER_STAGE_TRANSITION,
+    PUBLISHER_EXECUTE,
     CoordinatorResumeBoundary,
     CoordinatorResumeEffectAdapter,
     SessionResumeBoundary,
@@ -45,6 +49,7 @@ from .effects import (
     TrackerEffectAdapter,
     TrackerEffectPayloadConflict,
     TrackerStageEffectConflict,
+    PublisherEffectAdapter,
 )
 from .outbox import (
     EffectConfirmation,
@@ -70,6 +75,15 @@ from .reports import (
     PMReportDraft,
     TrackerPMReportRecord,
 )
+from .publication import (
+    AcceptanceEvidence,
+    ApprovedPublicationAction,
+    PublicationAction,
+    PublicationHandoff,
+    PublicationRecord,
+    PublisherBoundary,
+    RemotePublicationEvidence,
+)
 from .coordinator import (
     DELIVERY_TRANSPORT_RECOVERY_LIMITATION,
     CommissioningAuthorizationError,
@@ -94,6 +108,7 @@ from .tracker import (
     TrackerDecisionRecord,
     TrackerError,
     TrackerIssue,
+    TrackerPublicationRecord,
     TrackerProject,
 )
 
@@ -158,6 +173,25 @@ class GovernanceAuthorizationError(PermissionError):
             "type": "authorization_denied",
             "action": self.action,
             "map_id": self.map_id,
+            "reason": self.reason,
+            "retryable": False,
+        }
+
+
+class PublicationRepairRequired(RuntimeError):
+    """A remote publication may have changed state and needs governed repair."""
+
+    def __init__(self, *, map_id: str, action_id: str, reason: str) -> None:
+        self.map_id = map_id
+        self.action_id = action_id
+        self.reason = reason
+        super().__init__(f"Publication repair required: {reason}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": "publication_repair_required",
+            "map_id": self.map_id,
+            "action_id": self.action_id,
             "reason": self.reason,
             "retryable": False,
         }
@@ -343,9 +377,13 @@ class MapGovernanceApplication:
         event_settings: BoardEventSettings | None = None,
         commissioning_prerequisites: CommissioningPrerequisiteResolver | None = None,
         coordinator_runtime: CoordinatorRuntimeBoundary | None = None,
+        publisher: PublisherBoundary | None = None,
+        publication_handoff: PublicationHandoff | None = None,
+        publication_authority_ref: str | None = None,
+        storage_group_id: int | None = None,
     ) -> None:
         self._plugin_root = plugin_root.resolve()
-        self._storage = PluginStorage(storage_root)
+        self._storage = PluginStorage(storage_root, shared_gid=storage_group_id)
         self._tracker = tracker or GitHubTrackerAdapter()
         self._session_runner = session_runner
         self._profile_name = profile_name
@@ -353,7 +391,7 @@ class MapGovernanceApplication:
         self._authority_policy = (
             authority_policy or AuthorityEnvelopePolicy.from_settings(None)
         )
-        self._outbox = OutboxRepository(storage_root)
+        self._outbox = OutboxRepository(storage_root, shared_gid=storage_group_id)
         self._event_settings = event_settings or BoardEventSettings()
         self._board_events = BoardEventJournal(
             self._storage.database,
@@ -365,13 +403,29 @@ class MapGovernanceApplication:
             f"map-governance:{os.getpid()}:{uuid.uuid4()}"
         )
         self._outbox_runtime: OutboxRuntime | None = None
-        tracker_effects = TrackerEffectAdapter(self._tracker)
+        tracker_effects = TrackerEffectAdapter(
+            self._tracker,
+            publication_fence=self._publication_tracker_fence,
+        )
         effect_adapters: dict[str, Any] = {
             TRACKER_STAGE_TRANSITION: tracker_effects,
             TRACKER_DECISION: tracker_effects,
             TRACKER_APPROVAL_EVENT: tracker_effects,
             TRACKER_PM_REPORT: tracker_effects,
+            TRACKER_PUBLICATION_RECORD: tracker_effects,
+            TRACKER_ISSUE_CLOSE: tracker_effects,
         }
+        self._publisher = publisher
+        self._publication_handoff = publication_handoff
+        self._publication_authority_ref = publication_authority_ref or (
+            publisher.authority_ref if publisher is not None else None
+        )
+        if publisher is not None:
+            effect_adapters[PUBLISHER_EXECUTE] = PublisherEffectAdapter(
+                publisher,
+                execution_fence=self._publisher_execution_fence,
+                before_execute=self._mark_publisher_external_call,
+            )
         missing_session_effect_methods = (
             [
                 name
@@ -1265,7 +1319,174 @@ class MapGovernanceApplication:
         except StaleProjectionError as error:
             raise EffectRetryableError(str(error)) from error
 
+    @contextmanager
+    def _publication_tracker_fence(self, intent: OutboxIntent) -> Iterator[None]:
+        """Fence publication evidence and closeout against acceptance writes."""
+        with self._storage.publication_lease(intent.map_id):
+            yield
+
+    @contextmanager
+    def _publisher_execution_fence(self, intent: OutboxIntent) -> Iterator[None]:
+        """Hold the cross-process acceptance fence through the remote call."""
+        action = ApprovedPublicationAction.from_payload(dict(intent.payload["action"]))
+        binding = self._ensure_map_writable(map_id=action.map_id)
+        expected_report_id = str(intent.payload["acceptance_report_id"])
+        with self._storage.publication_lease(action.map_id):
+            approval = self._storage.approval(
+                str(intent.payload["approval_request_id"])
+            )
+            expires_at = approval.get("expires_at") if approval is not None else None
+            approval_active = (
+                approval is not None
+                and approval["status"] == "consumed"
+                and approval.get("consumed_by_mutation_id") == action.action_id
+                and self._publisher is not None
+                and intent.payload.get("publisher_authority_ref")
+                == self._publisher.authority_ref
+                and isinstance(expires_at, str)
+                and self._current_datetime()
+                < datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            )
+            issue = self._tracker_read(
+                project_id=str(binding["project_id"]),
+                operation=lambda: self._tracker.get_issue(binding["issue_url"]),
+            )
+            reports = self._tracker_read(
+                project_id=str(binding["project_id"]),
+                operation=lambda: self._tracker.list_pm_reports(binding["issue_url"]),
+            )
+            acceptance_reports = [
+                item
+                for item in reports
+                if item.report.content.report_type == "acceptance"
+                and item.report.content.acceptance is not None
+            ]
+            latest = acceptance_reports[-1] if acceptance_reports else None
+            acceptance = (
+                latest.report.content.acceptance if latest is not None else None
+            )
+            requested = (
+                acceptance.requested_publication_action
+                if acceptance is not None
+                else None
+            )
+            if (
+                not approval_active
+                or issue.id != action.map_id
+                or self._executive_stage(issue) != "acceptance"
+                or latest is None
+                or latest.report.content.record_id != expected_report_id
+                or acceptance is None
+                or acceptance.revision != action.revision
+                or requested is None
+                or requested.action != action.action
+                or normalized_json(requested.target) != normalized_json(action.target)
+            ):
+                raise EffectTerminalError(
+                    "Approved publication became stale before privileged execution"
+                )
+            yield
+
+    def _mark_publisher_external_call(self, intent: OutboxIntent) -> None:
+        """Persist the uncertainty boundary after final preflight, before mutation."""
+        action = ApprovedPublicationAction.from_payload(dict(intent.payload["action"]))
+        binding = self._ensure_map_writable(map_id=action.map_id)
+        issue = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.get_issue(str(binding["issue_url"])),
+        )
+        reports = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.list_pm_reports(str(binding["issue_url"])),
+        )
+        acceptance_reports = [
+            item
+            for item in reports
+            if item.report.content.report_type == "acceptance"
+            and item.report.content.acceptance is not None
+        ]
+        latest = acceptance_reports[-1] if acceptance_reports else None
+        acceptance = latest.report.content.acceptance if latest is not None else None
+        requested = (
+            acceptance.requested_publication_action if acceptance is not None else None
+        )
+        attempted_at = self._synchronized_at()
+        attempted_datetime = datetime.fromisoformat(attempted_at.replace("Z", "+00:00"))
+        approval = self._storage.approval(str(intent.payload["approval_request_id"]))
+        expires_at = approval.get("expires_at") if approval is not None else None
+        decided_at = approval.get("decided_at") if approval is not None else None
+        authorization_active = (
+            approval is not None
+            and approval["status"] == "consumed"
+            and approval.get("consumed_by_mutation_id") == action.action_id
+            and self._publisher is not None
+            and intent.payload.get("publisher_authority_ref")
+            == self._publisher.authority_ref
+            and isinstance(decided_at, str)
+            and isinstance(expires_at, str)
+            and datetime.fromisoformat(decided_at.replace("Z", "+00:00"))
+            <= attempted_datetime
+            < datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        )
+        if (
+            not authorization_active
+            or issue.id != action.map_id
+            or self._executive_stage(issue) != "acceptance"
+            or latest is None
+            or latest.report.content.record_id
+            != str(intent.payload["acceptance_report_id"])
+            or acceptance is None
+            or acceptance.revision != action.revision
+            or requested is None
+            or requested.action != action.action
+            or normalized_json(requested.target) != normalized_json(action.target)
+        ):
+            raise EffectTerminalError(
+                "Approved publication became stale before remote-call marker"
+            )
+        self._outbox.mark_external_call_started(
+            effect_id=intent.effect_id,
+            owner_id=self._outbox_owner_id,
+            now=attempted_at,
+        )
+
     def _external_effect_failed(self, intent: OutboxIntent, error: Exception) -> None:
+        if intent.effect_type == PUBLISHER_EXECUTE:
+            attempted_at = self._outbox.external_call_started_at(intent.effect_id)
+            if attempted_at is None:
+                return
+            action = ApprovedPublicationAction.from_payload(
+                dict(intent.payload["action"])
+            )
+            record = PublicationRecord(
+                record_id=f"publication:{action.action_id}:repair-required",
+                action_id=action.action_id,
+                map_id=action.map_id,
+                approval_request_id=str(intent.payload["approval_request_id"]),
+                status="repair_required",
+                revision=action.revision,
+                action=action.action,
+                target=action.target,
+                occurred_at=attempted_at,
+                reason=self._publication_incident_reason(str(error)),
+            )
+            try:
+                self._outbox.enqueue(
+                    effect_id=f"tracker-publication:{action.action_id}:repair-required",
+                    effect_type=TRACKER_PUBLICATION_RECORD,
+                    map_id=intent.map_id,
+                    payload={
+                        "issue_url": intent.payload["issue_url"],
+                        "issue_id": intent.map_id,
+                        "project_id": intent.payload["project_id"],
+                        "record": record.payload(),
+                        "acceptance_report_id": intent.payload["acceptance_report_id"],
+                    },
+                    created_at=self._synchronized_at(),
+                )
+            except OutboxConflictError:
+                pass
+            return
         if not intent.effect_type.startswith("tracker."):
             return
         if getattr(error, "retryable", True) is False:
@@ -1345,16 +1566,749 @@ class MapGovernanceApplication:
                 card["recent_decisions"] = self._storage.recent_decisions(map_id=map_id)
                 card["approvals"] = self._approval_collection(map_id=map_id)
                 card["pm_reports"] = self._storage.recent_pm_reports(map_id=map_id)
+                acceptance_report = next(
+                    (
+                        report
+                        for report in card["pm_reports"]
+                        if report["type"] == "acceptance"
+                        and isinstance(report.get("acceptance"), dict)
+                    ),
+                    None,
+                )
+                changes_requested = next(
+                    (
+                        approval
+                        for approval in card["approvals"]["items"]
+                        if approval["proposed_action"] == "publish_map"
+                        and approval["status"] in {"rejected", "revision"}
+                        and acceptance_report is not None
+                        and approval["decision_payload"].get("acceptance_report_id")
+                        == acceptance_report["record_id"]
+                    ),
+                    None,
+                )
+                if changes_requested is not None:
+                    card["acceptance_outcome"] = {
+                        "state": "changes_requested",
+                        "request_id": changes_requested["request_id"],
+                        "decision": changes_requested["status"],
+                        "requested_changes": changes_requested["decision"]["note"],
+                    }
                 card["decision_acknowledgments"] = (
                     self._storage.pm_decision_acknowledgments(map_id=map_id)
                 )
                 card["external_effects"] = self._outbox.map_summary(map_id)
+                card["publication"] = self._storage.publication_summary(map_id=map_id)
+                if acceptance_report is not None:
+                    acceptance = dict(acceptance_report["acceptance"])
+                    card["acceptance"] = {
+                        **acceptance,
+                        "acceptance_evidence_hash": normalized_hash(acceptance),
+                        "report": {
+                            "id": acceptance_report["record_id"],
+                            "tracker_url": acceptance_report["tracker"]["url"],
+                        },
+                    }
+                    approval_binding = self._publication_approval_binding(
+                        map_id=map_id,
+                        acceptance=acceptance,
+                        acceptance_report_id=acceptance_report["record_id"],
+                    )
+                    if approval_binding is not None:
+                        card["publication_approval"] = approval_binding
                 return card
         raise MapBindingError(f"Map is not bound: {map_id}")
 
     def outbox_status(self, *, effect_id: str) -> dict[str, Any]:
         """Return one operator-visible durable execution record."""
         return self._outbox.operator_status(effect_id)
+
+    def cancel_map(
+        self,
+        *,
+        map_id: str,
+        actor_identity: GovernanceActorIdentity,
+        approval_request_id: str,
+        mutation_id: str,
+    ) -> dict[str, Any]:
+        """Close one exactly approved Map as not planned, never as delivered."""
+        binding = self._ensure_map_writable(map_id=map_id)
+        self._authorize_chairman_request(
+            map_id=map_id,
+            action="cancel_map",
+            actor_identity=actor_identity,
+        )
+        if not mutation_id or len(mutation_id) > 128:
+            raise ValueError("cancellation mutation_id must be 1 to 128 characters")
+        action = "cancel_map"
+        scope = {"map_id": map_id}
+        payload = {"state_reason": "not_planned"}
+        payload_hash = normalized_hash(
+            {"action": action, "scope": scope, "payload": payload}
+        )
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("cancellation", lock_key):
+            with self._storage.approval_lease(map_id):
+                approval = self._current_approval(request_id=approval_request_id)
+                existing = self._storage.protected_mutation(mutation_id)
+                if approval is None or approval["map_id"] != map_id:
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action=action,
+                        reason="approval_missing",
+                        actor_identity=actor_identity,
+                    )
+                expected_status = "consumed" if existing is not None else "approved"
+                if approval["status"] != expected_status:
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action=action,
+                        reason=self._approval_status_reason(approval["status"]),
+                        actor_identity=actor_identity,
+                    )
+                self._validate_approval_action(
+                    map_id=map_id,
+                    approval=approval,
+                    decision_class="cancellation",
+                    action=action,
+                    scope=scope,
+                    payload=payload,
+                    actor_identity=actor_identity,
+                )
+                if existing is not None and (
+                    existing["map_id"] != map_id
+                    or existing["request_id"] != approval_request_id
+                    or existing["action"] != action
+                    or normalized_json(existing["scope"]) != normalized_json(scope)
+                    or normalized_json(existing["payload"]) != normalized_json(payload)
+                    or existing["payload_hash"] != payload_hash
+                ):
+                    raise ApprovalRequestConflict(
+                        request_id=approval_request_id,
+                        reason="stable cancellation identity belongs to another payload",
+                    )
+                close_effect_id = f"tracker-close:{mutation_id}:not-planned"
+                existing_intent = self._outbox.intent(close_effect_id)
+                current_issue = self._tracker_read(
+                    project_id=str(binding["project_id"]),
+                    operation=lambda: self._tracker.get_issue(binding["issue_url"]),
+                )
+                current_stage = self._executive_stage(current_issue)
+                if current_stage in {"done", "cancelled"} and existing is None:
+                    raise MapTransitionError(
+                        current_stage=current_stage,
+                        requested_stage="cancelled",
+                        reason="terminal Map stages cannot be cancelled again",
+                    )
+                expected_stage = (
+                    str(existing_intent.payload["expected_stage"])
+                    if existing_intent is not None
+                    else current_stage
+                )
+                created_at = (
+                    str(existing["reserved_at"])
+                    if existing is not None
+                    else self._synchronized_at()
+                )
+                close_payload = {
+                    "issue_url": binding["issue_url"],
+                    "issue_id": map_id,
+                    "project_id": binding["project_id"],
+                    "state_reason": "not_planned",
+                    "expected_stage": expected_stage,
+                    "protected_mutation_id": mutation_id,
+                    "approval_request_id": approval_request_id,
+                    "consumption_event_id": (
+                        f"approval:{approval_request_id}:consumed:{mutation_id}"
+                    ),
+                    "approval_payload_hash": str(approval["payload_hash"]),
+                }
+                consumption_event = ApprovalHistoryEvent(
+                    event_id=(f"approval:{approval_request_id}:consumed:{mutation_id}"),
+                    request_id=approval_request_id,
+                    event_type="consumed",
+                    occurred_at=created_at,
+                    payload_hash=str(approval["payload_hash"]),
+                    details={
+                        "mutation_id": mutation_id,
+                        "action": action,
+                        "actor_id": actor_identity.actor_id,
+                        "actor_profile": actor_identity.profile_name,
+                        "note": "Approved cancellation action consumed.",
+                    },
+                )
+                consumption_effect_id = f"tracker-approval:{consumption_event.event_id}"
+                try:
+                    with self._storage.atomic() as connection:
+                        _replay, status = (
+                            self._storage.reserve_protected_mutation_in_transaction(
+                                connection,
+                                mutation_id=mutation_id,
+                                map_id=map_id,
+                                request_id=approval_request_id,
+                                action=action,
+                                scope=scope,
+                                payload=payload,
+                                payload_hash=payload_hash,
+                                reserved_at=created_at,
+                            )
+                        )
+                        if status not in {"reserved", "confirmed"}:
+                            raise ApprovalEnforcementError(
+                                action=action,
+                                map_id=map_id,
+                                reason=self._approval_status_reason(status),
+                            )
+                        enqueued = self._outbox.enqueue_in_transaction(
+                            connection,
+                            effect_id=consumption_effect_id,
+                            effect_type=TRACKER_APPROVAL_EVENT,
+                            map_id=map_id,
+                            payload={
+                                "issue_url": binding["issue_url"],
+                                "issue_id": map_id,
+                                "project_id": binding["project_id"],
+                                "event": consumption_event.payload(),
+                                "completion": {
+                                    "operation": "consumption",
+                                    "mutation_id": mutation_id,
+                                    "action": action,
+                                    "close_effect_id": close_effect_id,
+                                    "close_payload": close_payload,
+                                },
+                            },
+                            created_at=created_at,
+                        )
+                except OutboxConflictError as error:
+                    raise ApprovalRequestConflict(
+                        request_id=approval_request_id,
+                        reason="stable cancellation identity belongs to another payload",
+                    ) from error
+
+        self._outbox_dispatcher.dispatch_effect(
+            effect_id=consumption_effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=not enqueued.created,
+        )
+        self._require_effect_success(
+            consumption_effect_id,
+            "Map cancellation authority consumption is not confirmed",
+        )
+        self._dispatch_if_present(close_effect_id)
+        self._require_effect_success(
+            close_effect_id,
+            "Map cancellation is not confirmed",
+        )
+        return next(card for card in self.board()["maps"] if card["id"] == map_id)
+
+    def publish_map(
+        self,
+        *,
+        map_id: str,
+        approval_request_id: str,
+        mutation_id: str,
+    ) -> dict[str, Any]:
+        """Execute one exact approved action, record evidence, then close done."""
+        binding = self._ensure_map_writable(map_id=map_id)
+        if self._publisher is None:
+            self._storage.save_authorization_denial(
+                action="publish_map",
+                map_id=map_id,
+                profile_name="unavailable-publisher",
+                session_id="unavailable-publisher",
+                reason="publisher_capability_unavailable",
+                denied_at=self._synchronized_at(),
+            )
+            raise GovernanceAuthorizationError(
+                action="publish_map",
+                map_id=map_id,
+                reason="publisher_capability_unavailable",
+            )
+        publisher_profile = self._publisher.profile_name
+        publisher_authority = self._publisher.authority_ref
+        try:
+            self._publisher.validate_authority()
+        except Exception as error:
+            self._storage.save_authorization_denial(
+                action="publish_map",
+                map_id=map_id,
+                profile_name=publisher_profile,
+                session_id=publisher_authority,
+                reason="publisher_authority_unavailable",
+                denied_at=self._synchronized_at(),
+            )
+            raise GovernanceAuthorizationError(
+                action="publish_map",
+                map_id=map_id,
+                reason="publisher_authority_unavailable",
+            ) from error
+        if not mutation_id or len(mutation_id) > 128:
+            raise ValueError("publication mutation_id must be 1 to 128 characters")
+        lock_key = f"{self._storage.database}:{map_id}"
+        with _operation_lock("publication", lock_key):
+            with self._storage.approval_lease(map_id):
+                approval = self._current_approval(request_id=approval_request_id)
+                existing = self._storage.protected_mutation(mutation_id)
+                if approval is None or approval["map_id"] != map_id:
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action="publish_map",
+                        reason="approval_missing",
+                        profile_name=publisher_profile,
+                        session_id=publisher_authority,
+                    )
+                if existing is None and approval["status"] != "approved":
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action="publish_map",
+                        reason=self._approval_status_reason(approval["status"]),
+                        profile_name=publisher_profile,
+                        session_id=publisher_authority,
+                    )
+                if existing is not None and approval["status"] != "consumed":
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action="publish_map",
+                        reason=self._approval_status_reason(approval["status"]),
+                        profile_name=publisher_profile,
+                        session_id=publisher_authority,
+                    )
+                issue = self._tracker_read(
+                    project_id=str(binding["project_id"]),
+                    operation=lambda: self._tracker.get_issue(binding["issue_url"]),
+                )
+                if issue.id != map_id or self._executive_stage(issue) != "acceptance":
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action="publish_map",
+                        reason="publication_acceptance_stage_mismatch",
+                        profile_name=publisher_profile,
+                        session_id=publisher_authority,
+                    )
+                incident = self._unresolved_publication_incident(binding=binding)
+                if incident is not None:
+                    raise PublicationRepairRequired(
+                        map_id=map_id,
+                        action_id=incident.action_id,
+                        reason=incident.reason
+                        or "Remote publication requires evidence reconciliation",
+                    )
+                action = self._approved_publication_action(
+                    map_id=map_id,
+                    mutation_id=mutation_id,
+                    approval=approval,
+                )
+                try:
+                    self._publisher.validate_action(action)
+                except Exception:
+                    self._deny_approval_enforcement(
+                        map_id=map_id,
+                        action="publish_map",
+                        reason="publication_target_preflight_failed",
+                        profile_name=publisher_profile,
+                        session_id=publisher_authority,
+                    )
+                scope = {
+                    "map_id": map_id,
+                    "publication_target": action.target,
+                    "publisher_authority_ref": publisher_authority,
+                }
+                payload = {
+                    "revision": action.revision,
+                    "publication_action": action.action,
+                    "publication_target": action.target,
+                    "publisher_authority_ref": publisher_authority,
+                    "acceptance_evidence_hash": approval["decision_payload"].get(
+                        "acceptance_evidence_hash"
+                    ),
+                    "acceptance_report_id": approval["decision_payload"].get(
+                        "acceptance_report_id"
+                    ),
+                }
+                payload_hash = normalized_hash(
+                    {"action": "publish_map", "scope": scope, "payload": payload}
+                )
+                if existing is not None and (
+                    existing["map_id"] != map_id
+                    or existing["request_id"] != approval_request_id
+                    or existing["action"] != "publish_map"
+                    or normalized_json(existing["scope"]) != normalized_json(scope)
+                    or normalized_json(existing["payload"]) != normalized_json(payload)
+                    or existing["payload_hash"] != payload_hash
+                ):
+                    raise ApprovalRequestConflict(
+                        request_id=approval_request_id,
+                        reason="stable mutation identity belongs to another payload",
+                    )
+                effect_id = f"publisher:{mutation_id}"
+                effect_payload = {
+                    "action": action.payload(),
+                    "approval_request_id": approval_request_id,
+                    "issue_url": binding["issue_url"],
+                    "issue_id": map_id,
+                    "project_id": binding["project_id"],
+                    "acceptance_report_id": approval["decision_payload"][
+                        "acceptance_report_id"
+                    ],
+                    "publisher_authority_ref": publisher_authority,
+                }
+                created_at = self._synchronized_at()
+                try:
+                    with self._storage.atomic() as connection:
+                        _replay, status = (
+                            self._storage.reserve_protected_mutation_in_transaction(
+                                connection,
+                                mutation_id=mutation_id,
+                                map_id=map_id,
+                                request_id=approval_request_id,
+                                action="publish_map",
+                                scope=scope,
+                                payload=payload,
+                                payload_hash=payload_hash,
+                                reserved_at=created_at,
+                            )
+                        )
+                        if status not in {"reserved", "confirmed"}:
+                            raise ApprovalEnforcementError(
+                                action="publish_map",
+                                map_id=map_id,
+                                reason=self._approval_status_reason(status),
+                            )
+                        enqueued = self._outbox.enqueue_in_transaction(
+                            connection,
+                            effect_id=effect_id,
+                            effect_type=PUBLISHER_EXECUTE,
+                            map_id=map_id,
+                            payload=effect_payload,
+                            created_at=created_at,
+                        )
+                except OutboxConflictError as error:
+                    raise ApprovalRequestConflict(
+                        request_id=approval_request_id,
+                        reason="stable publication identity belongs to another payload",
+                    ) from error
+
+        self._outbox_dispatcher.dispatch_effect(
+            effect_id=effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=not enqueued.created,
+        )
+        publisher_intent = self._outbox.intent(effect_id)
+        if publisher_intent is not None and publisher_intent.state == "terminal":
+            if not self._outbox.external_call_started(effect_id):
+                raise ApprovalEnforcementError(
+                    action="publish_map",
+                    map_id=map_id,
+                    reason=(
+                        publisher_intent.last_error_message
+                        or "publication_preflight_failed"
+                    ),
+                )
+            incident_effect_id = f"tracker-publication:{mutation_id}:repair-required"
+            self._dispatch_if_present(incident_effect_id)
+            self._require_effect_success(
+                incident_effect_id,
+                "Publication repair incident is not tracker-confirmed",
+            )
+            raise PublicationRepairRequired(
+                map_id=map_id,
+                action_id=mutation_id,
+                reason=self._publication_incident_reason(
+                    publisher_intent.last_error_message
+                    or "Remote publication could not be safely confirmed"
+                ),
+            )
+        if (
+            publisher_intent is not None
+            and publisher_intent.state == "succeeded"
+            and isinstance(publisher_intent.acknowledgment, dict)
+            and publisher_intent.acknowledgment.get("outcome") == "confirmed_absent"
+        ):
+            raise ApprovalEnforcementError(
+                action="publish_map",
+                map_id=map_id,
+                reason="publication_aborted_grant_consumed",
+            )
+        self._require_effect_success(effect_id, "Remote publication is not confirmed")
+        self._dispatch_if_present(f"tracker-publication:{mutation_id}:succeeded")
+        self._dispatch_if_present(f"tracker-close:{mutation_id}:completed")
+        self._require_effect_success(
+            f"tracker-publication:{mutation_id}:succeeded",
+            "Remote publication evidence is not tracker-confirmed",
+        )
+        self._require_effect_success(
+            f"tracker-close:{mutation_id}:completed",
+            "Map closeout is not tracker-confirmed",
+        )
+        return next(card for card in self.board()["maps"] if card["id"] == map_id)
+
+    def reconcile_publication(
+        self,
+        *,
+        map_id: str,
+        action_id: str,
+    ) -> dict[str, Any]:
+        """Resolve an uncertain publication exclusively through provider readback."""
+        if self._publisher is None:
+            raise GovernanceAuthorizationError(
+                action="reconcile_publication",
+                map_id=map_id,
+                reason="publisher_capability_unavailable",
+            )
+        self._ensure_map_writable(map_id=map_id)
+        effect_id = f"publisher:{action_id}"
+        intent = self._outbox.intent(effect_id)
+        if (
+            intent is None
+            or intent.map_id != map_id
+            or intent.effect_type != PUBLISHER_EXECUTE
+        ):
+            raise ValueError(
+                "Publication action is not durably registered for this Map"
+            )
+        if intent.state == "succeeded":
+            outcome = intent.acknowledgment or {}
+            self._confirm_publication_incident_if_present(action_id=action_id)
+            if outcome.get("outcome") == "confirmed_absent":
+                aborted_effect_id = f"tracker-publication:{action_id}:aborted"
+                self._dispatch_if_present(aborted_effect_id)
+                self._require_effect_success(
+                    aborted_effect_id,
+                    "Confirmed-absent publication record is not tracker-confirmed",
+                )
+                return self.map_detail(map_id=map_id)
+            self._dispatch_if_present(f"tracker-publication:{action_id}:succeeded")
+            self._dispatch_if_present(f"tracker-close:{action_id}:completed")
+            return self.map_detail(map_id=map_id)
+        if intent.state != "terminal":
+            raise ValueError(
+                "Publication action is not terminal and cannot use evidence repair"
+            )
+        if not self._outbox.external_call_started(effect_id):
+            raise ValueError(
+                "Publication never crossed the remote-call boundary; use explicit "
+                "Outbox repair after correcting the failed preflight"
+            )
+        incident_effect_id = f"tracker-publication:{action_id}:repair-required"
+        self._dispatch_if_present(incident_effect_id)
+        self._require_effect_success(
+            incident_effect_id,
+            "Publication repair incident must be tracker-confirmed before resolution",
+        )
+        action = ApprovedPublicationAction.from_payload(dict(intent.payload["action"]))
+        try:
+            evidence = self._publisher.readback(action)
+        except Exception as error:
+            raise PublicationRepairRequired(
+                map_id=map_id,
+                action_id=action_id,
+                reason=self._publication_incident_reason(str(error)),
+            ) from error
+        resolved_at = self._synchronized_at()
+        if evidence is None:
+            try:
+                confirmed_absent = self._publisher.confirms_absence(action)
+            except Exception as error:
+                raise PublicationRepairRequired(
+                    map_id=map_id,
+                    action_id=action_id,
+                    reason=self._publication_incident_reason(str(error)),
+                ) from error
+            if not confirmed_absent:
+                raise PublicationRepairRequired(
+                    map_id=map_id,
+                    action_id=action_id,
+                    reason=(
+                        "Provider state conflicts with or cannot prove absence of "
+                        "the approved remote action"
+                    ),
+                )
+            attempted_at = self._outbox.external_call_started_at(effect_id)
+            if attempted_at is None:  # pragma: no cover - marker checked above
+                raise RuntimeError("Publisher attempt timestamp disappeared")
+            record = PublicationRecord(
+                record_id=f"publication:{action.action_id}:aborted",
+                action_id=action.action_id,
+                map_id=action.map_id,
+                approval_request_id=str(intent.payload["approval_request_id"]),
+                status="aborted",
+                revision=action.revision,
+                action=action.action,
+                target=action.target,
+                occurred_at=attempted_at,
+                reason=(
+                    "Provider readback confirmed the approved remote action is "
+                    "absent; the consumed grant will not be replayed."
+                ),
+            )
+            acknowledgment = {
+                "outcome": "confirmed_absent",
+                "action": action.payload(),
+            }
+            resolution_id = f"publication-absence:{action_id}"
+            note = (
+                "Privileged provider readback proved the exact approved action absent."
+            )
+        else:
+            record = self._successful_publication_record(intent, evidence)
+            acknowledgment = {"evidence": evidence.payload()}
+            resolution_id = f"publication-evidence:{action_id}"
+            note = "Privileged provider readback proved the exact approved action."
+        successor = self._publication_record_successor(intent, record)
+        self._outbox.acknowledge_terminal_readback(
+            effect_id=effect_id,
+            resolution_id=resolution_id,
+            note=note,
+            acknowledgment=acknowledgment,
+            resolved_at=resolved_at,
+            successor_effect_id=str(successor["effect_id"]),
+            successor_effect_type=TRACKER_PUBLICATION_RECORD,
+            successor_map_id=intent.map_id,
+            successor_payload=dict(successor["payload"]),
+        )
+        publication_effect_id = str(successor["effect_id"])
+        self._dispatch_if_present(publication_effect_id)
+        self._require_effect_success(
+            publication_effect_id,
+            "Reconciled publication evidence is not tracker-confirmed",
+        )
+        if record.status == "aborted":
+            return self.map_detail(map_id=map_id)
+        close_effect_id = f"tracker-close:{action_id}:completed"
+        self._dispatch_if_present(close_effect_id)
+        close = self._outbox.intent(close_effect_id)
+        if close is not None and close.state == "succeeded":
+            return next(card for card in self.board()["maps"] if card["id"] == map_id)
+        return self.map_detail(map_id=map_id)
+
+    def _unresolved_publication_incident(
+        self, *, binding: Mapping[str, Any]
+    ) -> PublicationRecord | None:
+        records = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.list_publication_records(
+                str(binding["issue_url"])
+            ),
+        )
+        for index, item in enumerate(records):
+            if item.record.status != "repair_required":
+                continue
+            resolved_later = any(
+                later.record.action_id == item.record.action_id
+                and later.record.status in {"succeeded", "aborted"}
+                for later in records[index + 1 :]
+            )
+            if not resolved_later:
+                return item.record
+        return None
+
+    def _confirm_publication_incident_if_present(self, *, action_id: str) -> None:
+        incident_effect_id = f"tracker-publication:{action_id}:repair-required"
+        if self._outbox.intent(incident_effect_id) is None:
+            return
+        self._dispatch_if_present(incident_effect_id)
+        self._require_effect_success(
+            incident_effect_id,
+            "Publication repair incident must be tracker-confirmed before resolution",
+        )
+
+    def _approved_publication_action(
+        self,
+        *,
+        map_id: str,
+        mutation_id: str,
+        approval: Mapping[str, Any],
+    ) -> ApprovedPublicationAction:
+        acceptance_report = next(
+            (
+                report
+                for report in self._storage.recent_pm_reports(map_id=map_id)
+                if report["type"] == "acceptance"
+                and isinstance(report.get("acceptance"), dict)
+            ),
+            None,
+        )
+        acceptance = (
+            dict(acceptance_report["acceptance"])
+            if acceptance_report is not None
+            else None
+        )
+        requested = (
+            acceptance.get("requested_publication_action")
+            if isinstance(acceptance, dict)
+            else None
+        )
+        decision_payload = approval["decision_payload"]
+        if (
+            approval["decision_class"] != "remote_publication"
+            or approval["proposed_action"] != "publish_map"
+            or acceptance is None
+            or not isinstance(requested, dict)
+            or decision_payload.get("acceptance_evidence_hash")
+            != normalized_hash(acceptance)
+            or decision_payload.get("acceptance_report_id")
+            != (
+                acceptance_report["record_id"]
+                if acceptance_report is not None
+                else None
+            )
+            or decision_payload.get("revision") != acceptance.get("revision")
+            or decision_payload.get("publication_action") != requested.get("action")
+            or self._publisher is None
+            or self._publication_authority_ref != self._publisher.authority_ref
+            or decision_payload.get("publisher_authority_ref")
+            != self._publisher.authority_ref
+            or normalized_json(decision_payload.get("publication_target"))
+            != normalized_json(requested.get("target"))
+        ):
+            self._deny_approval_enforcement(
+                map_id=map_id,
+                action="publish_map",
+                reason="publication_acceptance_mismatch",
+                profile_name=(
+                    self._publisher.profile_name if self._publisher else "unavailable"
+                ),
+                session_id=(
+                    self._publisher.authority_ref if self._publisher else "unavailable"
+                ),
+            )
+        return ApprovedPublicationAction(
+            action_id=mutation_id,
+            map_id=map_id,
+            revision=str(decision_payload["revision"]),
+            action=str(decision_payload["publication_action"]),
+            target=dict(decision_payload["publication_target"]),
+        )
+
+    @staticmethod
+    def _publication_incident_reason(reason: str) -> str:
+        normalized = " ".join(reason.split())[:1000]
+        if re.search(
+            r"(?i)(credential|secret|password|access[_ -]?token|github_pat_|ghp_)",
+            normalized,
+        ):
+            return (
+                "Privileged publisher reported a partial remote failure; inspect "
+                "the isolated publisher audit boundary."
+            )
+        return normalized or "Remote publication could not be safely confirmed"
+
+    def _dispatch_if_present(self, effect_id: str) -> None:
+        intent = self._outbox.intent(effect_id)
+        if intent is None or intent.state == "succeeded":
+            return
+        self._outbox_dispatcher.dispatch_effect(
+            effect_id=effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=True,
+        )
+
+    def _require_effect_success(self, effect_id: str, message: str) -> None:
+        intent = self._outbox.intent(effect_id)
+        if intent is None or intent.state != "succeeded":
+            raise TrackerError(
+                (intent.last_error_message if intent is not None else None) or message
+            )
 
     def recover_outbox(self, *, limit: int = 100) -> dict[str, Any]:
         """Dispatch due durable effects during startup or an operator recovery."""
@@ -1381,7 +2335,41 @@ class MapGovernanceApplication:
                     "terminal_reason": outcome.terminal_reason,
                 }
             )
-        return {"processed_count": len(outcomes), "outcomes": outcomes}
+        acceptance_decisions = self._recover_publication_acceptance_decisions()
+        return {
+            "processed_count": len(outcomes),
+            "outcomes": outcomes,
+            "acceptance_decisions": acceptance_decisions,
+        }
+
+    def _recover_publication_acceptance_decisions(self) -> list[dict[str, Any]]:
+        """Derive the rejection/revision delivery handoff from durable authority."""
+        _projects, maps = self._storage.board_rows()
+        recovered: list[dict[str, Any]] = []
+        for card in maps:
+            map_id = str(card["map_id"])
+            for row in reversed(self._storage.approvals(map_id=map_id)):
+                if row.get("proposed_action") != "publish_map" or row.get(
+                    "status"
+                ) not in {"rejected", "revision"}:
+                    continue
+                result = self._complete_publication_acceptance_decision(
+                    result={
+                        "map_id": map_id,
+                        "approval": self._approval_projection(row),
+                        "idempotent": True,
+                    },
+                    row=row,
+                )
+                recovered.append(
+                    {
+                        "map_id": map_id,
+                        "request_id": row["request_id"],
+                        "decision": row["status"],
+                        "resumed": "resume" in result,
+                    }
+                )
+        return recovered
 
     def start_outbox_runtime(
         self,
@@ -1417,6 +2405,15 @@ class MapGovernanceApplication:
     ) -> dict[str, Any]:
         """Audit an explicit operator repair and requeue a terminal intent."""
         intent = self._outbox.intent(effect_id)
+        if (
+            intent is not None
+            and intent.effect_type == PUBLISHER_EXECUTE
+            and self._outbox.external_call_started(effect_id)
+        ):
+            raise ValueError(
+                "Publisher effects cannot be re-executed by generic Outbox repair; "
+                "use evidence-only publication reconciliation"
+            )
         if intent is not None and self._storage.map_binding(intent.map_id) is not None:
             self._ensure_map_writable(map_id=intent.map_id)
         self._outbox.repair(
@@ -2734,6 +3731,16 @@ class MapGovernanceApplication:
             if final_lane
             else ()
         )
+        acceptance = (
+            self._delivery_acceptance_packet(
+                outcome=outcome,
+                lane=lane,
+                repository=issue.repository,
+                executive_evidence=evidence,
+            )
+            if final_lane
+            else None
+        )
         report_result = self.report_pm(
             request_identity=request_identity,
             report=PMReportDraft(
@@ -2746,6 +3753,7 @@ class MapGovernanceApplication:
                 ),
                 timestamp=str(assignment["updated_at"]),
                 evidence=evidence,
+                acceptance=acceptance,
             ),
         )
         return {
@@ -3490,6 +4498,44 @@ class MapGovernanceApplication:
         )
         return tuple(dict.fromkeys(evidence))
 
+    @staticmethod
+    def _delivery_acceptance_packet(
+        *,
+        outcome: Mapping[str, Any],
+        lane: DeliveryLaneSpec,
+        repository: str,
+        executive_evidence: tuple[str, ...],
+    ) -> AcceptanceEvidence:
+        raw_evidence = outcome.get("evidence")
+        if not isinstance(raw_evidence, Mapping):
+            raise RuntimeError("Delivery acceptance evidence is unavailable")
+        revision = raw_evidence.get("integration_commit")
+        limitations = [
+            item.removeprefix("Known limitation: ")
+            for item in executive_evidence
+            if item.startswith("Known limitation: ")
+        ]
+        branch = lane.integration_branch
+        target_ref = branch if branch.startswith("refs/") else f"refs/heads/{branch}"
+        return AcceptanceEvidence(
+            revision=revision,
+            delivered_scope=(
+                "The declared Map delivery scope is locally integrated and validated.",
+            ),
+            validations=(
+                "The declared focused validation passed.",
+                "The local integration completion contract is satisfied.",
+            ),
+            known_limitations=tuple(limitations),
+            rollback_considerations=(
+                "Restore the publication target to its previous immutable revision.",
+            ),
+            requested_publication_action=PublicationAction(
+                action="push",
+                target={"repository": repository, "ref": target_ref},
+            ),
+        )
+
     def report_pm(
         self,
         *,
@@ -3511,6 +4557,10 @@ class MapGovernanceApplication:
         map_id = str(assignment["map_id"])
         self._ensure_map_writable(map_id=map_id)
         bound_report = report.assign_to(map_id)
+        if report.report_type == "acceptance" and report.acceptance is None:
+            raise ValueError(
+                "PM acceptance report must include structured acceptance evidence"
+            )
         if (
             report.report_type == "question"
             and report.scope is not None
@@ -3522,7 +4572,10 @@ class MapGovernanceApplication:
             raise MapBindingError(f"Map is not bound: {map_id}")
         lock_key = f"{self._storage.database}:{map_id}"
         with _operation_lock("pm-turn", lock_key):
-            with self._storage.pm_turn_lease(map_id):
+            with (
+                self._storage.pm_turn_lease(map_id),
+                self._storage.publication_lease(map_id),
+            ):
                 assignment = self._storage.pm_assignment_for_request(
                     profile_name=request_identity.profile_name,
                     session_id=request_identity.session_id,
@@ -3534,6 +4587,9 @@ class MapGovernanceApplication:
                         request_identity=request_identity,
                         reason="pm_assignment_missing",
                     )
+                acceptance = bound_report.content.acceptance
+                if acceptance is not None and self._publication_handoff is not None:
+                    self._publication_handoff.prepare(acceptance)
                 return self._report_pm_under_turn_lease(
                     map_id=map_id,
                     binding=binding,
@@ -4554,6 +5610,15 @@ class MapGovernanceApplication:
                 profile_name=request_identity.profile_name,
                 session_id=request_identity.session_id,
             )
+        if (
+            packet.decision_class == "remote_publication"
+            or packet.proposed_action == "publish_map"
+        ):
+            self._validate_publication_approval_packet(
+                map_id=map_id,
+                packet=packet,
+                request_identity=request_identity,
+            )
         binding = self._storage.map_binding(map_id)
         if binding is None:
             raise MapBindingError(f"Map is not bound: {map_id}")
@@ -4604,6 +5669,101 @@ class MapGovernanceApplication:
                     "idempotent": False,
                 }
 
+    def _validate_publication_approval_packet(
+        self,
+        *,
+        map_id: str,
+        packet: ApprovalPacket,
+        request_identity: GovernanceRequestIdentity,
+    ) -> None:
+        binding = self._ensure_map_writable(map_id=map_id)
+        if self._unresolved_publication_incident(binding=binding) is not None:
+            self._deny_approval_enforcement(
+                map_id=map_id,
+                action="request_approval",
+                reason="publication_repair_required",
+                profile_name=request_identity.profile_name,
+                session_id=request_identity.session_id,
+            )
+        issue = self._tracker_read(
+            project_id=str(binding["project_id"]),
+            operation=lambda: self._tracker.get_issue(binding["issue_url"]),
+        )
+        acceptance_report = next(
+            (
+                report
+                for report in self._storage.recent_pm_reports(map_id=map_id)
+                if report["type"] == "acceptance"
+                and isinstance(report.get("acceptance"), dict)
+            ),
+            None,
+        )
+        acceptance = (
+            dict(acceptance_report["acceptance"])
+            if acceptance_report is not None
+            else None
+        )
+        approval_binding = (
+            self._publication_approval_binding(
+                map_id=map_id,
+                acceptance=acceptance,
+                acceptance_report_id=acceptance_report["record_id"],
+            )
+            if acceptance is not None and acceptance_report is not None
+            else None
+        )
+        if (
+            issue.id != map_id
+            or self._executive_stage(issue) != "acceptance"
+            or packet.decision_class != "remote_publication"
+            or packet.proposed_action != "publish_map"
+            or approval_binding is None
+            or normalized_json(packet.requested_scope)
+            != normalized_json(approval_binding["requested_scope"])
+            or normalized_json(packet.decision_payload)
+            != normalized_json(approval_binding["decision_payload"])
+        ):
+            self._deny_approval_enforcement(
+                map_id=map_id,
+                action="request_approval",
+                reason="publication_acceptance_mismatch",
+                profile_name=request_identity.profile_name,
+                session_id=request_identity.session_id,
+            )
+
+    def _publication_approval_binding(
+        self,
+        *,
+        map_id: str,
+        acceptance: Mapping[str, Any],
+        acceptance_report_id: str,
+    ) -> dict[str, Any] | None:
+        """Project the exact secret-free binding a chairman may approve."""
+        if self._publication_authority_ref is None:
+            return None
+        requested = acceptance.get("requested_publication_action")
+        if not isinstance(requested, Mapping):
+            return None
+        target = requested.get("target")
+        action = requested.get("action")
+        return {
+            "decision_class": "remote_publication",
+            "proposed_action": "publish_map",
+            "requested_scope": {
+                "map_id": map_id,
+                "publication_target": target,
+                "publisher_authority_ref": self._publication_authority_ref,
+            },
+            "decision_payload": {
+                "revision": acceptance.get("revision"),
+                "publication_action": action,
+                "publication_target": target,
+                "publisher_authority_ref": self._publication_authority_ref,
+                "acceptance_evidence_hash": normalized_hash(acceptance),
+                "acceptance_report_id": acceptance_report_id,
+            },
+        }
+
     def decide_approval(
         self,
         *,
@@ -4647,6 +5807,10 @@ class MapGovernanceApplication:
                             "approval": self._approval_projection(approval),
                             "idempotent": True,
                         }
+                        result = self._complete_publication_acceptance_decision(
+                            result=result,
+                            row=approval,
+                        )
                         return self._resume_correlated_approval_decision(
                             result=result,
                             row=approval,
@@ -4702,10 +5866,123 @@ class MapGovernanceApplication:
                     "approval": self._approval_projection(stored),
                     "idempotent": False,
                 }
+                result = self._complete_publication_acceptance_decision(
+                    result=result,
+                    row=stored,
+                )
                 return self._resume_correlated_approval_decision(
                     result=result,
                     row=stored,
                 )
+
+    def _complete_publication_acceptance_decision(
+        self,
+        *,
+        result: dict[str, Any],
+        row: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if row.get("proposed_action") != "publish_map" or row.get("status") not in {
+            "rejected",
+            "revision",
+        }:
+            return result
+        binding = self._storage.map_binding(str(row["map_id"]))
+        if binding is None:
+            raise MapBindingError(f"Map is not bound: {row['map_id']}")
+        effect_id = f"stage-transition:acceptance-decision:{row['request_id']}"
+        try:
+            enqueued = self._outbox.enqueue(
+                effect_id=effect_id,
+                effect_type=TRACKER_STAGE_TRANSITION,
+                map_id=str(row["map_id"]),
+                payload={
+                    "issue_url": binding["issue_url"],
+                    "issue_id": row["map_id"],
+                    "project_id": binding["project_id"],
+                    "expected_stage": "acceptance",
+                    "requested_stage": "delivery",
+                    "protected_mutation_id": None,
+                },
+                created_at=self._synchronized_at(),
+            )
+        except OutboxConflictError as error:
+            raise TrackerEffectPayloadConflict(
+                "Acceptance decision transition identity belongs to other content"
+            ) from error
+        self._outbox_dispatcher.dispatch_effect(
+            effect_id=effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=not enqueued.created,
+        )
+        self._require_effect_success(
+            effect_id,
+            "Acceptance rejection has not returned the Map to delivery",
+        )
+        result = {
+            **result,
+            "acceptance_outcome": {
+                "state": "changes_requested",
+                "request_id": row["request_id"],
+                "decision": row["status"],
+                "requested_changes": row["decision_note"],
+            },
+        }
+        tracker = result["approval"]["tracker"].get("decision")
+        if self._coordinator_resume is None or not isinstance(tracker, dict):
+            return result
+        assignment = self._storage.pm_assignment(str(row["map_id"]))
+        if assignment is None:
+            raise EffectRetryableError(
+                "PM assignment is unavailable for acceptance changes"
+            )
+        resume_effect_id = f"acceptance-changes:{row['request_id']}:{row['status']}"
+        turn_id = f"acceptance:{row['request_id']}:{row['status']}"
+        content = (
+            f"Chairman acceptance decision {tracker['id']} requested changes: "
+            f"{row['decision_note']} Review {tracker['url']}, return to delivery, "
+            "and submit a new structured acceptance report before requesting "
+            "publication again."
+        )
+        try:
+            resume_intent = self._outbox.enqueue(
+                effect_id=resume_effect_id,
+                effect_type=COORDINATOR_RESUME,
+                map_id=str(row["map_id"]),
+                payload={
+                    "profile_name": str(assignment["profile_name"]),
+                    "session_id": str(assignment["session_id"]),
+                    "coordinator_id": str(assignment["coordinator_id"]),
+                    "turn_id": turn_id,
+                    "content": content,
+                    "acceptance_request_id": str(row["request_id"]),
+                    "outcome": "changes_requested",
+                    "tracker_record_id": str(tracker["id"]),
+                    "tracker_record_url": str(tracker["url"]),
+                },
+                created_at=self._synchronized_at(),
+            )
+        except OutboxConflictError as error:
+            raise EffectTerminalError(
+                "Acceptance change resume identity belongs to another decision"
+            ) from error
+        self._outbox_dispatcher.dispatch_effect(
+            effect_id=resume_effect_id,
+            owner_id=self._outbox_owner_id,
+            expedite_retry=not resume_intent.created,
+        )
+        self._require_effect_success(
+            resume_effect_id,
+            "Acceptance requested changes have not resumed the PM",
+        )
+        return {
+            **result,
+            "resume": {
+                "effect_id": resume_effect_id,
+                "state": "succeeded",
+                "turn_id": turn_id,
+                "idempotent": not resume_intent.created,
+            },
+        }
 
     def _resume_correlated_approval_decision(
         self,
@@ -5017,7 +6294,10 @@ class MapGovernanceApplication:
             revocations = [
                 record for record in ordered if record.event.event_type == "revoked"
             ]
-            if len(outcomes) > 1 or len(revocations) > 1:
+            consumptions = [
+                record for record in ordered if record.event.event_type == "consumed"
+            ]
+            if len(outcomes) > 1 or len(revocations) > 1 or len(consumptions) > 1:
                 raise ApprovalRequestConflict(
                     request_id=request_id,
                     reason="tracker approval history has multiple terminal outcomes",
@@ -5097,6 +6377,39 @@ class MapGovernanceApplication:
                 expires_at = None
                 decision_record = revocation
 
+            consumption_record = consumptions[0] if consumptions else None
+            if consumption_record is not None:
+                if status != "approved" or ordered.index(
+                    consumption_record
+                ) < ordered.index(outcomes[0]):
+                    raise ApprovalRequestConflict(
+                        request_id=request_id,
+                        reason="tracker consumption has no preceding approval",
+                    )
+                mutation_id = self._approval_history_text(
+                    consumption_record.event.details,
+                    "mutation_id",
+                    request_id,
+                )
+                consumed_action = self._approval_history_text(
+                    consumption_record.event.details,
+                    "action",
+                    request_id,
+                )
+                if consumed_action != packet.proposed_action:
+                    raise ApprovalRequestConflict(
+                        request_id=request_id,
+                        reason="tracker consumption belongs to another action",
+                    )
+                if expires_at is None or datetime.fromisoformat(
+                    consumption_record.event.occurred_at.replace("Z", "+00:00")
+                ) > datetime.fromisoformat(expires_at.replace("Z", "+00:00")):
+                    raise ApprovalRequestConflict(
+                        request_id=request_id,
+                        reason="tracker consumption occurred after approval expiry",
+                    )
+                status = "consumed"
+
             existing = self._storage.approval(request_id)
             if existing is not None and (
                 existing["map_id"] != map_id
@@ -5110,7 +6423,7 @@ class MapGovernanceApplication:
                 "expired",
                 "consumed",
             }
-            if local_terminal and status != "approved":
+            if local_terminal and status not in {"approved", "consumed"}:
                 raise ApprovalRequestConflict(
                     request_id=request_id,
                     reason="tracker outcome conflicts with local enforcement record",
@@ -5121,10 +6434,24 @@ class MapGovernanceApplication:
                 else status
             )
             consumption = None
-            if existing is not None and existing.get("consumed_by_mutation_id"):
+            consumed_by_mutation_id = (
+                mutation_id
+                if consumption_record is not None
+                else (
+                    existing.get("consumed_by_mutation_id")
+                    if existing is not None
+                    else None
+                )
+            )
+            consumed_at = (
+                consumption_record.event.occurred_at
+                if consumption_record is not None
+                else (existing.get("consumed_at") if existing is not None else None)
+            )
+            if consumed_by_mutation_id:
                 consumption = {
-                    "mutation_id": existing["consumed_by_mutation_id"],
-                    "consumed_at": existing["consumed_at"],
+                    "mutation_id": consumed_by_mutation_id,
+                    "consumed_at": consumed_at,
                 }
             decision = (
                 {
@@ -5185,20 +6512,12 @@ class MapGovernanceApplication:
                         if decision_record is not None
                         else None
                     ),
-                    "consumed_by_mutation_id": (
-                        existing.get("consumed_by_mutation_id")
-                        if local_terminal and existing is not None
-                        else None
-                    ),
-                    "consumed_at": (
-                        existing.get("consumed_at")
-                        if local_terminal and existing is not None
-                        else None
-                    ),
+                    "consumed_by_mutation_id": consumed_by_mutation_id,
+                    "consumed_at": consumed_at,
                     "updated_at": (
                         existing["updated_at"]
                         if local_terminal and existing is not None
-                        else (decided_at or requested.event.occurred_at)
+                        else (consumed_at or decided_at or requested.event.occurred_at)
                     ),
                     "events": events,
                     "public": {
@@ -5242,7 +6561,12 @@ class MapGovernanceApplication:
         *,
         issue: TrackerIssue,
         synchronized_at: str,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         """Load every tracker-backed Map history projection through one seam."""
         decisions = [
             self._decision_projection(record, confirmed_at=synchronized_at)
@@ -5284,7 +6608,170 @@ class MapGovernanceApplication:
             map_id=issue.id,
             records=approval_records,
         )
-        return decisions, reports, approvals
+        list_publications = getattr(self._tracker, "list_publication_records", None)
+        if callable(list_publications):
+            publications = []
+            for record in self._publication_records_by_id(
+                list_publications(issue.url)
+            ).values():
+                if record.record.map_id != issue.id:
+                    raise MapBindingError(
+                        "Tracker publication record belongs to another Map"
+                    )
+                publications.append(
+                    self._publication_projection(
+                        record,
+                        confirmed_at=synchronized_at,
+                    )
+                )
+        elif self._storage.recent_publication_records(map_id=issue.id):
+            raise MapBindingError(
+                "Tracker adapter cannot authoritatively reconcile publication history"
+            )
+        else:
+            publications = []
+        for publication in publications:
+            if publication["status"] not in {"succeeded", "aborted"}:
+                continue
+            approval = next(
+                (
+                    item
+                    for item in approvals
+                    if item["request_id"] == publication["approval_request_id"]
+                    and item["proposed_action"] == "publish_map"
+                    and item["status"] in {"approved", "consumed"}
+                ),
+                None,
+            )
+            if approval is not None:
+                approval["status"] = "consumed"
+                approval["consumed_by_mutation_id"] = publication["action_id"]
+                approval["consumed_at"] = publication["occurred_at"]
+                approval["updated_at"] = publication["occurred_at"]
+                approval["public"] = {
+                    **approval["public"],
+                    "status": "consumed",
+                    "consumption": {
+                        "mutation_id": publication["action_id"],
+                        "consumed_at": publication["occurred_at"],
+                    },
+                }
+        if issue.state == "closed" and issue.state_reason == "not_planned":
+            cancellation = next(
+                (
+                    approval
+                    for approval in approvals
+                    if approval["proposed_action"] == "cancel_map"
+                    and approval["status"] == "consumed"
+                    and approval.get("consumed_by_mutation_id")
+                    and approval["decision_payload"] == {"state_reason": "not_planned"}
+                ),
+                None,
+            )
+            if cancellation is None:
+                raise MapBindingError(
+                    "Cancelled Map Issue has no consumed cancellation authority"
+                )
+        elif issue.state == "closed":
+            latest_acceptance = next(
+                (
+                    report
+                    for report in reversed(reports)
+                    if report["type"] == "acceptance"
+                    and isinstance(report.get("acceptance"), dict)
+                ),
+                None,
+            )
+            unresolved_incident = any(
+                record["status"] == "repair_required"
+                and not any(
+                    later["action_id"] == record["action_id"]
+                    and later["status"] in {"succeeded", "aborted"}
+                    for later in publications[index + 1 :]
+                )
+                for index, record in enumerate(publications)
+            )
+            valid_publication = False
+            if latest_acceptance is not None and not unresolved_incident:
+                acceptance = dict(latest_acceptance["acceptance"])
+                requested = acceptance.get("requested_publication_action")
+                for record in publications:
+                    if record["status"] != "succeeded":
+                        continue
+                    approval = next(
+                        (
+                            item
+                            for item in approvals
+                            if item["request_id"] == record["approval_request_id"]
+                        ),
+                        None,
+                    )
+                    if not isinstance(requested, dict) or approval is None:
+                        continue
+                    payload = approval["decision_payload"]
+                    expires_at = approval.get("expires_at")
+                    decided_at = approval.get("decided_at")
+                    approval_active_at_publication = (
+                        isinstance(decided_at, str)
+                        and isinstance(expires_at, str)
+                        and datetime.fromisoformat(decided_at.replace("Z", "+00:00"))
+                        <= datetime.fromisoformat(
+                            record["occurred_at"].replace("Z", "+00:00")
+                        )
+                        < datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    )
+                    valid_publication = (
+                        approval["proposed_action"] == "publish_map"
+                        and approval["status"] == "consumed"
+                        and approval_active_at_publication
+                        and approval.get("consumed_by_mutation_id")
+                        == record["action_id"]
+                        and payload.get("acceptance_report_id")
+                        == latest_acceptance["record_id"]
+                        and payload.get("acceptance_evidence_hash")
+                        == normalized_hash(acceptance)
+                        and record["revision"] == acceptance.get("revision")
+                        and record["action"] == requested.get("action")
+                        and normalized_json(record["target"])
+                        == normalized_json(requested.get("target"))
+                    )
+                    if valid_publication:
+                        break
+            if not valid_publication:
+                raise MapBindingError(
+                    "Completed Map Issue has no exact governed publication lineage"
+                )
+        return decisions, reports, approvals, publications
+
+    @staticmethod
+    def _publication_records_by_id(
+        records: list[TrackerPublicationRecord],
+    ) -> dict[str, TrackerPublicationRecord]:
+        by_id: dict[str, TrackerPublicationRecord] = {}
+        for record in records:
+            record_id = record.record.record_id
+            existing = by_id.get(record_id)
+            if existing is not None and existing.record != record.record:
+                raise MapBindingError(
+                    "Tracker publication record identity has conflicting history"
+                )
+            by_id.setdefault(record_id, record)
+        return by_id
+
+    @staticmethod
+    def _publication_projection(
+        record: TrackerPublicationRecord,
+        *,
+        confirmed_at: str,
+    ) -> dict[str, Any]:
+        return {
+            **record.record.payload(),
+            "tracker": {
+                "id": record.tracker_record_id,
+                "url": record.tracker_record_url,
+            },
+            "confirmed_at": confirmed_at,
+        }
 
     @staticmethod
     def _approval_history_text(
@@ -5988,9 +7475,11 @@ class MapGovernanceApplication:
         synchronized_at = self._synchronized_at()
         try:
             issue = self._tracker.get_issue(issue_url)
-            decisions, reports, approvals = self._authoritative_map_history(
-                issue=issue,
-                synchronized_at=synchronized_at,
+            decisions, reports, approvals, publications = (
+                self._authoritative_map_history(
+                    issue=issue,
+                    synchronized_at=synchronized_at,
+                )
             )
         except TrackerError as error:
             self._mark_tracker_stale(project_id=project_id, reason=str(error))
@@ -6016,6 +7505,10 @@ class MapGovernanceApplication:
             map_id=issue.id,
             approvals=approvals,
             reconciled_at=synchronized_at,
+        )
+        self._storage.replace_publication_projections(
+            map_id=issue.id,
+            records=publications,
         )
         return self._card_with_summary(
             card,
@@ -6058,6 +7551,7 @@ class MapGovernanceApplication:
             decisions: dict[str, list[dict[str, Any]]] = {}
             reports: dict[str, list[dict[str, Any]]] = {}
             approvals: dict[str, list[dict[str, Any]]] = {}
+            publications: dict[str, list[dict[str, Any]]] = {}
             for map_binding in self._storage.map_bindings(project_id):
                 issue = self._tracker.get_issue(str(map_binding["issue_url"]))
                 if issue.id != map_binding["map_id"]:
@@ -6073,6 +7567,7 @@ class MapGovernanceApplication:
                     decisions[issue.id],
                     reports[issue.id],
                     approvals[issue.id],
+                    publications[issue.id],
                 ) = self._authoritative_map_history(
                     issue=issue,
                     synchronized_at=synchronized_at,
@@ -6083,6 +7578,7 @@ class MapGovernanceApplication:
                 decisions=decisions,
                 reports=reports,
                 approvals=approvals,
+                publications=publications,
                 synchronized_at=synchronized_at,
             )
         except (
@@ -6469,11 +7965,188 @@ class MapGovernanceApplication:
         ).hexdigest()[:32]
         return f"stage-transition:{digest}"
 
+    def _successful_publication_record(
+        self,
+        intent: OutboxIntent,
+        evidence: RemotePublicationEvidence,
+    ) -> PublicationRecord:
+        action = ApprovedPublicationAction.from_payload(dict(intent.payload["action"]))
+        if evidence.action_id != action.action_id:
+            raise EffectTerminalError(
+                "Publisher evidence belongs to another approved action"
+            )
+        attempted_at = self._outbox.external_call_started_at(intent.effect_id)
+        if attempted_at is None:
+            raise EffectTerminalError(
+                "Publisher evidence has no durable authorized attempt timestamp"
+            )
+        return PublicationRecord(
+            record_id=f"publication:{action.action_id}:succeeded",
+            action_id=action.action_id,
+            map_id=action.map_id,
+            approval_request_id=str(intent.payload["approval_request_id"]),
+            status="succeeded",
+            revision=action.revision,
+            action=action.action,
+            target=action.target,
+            occurred_at=attempted_at,
+            evidence=evidence,
+        )
+
+    @staticmethod
+    def _publication_record_successor(
+        intent: OutboxIntent,
+        record: PublicationRecord,
+    ) -> dict[str, Any]:
+        return {
+            "effect_id": f"tracker-publication:{record.action_id}:{record.status}",
+            "payload": {
+                "issue_url": intent.payload["issue_url"],
+                "issue_id": intent.map_id,
+                "project_id": intent.payload["project_id"],
+                "record": record.payload(),
+                "acceptance_report_id": intent.payload["acceptance_report_id"],
+            },
+        }
+
     def _complete_external_effect(
         self,
         intent: OutboxIntent,
         confirmation: EffectConfirmation,
     ) -> None:
+        if intent.effect_type == PUBLISHER_EXECUTE:
+            raw_evidence = confirmation.acknowledgment.get("evidence")
+            if not isinstance(raw_evidence, dict):
+                raise EffectRetryableError(
+                    "Publisher confirmation has no immutable remote evidence"
+                )
+            evidence = RemotePublicationEvidence.from_payload(raw_evidence)
+            action = ApprovedPublicationAction.from_payload(
+                dict(intent.payload["action"])
+            )
+            incident_effect_id = (
+                f"tracker-publication:{action.action_id}:repair-required"
+            )
+            if (
+                confirmation.reconciled_by_readback
+                and self._outbox.external_call_started(intent.effect_id)
+                and self._outbox.intent(incident_effect_id) is None
+            ):
+                attempted_at = self._outbox.external_call_started_at(intent.effect_id)
+                if attempted_at is None:  # pragma: no cover - checked above
+                    raise EffectTerminalError("Publisher attempt marker disappeared")
+                incident = PublicationRecord(
+                    record_id=f"publication:{action.action_id}:repair-required",
+                    action_id=action.action_id,
+                    map_id=action.map_id,
+                    approval_request_id=str(intent.payload["approval_request_id"]),
+                    status="repair_required",
+                    revision=action.revision,
+                    action=action.action,
+                    target=action.target,
+                    occurred_at=attempted_at,
+                    reason=(
+                        "Publisher restarted after the remote-call marker; provider "
+                        "readback was required before resolution."
+                    ),
+                )
+                incident_successor = self._publication_record_successor(
+                    intent, incident
+                )
+                self._outbox.enqueue(
+                    effect_id=str(incident_successor["effect_id"]),
+                    effect_type=TRACKER_PUBLICATION_RECORD,
+                    map_id=intent.map_id,
+                    payload=dict(incident_successor["payload"]),
+                    created_at=self._synchronized_at(),
+                )
+            self._confirm_publication_incident_if_present(action_id=action.action_id)
+            record = self._successful_publication_record(intent, evidence)
+            successor = self._publication_record_successor(intent, record)
+            try:
+                self._outbox.enqueue(
+                    effect_id=str(successor["effect_id"]),
+                    effect_type=TRACKER_PUBLICATION_RECORD,
+                    map_id=intent.map_id,
+                    payload=dict(successor["payload"]),
+                    created_at=self._synchronized_at(),
+                )
+            except OutboxConflictError as error:
+                raise EffectTerminalError(
+                    "Publication evidence identity belongs to other content"
+                ) from error
+            return
+        if intent.effect_type == TRACKER_PUBLICATION_RECORD:
+            raw_record = confirmation.acknowledgment.get("record")
+            if not isinstance(raw_record, dict):
+                raise EffectRetryableError(
+                    "Tracker confirmation has no publication record"
+                )
+            record = PublicationRecord.from_payload(raw_record)
+            projection = {
+                **record.payload(),
+                "tracker": {
+                    "id": str(confirmation.acknowledgment["tracker_record_id"]),
+                    "url": str(confirmation.acknowledgment["tracker_record_url"]),
+                },
+                "confirmed_at": self._synchronized_at(),
+            }
+            self._storage.save_publication_projection(
+                map_id=intent.map_id,
+                record=projection,
+            )
+            if record.status == "succeeded":
+                try:
+                    self._outbox.enqueue(
+                        effect_id=f"tracker-close:{record.action_id}:completed",
+                        effect_type=TRACKER_ISSUE_CLOSE,
+                        map_id=intent.map_id,
+                        payload={
+                            "issue_url": intent.payload["issue_url"],
+                            "issue_id": intent.map_id,
+                            "project_id": intent.payload["project_id"],
+                            "state_reason": "completed",
+                            "expected_stage": "acceptance",
+                            "publication_record_id": record.record_id,
+                            "acceptance_report_id": intent.payload[
+                                "acceptance_report_id"
+                            ],
+                            "protected_mutation_id": record.action_id,
+                        },
+                        created_at=self._synchronized_at(),
+                    )
+                except OutboxConflictError as error:
+                    raise EffectTerminalError(
+                        "Completed closeout identity belongs to other content"
+                    ) from error
+            return
+        if intent.effect_type == TRACKER_ISSUE_CLOSE:
+            issue_payload = confirmation.acknowledgment.get("issue")
+            if not isinstance(issue_payload, dict):
+                raise EffectRetryableError(
+                    "Tracker close confirmation has no authoritative Issue"
+                )
+            issue = TrackerEffectAdapter.issue_from_payload(issue_payload)
+            card = self._stored_card(
+                issue,
+                project_id=str(intent.payload["project_id"]),
+                synchronized_at=self._synchronized_at(),
+            )
+            competing_stage = self._storage.compare_and_save_map_projection(
+                card,
+                expected_stage=str(intent.payload["expected_stage"]),
+            )
+            if competing_stage is not None and competing_stage != card["stage"]:
+                raise EffectRetryableError(
+                    "local projection changed after tracker close confirmation"
+                )
+            mutation_id = intent.payload.get("protected_mutation_id")
+            if mutation_id:
+                self._storage.confirm_protected_mutation(
+                    mutation_id=str(mutation_id),
+                    confirmed_at=self._synchronized_at(),
+                )
+            return
         if intent.effect_type == COORDINATOR_RESUME:
             try:
                 self._storage.begin_pm_turn(
@@ -6829,6 +8502,36 @@ class MapGovernanceApplication:
                 row=stored,
                 tracker={"id": tracker_record_id, "url": tracker_record_url},
             )
+            return
+        if operation == "consumption":
+            mutation_id = str(completion.get("mutation_id") or "")
+            if (
+                event.event_type != "consumed"
+                or details.get("mutation_id") != mutation_id
+                or details.get("action") != completion.get("action")
+                or approval["status"] != "consumed"
+                or approval.get("consumed_by_mutation_id") != mutation_id
+            ):
+                raise TrackerEffectPayloadConflict(
+                    "approval consumption projection has different content"
+                )
+            close_payload = completion.get("close_payload")
+            if not isinstance(close_payload, dict):
+                raise EffectRetryableError(
+                    "Approval consumption has no closeout payload"
+                )
+            try:
+                self._outbox.enqueue(
+                    effect_id=str(completion["close_effect_id"]),
+                    effect_type=TRACKER_ISSUE_CLOSE,
+                    map_id=intent.map_id,
+                    payload=close_payload,
+                    created_at=event.occurred_at,
+                )
+            except OutboxConflictError as error:
+                raise TrackerEffectPayloadConflict(
+                    "Cancellation closeout identity belongs to other content"
+                ) from error
             return
         if operation == "revocation":
             if approval["status"] == "revoked":

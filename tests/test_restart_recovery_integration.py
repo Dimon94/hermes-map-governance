@@ -606,7 +606,7 @@ def test_profile_backend_restart_matrix_recovers_real_temporary_home(
     )
     prerequisites = {
         "schema_version": 1,
-        "profiles": {"ceo": "ceo", "pm": "pm"},
+        "profiles": {"ceo": "ceo", "pm": "pm", "publisher": "default"},
         "skills": {
             "plugin": ["map-governance:ceo", "map-governance:pm"],
             "external": [

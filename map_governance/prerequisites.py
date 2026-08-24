@@ -8,7 +8,9 @@ must never initialize the registry merely to inspect it.
 from __future__ import annotations
 
 import json
+import grp
 import os
+import pwd
 import re
 import sqlite3
 import stat
@@ -37,6 +39,7 @@ from .prerequisites_setup import (
     _timestamp,
 )
 from .coordinator import CommissioningContext, CommissioningPrerequisiteError
+from .publication import publisher_subprocess_environment
 
 __all__ = [
     "CommandResult",
@@ -69,17 +72,34 @@ class CommandResult:
 
 
 class CommandRunner(Protocol):
-    def run(self, arguments: Sequence[str], *, timeout: float) -> CommandResult: ...
+    def run(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout: float,
+        environment: Mapping[str, str] | None = None,
+    ) -> CommandResult: ...
 
 
 class ReadOnlyCommandRunner:
     """Run preconstructed read-only argv without invoking a shell."""
 
-    def run(self, arguments: Sequence[str], *, timeout: float) -> CommandResult:
+    def run(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout: float,
+        environment: Mapping[str, str] | None = None,
+    ) -> CommandResult:
         argv = tuple(str(item) for item in arguments)
         try:
             completed = subprocess.run(
                 list(argv),
+                env=(
+                    publisher_subprocess_environment(environment)
+                    if environment is not None
+                    else None
+                ),
                 capture_output=True,
                 check=False,
                 text=True,
@@ -457,12 +477,12 @@ class PrerequisiteApplication:
                 _check(
                     "profiles.separation",
                     "fail",
-                    "CEO and PM profiles cannot be resolved without configuration",
+                    "CEO, PM, and publisher profiles cannot be resolved without configuration",
                     {"distinct": False},
-                    remediation="Apply the prerequisite configuration with distinct CEO and PM profile IDs.",
+                    remediation="Apply the prerequisite configuration with distinct CEO, PM, and publisher profile IDs.",
                 )
             )
-            for role in ("ceo", "pm"):
+            for role in ("ceo", "pm", "publisher"):
                 checks.append(
                     _check(
                         f"profiles.{role}",
@@ -475,21 +495,27 @@ class PrerequisiteApplication:
             return {}
         ceo = str(desired["profiles"]["ceo"])
         pm = str(desired["profiles"]["pm"])
-        distinct = ceo != pm
+        publisher = str(desired["profiles"]["publisher"])
+        distinct = len({ceo, pm, publisher}) == 3
         checks.append(
             _check(
                 "profiles.separation",
                 "pass" if distinct else "fail",
                 (
-                    "CEO and PM use independent Hermes profiles"
+                    "CEO, PM, and publisher use independent Hermes profiles"
                     if distinct
-                    else "CEO and PM must not share one Hermes profile"
+                    else "CEO, PM, and publisher must not share profiles"
                 ),
-                {"ceo_profile": ceo, "pm_profile": pm, "distinct": distinct},
+                {
+                    "ceo_profile": ceo,
+                    "pm_profile": pm,
+                    "publisher_profile": publisher,
+                    "distinct": distinct,
+                },
                 remediation=(
                     None
                     if distinct
-                    else "Choose a separate PM profile and generate a new setup plan."
+                    else "Choose separate CEO, PM, and publisher profiles and generate a new setup plan."
                 ),
             )
         )
@@ -542,6 +568,66 @@ class PrerequisiteApplication:
                     ),
                 )
             )
+        publisher_home = self._profile_resolver(publisher)
+        publisher_config = (
+            _parse_yaml_file(publisher_home / "config.yaml")
+            if publisher_home.is_dir()
+            else None
+        )
+        configs["publisher"] = publisher_config
+        publisher_plugins = (
+            publisher_config.get("plugins")
+            if isinstance(publisher_config, Mapping)
+            else None
+        )
+        publisher_enabled = (
+            publisher_plugins.get("enabled")
+            if isinstance(publisher_plugins, Mapping)
+            else None
+        )
+        publisher_toolsets = (
+            publisher_config.get("toolsets")
+            if isinstance(publisher_config, Mapping)
+            else None
+        )
+        publisher_ready = (
+            publisher_config is not None
+            and isinstance(publisher_enabled, list)
+            and PLUGIN_ID in publisher_enabled
+            and (
+                not isinstance(publisher_toolsets, list)
+                or (
+                    "map-governance-ceo" not in publisher_toolsets
+                    and "map-governance-pm" not in publisher_toolsets
+                )
+            )
+        )
+        checks.append(
+            _check(
+                "profiles.publisher",
+                "pass" if publisher_ready else "fail",
+                (
+                    "Publisher profile has CLI-only plugin authority"
+                    if publisher_ready
+                    else "Publisher profile is missing or exposes model tool authority"
+                ),
+                {
+                    "profile": publisher,
+                    "exists": publisher_home.is_dir(),
+                    "plugin_enabled": isinstance(publisher_enabled, list)
+                    and PLUGIN_ID in publisher_enabled,
+                    "ceo_toolset_absent": not isinstance(publisher_toolsets, list)
+                    or "map-governance-ceo" not in publisher_toolsets,
+                    "pm_toolset_absent": not isinstance(publisher_toolsets, list)
+                    or "map-governance-pm" not in publisher_toolsets,
+                },
+                remediation=(
+                    None
+                    if publisher_ready
+                    else "Enable only the CLI plugin entry in the dedicated publisher profile; do not expose CEO or PM model toolsets."
+                ),
+            )
+        )
         return configs
 
     def _doctor_skills(
@@ -598,6 +684,8 @@ class PrerequisiteApplication:
             root = path.parent.parent if item is not None else None
             discovered_by: list[str] = []
             for role, config in profile_configs.items():
+                if role not in {"ceo", "pm"}:
+                    continue
                 skills = config.get("skills") if isinstance(config, Mapping) else None
                 external_dirs = (
                     skills.get("external_dirs") if isinstance(skills, Mapping) else None
@@ -932,8 +1020,17 @@ class PrerequisiteApplication:
             f"number={number}",
         ]
 
-    def _run(self, arguments: Sequence[str]) -> CommandResult:
-        return self._runner.run(arguments, timeout=self._command_timeout)
+    def _run(
+        self,
+        arguments: Sequence[str],
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> CommandResult:
+        return self._runner.run(
+            arguments,
+            timeout=self._command_timeout,
+            environment=environment,
+        )
 
     @staticmethod
     def _json_result(result: CommandResult) -> tuple[dict[str, Any] | None, str]:
@@ -1148,8 +1245,42 @@ class PrerequisiteApplication:
         }
         issue_write_permissions = {"TRIAGE", "WRITE", "MAINTAIN", "ADMIN"}
         worker_ref = desired["authorities"]["worker"]["credential_ref"]
+        worker = desired["authorities"]["worker"]
         publisher = desired["authorities"]["publisher"]
-        separate_authority = worker_ref != publisher["credential_ref"]
+        publication_required = bool(publisher["required"]) or any(
+            repository["publication_required"] for repository in github["repositories"]
+        )
+        try:
+            worker_account = pwd.getpwnam(str(worker.get("os_user") or ""))
+            publisher_account_record = pwd.getpwnam(str(publisher.get("os_user") or ""))
+            control_group = grp.getgrnam(str(publisher.get("control_group") or ""))
+            worker_uid = worker_account.pw_uid
+            publisher_uid = publisher_account_record.pw_uid
+        except KeyError:
+            worker_account = None
+            publisher_account_record = None
+            control_group = None
+            worker_uid = None
+            publisher_uid = None
+        group_ready = bool(
+            control_group is not None
+            and worker_account is not None
+            and publisher_account_record is not None
+            and all(
+                account.pw_gid == control_group.gr_gid
+                or account.pw_name in control_group.gr_mem
+                for account in (worker_account, publisher_account_record)
+            )
+        )
+        separate_authority = worker_ref != publisher["credential_ref"] and (
+            not publication_required
+            or (
+                worker_uid is not None
+                and publisher_uid is not None
+                and worker_uid != publisher_uid
+                and group_ready
+            )
+        )
         checks.append(
             _check(
                 "authority.separation",
@@ -1162,13 +1293,30 @@ class PrerequisiteApplication:
                 {
                     "worker_kind": desired["authorities"]["worker"]["kind"],
                     "publisher_kind": publisher["kind"],
+                    "worker_os_user": worker.get("os_user") or None,
+                    "publisher_os_user": publisher.get("os_user") or None,
+                    "control_group": publisher.get("control_group") or None,
+                    "control_group_members": group_ready,
                     "distinct": separate_authority,
                 },
             )
         )
+        worker_git = Path(str(worker.get("git_executable") or ""))
+        try:
+            worker_git_resolved = worker_git.resolve(strict=True)
+            worker_git_metadata = worker_git_resolved.stat()
+            worker_git_ready = (
+                worker_git.is_absolute()
+                and worker_git_resolved.is_file()
+                and worker_git_metadata.st_uid in {0, worker_uid}
+                and not worker_git_metadata.st_mode & 0o022
+            )
+        except OSError:
+            worker_git_ready = False
         worker_context_matches = (
             desired["authorities"]["worker"]["kind"] == "local_git"
             and worker_ref == "local-git"
+            and (not publication_required or worker_git_ready)
         )
         checks.append(
             _check(
@@ -1182,30 +1330,159 @@ class PrerequisiteApplication:
                 {
                     "kind": desired["authorities"]["worker"]["kind"],
                     "local_git_reference": worker_context_matches,
+                    "trusted_git_executable": worker_git_ready,
                     "remote_publication_required": False,
                 },
             )
         )
-        publisher_context_matches = (
+        gh_config_dir = Path(str(publisher.get("gh_config_dir") or ""))
+        try:
+            config_metadata = gh_config_dir.stat()
+        except OSError:
+            config_metadata = None
+        config_contract_ready = (
+            gh_config_dir.is_absolute()
+            and gh_config_dir.is_dir()
+            and gh_config_dir.resolve() == gh_config_dir
+            and config_metadata is not None
+            and publisher_uid is not None
+            and config_metadata.st_uid == publisher_uid
+            and not config_metadata.st_mode & 0o077
+            and worker_uid != publisher_uid
+        )
+        config_ready = config_contract_ready and os.geteuid() == publisher_uid
+        executable_paths = (
+            Path(str(publisher.get("git_executable") or "")),
+            Path(str(publisher.get("gh_executable") or "")),
+        )
+
+        def trusted_executable(path: Path) -> bool:
+            try:
+                resolved = path.resolve(strict=True)
+                metadata = resolved.stat()
+            except OSError:
+                return False
+            return (
+                path.is_absolute()
+                and resolved.is_file()
+                and metadata.st_uid in {0, publisher_uid}
+                and not metadata.st_mode & 0o022
+            )
+
+        executables_ready = all(trusted_executable(path) for path in executable_paths)
+        publisher_account = None
+        publisher_repositories_ready = True
+        if publication_required and config_ready and executables_ready:
+            isolated_environment = {
+                "GH_CONFIG_DIR": str(gh_config_dir),
+                "HOME": str(gh_config_dir),
+            }
+            publisher_auth_arguments = [
+                str(publisher["gh_executable"]),
+                "auth",
+                "status",
+                "--active",
+                "--hostname",
+                host,
+                "--json",
+                "hosts",
+            ]
+            publisher_payload, publisher_outcome = self._json_result(
+                self._run(
+                    publisher_auth_arguments,
+                    environment=isolated_environment,
+                )
+            )
+            if publisher_payload is not None:
+                hosts = publisher_payload.get("hosts")
+                accounts = hosts.get(host) if isinstance(hosts, Mapping) else None
+                active = next(
+                    (
+                        item
+                        for item in accounts or []
+                        if isinstance(item, Mapping)
+                        and item.get("active") is True
+                        and item.get("state") == "success"
+                    ),
+                    None,
+                )
+                publisher_account = (
+                    str(active.get("login") or "") if active is not None else None
+                )
+            if publisher_outcome != "success":
+                publisher_account = None
+            for repository in github["repositories"]:
+                if not repository["publication_required"]:
+                    continue
+                result = self._run(
+                    [
+                        str(publisher["gh_executable"]),
+                        "repo",
+                        "view",
+                        f"{host}/{repository['coordinate']}",
+                        "--json",
+                        "nameWithOwner,viewerPermission,isArchived",
+                    ],
+                    environment=isolated_environment,
+                )
+                payload, outcome = self._json_result(result)
+                permission = (
+                    payload.get("viewerPermission")
+                    if isinstance(payload, Mapping)
+                    else None
+                )
+                publisher_repositories_ready = (
+                    publisher_repositories_ready
+                    and outcome == "success"
+                    and isinstance(payload, Mapping)
+                    and payload.get("nameWithOwner") == repository["coordinate"]
+                    and payload.get("isArchived") is False
+                    and permission in {"WRITE", "MAINTAIN", "ADMIN"}
+                )
+        elif publication_required:
+            publisher_repositories_ready = False
+        live_publisher_context_matches = (
             publisher["kind"] == "gh"
             and publisher["credential_ref"] == f"gh:{host}:{publisher['account']}"
-            and bool(account)
-            and publisher["account"] == account
+            and bool(publisher_account)
+            and publisher["account"] == publisher_account
+            and config_ready
+            and executables_ready
+            and publisher_repositories_ready
         )
-        publisher_required = bool(publisher["required"])
+        isolated_publisher_configured = (
+            publication_required
+            and worker_uid is not None
+            and os.geteuid() == worker_uid
+            and publisher_uid is not None
+            and worker_uid != publisher_uid
+            and group_ready
+            and publisher["kind"] == "gh"
+            and publisher["credential_ref"] == f"gh:{host}:{publisher['account']}"
+            and config_contract_ready
+            and executables_ready
+        )
+        publisher_required = publication_required
         checks.append(
             _check(
                 "authority.publisher",
                 (
                     "pass"
-                    if publisher_context_matches
+                    if live_publisher_context_matches
+                    else "warning"
+                    if isolated_publisher_configured
                     else "fail"
                     if publisher_required
                     else "warning"
                 ),
                 (
-                    "Publisher provider reference matches the active gh account"
-                    if publisher_context_matches
+                    (
+                        "Isolated publisher service configuration is ready; active "
+                        "credentials are verified only in the publisher process"
+                        if isolated_publisher_configured
+                        else "Publisher provider reference matches the active gh account"
+                    )
+                    if live_publisher_context_matches or isolated_publisher_configured
                     else (
                         "Required publisher provider reference is unavailable"
                         if publisher_required
@@ -1216,12 +1493,20 @@ class PrerequisiteApplication:
                     "kind": publisher["kind"],
                     "provider_reference": publisher["credential_ref"],
                     "expected_account": publisher["account"] or None,
-                    "active_account_matches": publisher_context_matches,
+                    "active_account_matches": bool(publisher_account)
+                    and publisher["account"] == publisher_account,
+                    "os_identity_matches": publisher_uid is not None
+                    and os.geteuid() == publisher_uid,
+                    "config_owner_only": config_ready,
+                    "trusted_executables": executables_ready,
+                    "control_group_members": group_ready,
+                    "isolated_service_configured": isolated_publisher_configured,
+                    "publication_repositories_ready": publisher_repositories_ready,
                     "required": publisher_required,
                 },
                 remediation=(
                     None
-                    if publisher_context_matches
+                    if live_publisher_context_matches or isolated_publisher_configured
                     else (
                         "Activate the referenced gh host/account before publication; doctor never copies its credential."
                         if publisher_required
@@ -1302,8 +1587,10 @@ class PrerequisiteApplication:
             if local_ready:
                 try:
                     mode = stat.S_IMODE(path.stat().st_mode)
-                    owner_writable = bool(mode & stat.S_IWUSR) and (
-                        not hasattr(os, "geteuid") or path.stat().st_uid == os.geteuid()
+                    owner_writable = bool(
+                        mode & stat.S_IWUSR
+                    ) and path.stat().st_uid == (
+                        worker_uid if worker_uid is not None else os.geteuid()
                     )
                 except OSError:
                     owner_writable = False
@@ -1361,17 +1648,27 @@ class PrerequisiteApplication:
             publisher_ready = (
                 publication_required
                 and separate_authority
-                and publisher_context_matches
+                and live_publisher_context_matches
                 and publisher["required"] is True
-                and permission_levels.get(permission, 0) >= 2
+                and publisher_repositories_ready
             )
             if publication_required:
-                publisher_status = "pass" if publisher_ready else "fail"
-                publisher_summary = (
-                    "Publisher has separate remote publication authority"
-                    if publisher_ready
-                    else "Required publisher authority is unavailable or unverified"
-                )
+                if publisher_ready:
+                    publisher_status = "pass"
+                    publisher_summary = (
+                        "Publisher has isolated verified remote publication authority"
+                    )
+                elif isolated_publisher_configured:
+                    publisher_status = "warning"
+                    publisher_summary = (
+                        "Publisher service is configured; live repository capability "
+                        "is verified only in the publisher process before mutation"
+                    )
+                else:
+                    publisher_status = "fail"
+                    publisher_summary = (
+                        "Required publisher authority is unavailable or unverified"
+                    )
             else:
                 publisher_status = "warning"
                 publisher_summary = (

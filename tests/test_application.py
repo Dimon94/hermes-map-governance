@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from map_governance import (
+    MapBindingError,
     MapGovernanceApplication,
     MapTransitionConflict,
     MapTransitionError,
@@ -303,7 +304,15 @@ def test_operator_binds_an_existing_issue_once_as_a_complete_map_card(tmp_path):
 
 
 def test_board_groups_multiple_maps_without_mixing_project_identity(tmp_path):
-    application = _application(tmp_path, ControllableTracker())
+    tracker = ControllableTracker()
+    octocat_issue = "https://github.com/octocat/hello-world/issues/9"
+    tracker.issues[octocat_issue] = replace(
+        tracker.issues[octocat_issue],
+        state="open",
+        state_reason=None,
+        labels=("map", "map-stage/parked"),
+    )
+    application = _application(tmp_path, tracker)
     acme = application.configure_project(
         project_url="https://github.com/orgs/acme/projects/7"
     )
@@ -321,7 +330,7 @@ def test_board_groups_multiple_maps_without_mixing_project_identity(tmp_path):
     )
     application.bind_map(
         project_id=octocat["id"],
-        issue_url="https://github.com/octocat/hello-world/issues/9",
+        issue_url=octocat_issue,
     )
 
     groups = {group["id"]: group for group in application.board()["projects"]}
@@ -332,8 +341,7 @@ def test_board_groups_multiple_maps_without_mixing_project_identity(tmp_path):
     assert [card["tracker"]["identity"] for card in groups[octocat["id"]]["maps"]] == [
         "octocat/hello-world#9"
     ]
-    assert groups[octocat["id"]]["maps"][0]["stage"] == "cancelled"
-    assert groups[octocat["id"]]["maps"][0]["available_transitions"] == []
+    assert groups[octocat["id"]]["maps"][0]["stage"] == "parked"
     assert all(
         card["project"]["id"] == group["id"]
         for group in groups.values()
@@ -903,7 +911,7 @@ def test_governance_lifecycle_accepts_each_defined_transition(
     ] == [f"map-stage/{requested_stage}"]
 
 
-def test_completed_issue_projects_done_without_an_active_stage_label(tmp_path):
+def test_completed_issue_without_governed_lineage_cannot_be_bound_as_done(tmp_path):
     tracker = ControllableTracker()
     issue_url = "https://github.com/acme/atlas/issues/41"
     tracker.issues[issue_url] = replace(
@@ -917,21 +925,7 @@ def test_completed_issue_projects_done_without_an_active_stage_label(tmp_path):
         project_url="https://github.com/orgs/acme/projects/7"
     )
 
-    card = application.bind_map(project_id=project["id"], issue_url=issue_url)
+    with pytest.raises(MapBindingError, match="governed publication lineage"):
+        application.bind_map(project_id=project["id"], issue_url=issue_url)
 
-    assert card["stage"] == "done"
-    assert card["available_transitions"] == []
-
-    with pytest.raises(MapTransitionError) as raised:
-        application.transition_map(
-            map_id=card["id"],
-            expected_stage="done",
-            requested_stage="delivery",
-        )
-
-    assert raised.value.current_stage == "done"
-    assert raised.value.requested_stage == "delivery"
-    assert raised.value.reason == (
-        "terminal Map stages can only change by reopening the tracker Issue"
-    )
     assert tracker.transition_calls == []

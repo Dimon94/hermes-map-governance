@@ -102,6 +102,14 @@ def test_native_maps_commands_delegate_to_the_application(
             calls.append(("repair_outbox", arguments))
             return {"operation": "repair_outbox"}
 
+        def publish_map(self, **arguments):
+            calls.append(("publish_map", arguments))
+            return {"operation": "publish_map"}
+
+        def reconcile_publication(self, **arguments):
+            calls.append(("reconcile_publication", arguments))
+            return {"operation": "reconcile_publication"}
+
     monkeypatch.setattr(
         native, "application_for_storage", lambda root: ApplicationProbe()
     )
@@ -111,6 +119,11 @@ def test_native_maps_commands_delegate_to_the_application(
         lambda profile: (
             calls.append(("profile", {"profile": profile})) or ApplicationProbe()
         ),
+    )
+    monkeypatch.setattr(
+        native,
+        "publisher_application_for_profile",
+        lambda _control, **_settings: ApplicationProbe(),
     )
     registrations = []
     context = SimpleNamespace(
@@ -202,9 +215,35 @@ def test_native_maps_commands_delegate_to_the_application(
                 "Verified downstream.",
             ]
         ),
+        parser.parse_args(
+            [
+                "publish",
+                "--map",
+                "I_atlas_41",
+                "--control-profile",
+                "ceo",
+                "--approval-request",
+                "publish-main-a",
+                "--mutation-id",
+                "publish-main-a-action",
+            ]
+        ),
+        parser.parse_args(
+            [
+                "reconcile-publication",
+                "--map",
+                "I_atlas_41",
+                "--control-profile",
+                "ceo",
+                "--action-id",
+                "publish-main-a-action",
+            ]
+        ),
     ]
 
     assert [command["handler_fn"](args) for args in arguments] == [
+        0,
+        0,
         0,
         0,
         0,
@@ -234,6 +273,8 @@ def test_native_maps_commands_delegate_to_the_application(
         {"operation": "outbox_status"},
         {"operation": "recover_outbox"},
         {"operation": "repair_outbox"},
+        {"operation": "publish_map"},
+        {"operation": "reconcile_publication"},
     ]
     assert calls == [
         (
@@ -293,6 +334,18 @@ def test_native_maps_commands_delegate_to_the_application(
                 "repair_id": "repair-001",
                 "note": "Verified downstream.",
             },
+        ),
+        (
+            "publish_map",
+            {
+                "map_id": "I_atlas_41",
+                "approval_request_id": "publish-main-a",
+                "mutation_id": "publish-main-a-action",
+            },
+        ),
+        (
+            "reconcile_publication",
+            {"map_id": "I_atlas_41", "action_id": "publish-main-a-action"},
         ),
     ]
 
@@ -656,6 +709,62 @@ def test_native_open_prints_structured_session_repair_failure(
             "type": "repair_required",
             "reason": "multiple_exact_canonical_sessions",
             "candidate_count": 2,
+            "retryable": False,
+        }
+    }
+
+
+def test_native_publish_denies_a_non_publisher_request_profile(
+    tmp_path, monkeypatch, capsys
+):
+    def deny_publisher_profile(_control, **_settings):
+        raise native.ProfileResolutionError("profile mismatch")
+
+    monkeypatch.setattr(
+        native,
+        "application_for_storage",
+        lambda _root: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        native,
+        "publisher_application_for_profile",
+        deny_publisher_profile,
+    )
+    registrations = []
+    context = SimpleNamespace(
+        state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
+        profile_name="pm",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
+        register_cli_command=lambda **command: registrations.append(command),
+    )
+    native.register(context)
+    parser = ArgumentParser()
+    registrations[0]["setup_fn"](parser)
+
+    result = registrations[0]["handler_fn"](
+        parser.parse_args(
+            [
+                "publish",
+                "--map",
+                "I_atlas_41",
+                "--control-profile",
+                "ceo",
+                "--approval-request",
+                "publish-main-a",
+                "--mutation-id",
+                "publish-main-a-action",
+            ]
+        )
+    )
+
+    assert result == 1
+    assert json.loads(capsys.readouterr().err) == {
+        "error": {
+            "type": "publisher_profile_denied",
+            "map_id": "I_atlas_41",
+            "reason": "request profile has no privileged publisher capability",
             "retryable": False,
         }
     }

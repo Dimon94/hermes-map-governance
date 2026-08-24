@@ -14,6 +14,7 @@ import yaml
 from .approvals import ApprovalHistoryEvent, normalized_json
 from .coordinator import DeliveryLaneRegistry
 from .reports import PMReport, TrackerPMReportRecord
+from .publication import PublicationRecord
 from .stages import ACTIVE_STAGES, executive_stage
 
 
@@ -143,6 +144,15 @@ class TrackerApprovalRecord:
 
 
 @dataclass(frozen=True)
+class TrackerPublicationRecord:
+    """Immutable publication evidence confirmed in Map Issue history."""
+
+    record: PublicationRecord
+    tracker_record_id: str
+    tracker_record_url: str
+
+
+@dataclass(frozen=True)
 class TrackerDeliveryLaneRegistryRecord:
     """One delivery-pipeline registry checkpoint read from ticket history."""
 
@@ -194,6 +204,24 @@ class TrackerAdapter(Protocol):
         report: PMReport,
     ) -> TrackerPMReportRecord: ...
 
+    def list_publication_records(self, url: str) -> list[TrackerPublicationRecord]: ...
+
+    def append_publication_record(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        record: PublicationRecord,
+    ) -> TrackerPublicationRecord: ...
+
+    def close_issue(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        state_reason: str,
+    ) -> TrackerIssue: ...
+
     def list_delivery_lane_registries(
         self, url: str
     ) -> list[TrackerDeliveryLaneRegistryRecord]: ...
@@ -214,10 +242,20 @@ class CommandRunner(Protocol):
 class SubprocessCommandRunner:
     """Run one argv-safe command and return its standard output."""
 
+    def __init__(
+        self,
+        *,
+        environment: Mapping[str, str] | None = None,
+        redact_errors: bool = False,
+    ) -> None:
+        self._environment = dict(environment) if environment is not None else None
+        self._redact_errors = redact_errors
+
     def run(self, arguments: Sequence[str]) -> str:
         try:
             completed = subprocess.run(
                 list(arguments),
+                env=self._environment,
                 capture_output=True,
                 check=False,
                 text=True,
@@ -226,6 +264,10 @@ class SubprocessCommandRunner:
         except (OSError, subprocess.TimeoutExpired) as error:
             raise TrackerError(f"GitHub CLI request failed: {error}") from error
         if completed.returncode != 0:
+            if self._redact_errors:
+                raise TrackerError(
+                    f"GitHub CLI request failed with exit status {completed.returncode}"
+                )
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise TrackerError(f"GitHub CLI request failed: {detail}")
         return completed.stdout
@@ -332,6 +374,28 @@ _APPEND_PM_REPORT_MUTATION = _APPEND_DECISION_MUTATION.replace(
 )
 
 
+_APPEND_PUBLICATION_MUTATION = _APPEND_DECISION_MUTATION.replace(
+    "MapGovernanceAppendDecision",
+    "MapGovernanceAppendPublication",
+)
+
+
+_CLOSE_ISSUE_MUTATION = """
+mutation MapGovernanceCloseIssue(
+  $issue: ID!,
+  $stateReason: IssueClosedStateReason!
+) {
+  updateIssue(input: {
+    id: $issue,
+    state: CLOSED,
+    stateReason: $stateReason
+  }) {
+    issue { id state stateReason }
+  }
+}
+"""
+
+
 _APPEND_DELIVERY_LANE_MUTATION = _APPEND_DECISION_MUTATION.replace(
     "MapGovernanceAppendDecision",
     "MapGovernanceAppendDeliveryLaneRegistry",
@@ -366,6 +430,12 @@ _PM_REPORT_HISTORY_QUERY = _DECISION_HISTORY_QUERY.replace(
 )
 
 
+_PUBLICATION_HISTORY_QUERY = _DECISION_HISTORY_QUERY.replace(
+    "MapGovernanceDecisionHistory",
+    "MapGovernancePublicationHistory",
+)
+
+
 _DELIVERY_LANE_HISTORY_QUERY = _DECISION_HISTORY_QUERY.replace(
     "MapGovernanceDecisionHistory",
     "MapGovernanceDeliveryLaneHistory",
@@ -378,6 +448,8 @@ _APPROVAL_MARKER_PREFIX = "<!-- map-governance:approval:v1 "
 _APPROVAL_MARKER_SUFFIX = " -->"
 _PM_REPORT_MARKER_PREFIX = "<!-- map-governance:pm-report:v1 "
 _PM_REPORT_MARKER_SUFFIX = " -->"
+_PUBLICATION_MARKER_PREFIX = "<!-- map-governance:publication:v1 "
+_PUBLICATION_MARKER_SUFFIX = " -->"
 _DELIVERY_LANE_MARKER = "<!-- wayfinder-lane-registry:v1 -->"
 
 
@@ -675,6 +747,83 @@ class GitHubTrackerAdapter:
             )
         ]
 
+    def append_publication_record(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        record: PublicationRecord,
+    ) -> TrackerPublicationRecord:
+        """Append and read back immutable publication evidence or an incident."""
+        committed, record_id, record_url = self._append_structured_comment(
+            query=_APPEND_PUBLICATION_MUTATION,
+            subject_id=issue_id,
+            body=self._publication_comment_body(record),
+            parser=self._publication_from_comment,
+            expected=record,
+            record_kind="publication record",
+            requested_kind="publication record",
+            url=url,
+        )
+        return TrackerPublicationRecord(
+            record=committed,
+            tracker_record_id=record_id,
+            tracker_record_url=record_url,
+        )
+
+    def list_publication_records(self, url: str) -> list[TrackerPublicationRecord]:
+        """Read publication evidence and incidents from complete Issue history."""
+        return [
+            TrackerPublicationRecord(
+                record=self._publication_from_comment(body),
+                tracker_record_id=record_id,
+                tracker_record_url=record_url,
+            )
+            for body, record_id, record_url in self._structured_comment_history(
+                url,
+                query=_PUBLICATION_HISTORY_QUERY,
+                marker_prefix=_PUBLICATION_MARKER_PREFIX,
+                record_kind="publication record",
+            )
+        ]
+
+    def close_issue(
+        self,
+        url: str,
+        *,
+        issue_id: str,
+        state_reason: str,
+    ) -> TrackerIssue:
+        """Close one exact Issue and verify its authoritative close reason."""
+        if state_reason not in {"completed", "not_planned"}:
+            raise ValueError("Issue close reason is not supported")
+        current = self.get_issue(url)
+        if current.id != issue_id:
+            raise TrackerError("Bound GitHub Issue identity changed")
+        if current.state == "closed":
+            if current.state_reason == state_reason:
+                return current
+            raise TrackerError("GitHub Issue is already closed with another reason")
+        payload = self._graphql(
+            _CLOSE_ISSUE_MUTATION,
+            issue=issue_id,
+            stateReason=("COMPLETED" if state_reason == "completed" else "NOT_PLANNED"),
+        )
+        try:
+            mutated = payload["data"]["updateIssue"]["issue"]
+        except (KeyError, TypeError) as error:
+            raise TrackerError("GitHub Issue close response is incomplete") from error
+        if not isinstance(mutated, dict) or str(mutated.get("id")) != issue_id:
+            raise TrackerError("GitHub did not close the requested Issue")
+        committed = self.get_issue(url)
+        if (
+            committed.id != issue_id
+            or committed.state != "closed"
+            or committed.state_reason != state_reason
+        ):
+            raise TrackerError("GitHub Issue close was not confirmed by readback")
+        return committed
+
     def append_delivery_lane_registry(
         self,
         url: str,
@@ -853,6 +1002,7 @@ class GitHubTrackerAdapter:
             "rejected": "Chairman rejected",
             "revision": "Chairman requested revision",
             "revoked": "Chairman revoked approval",
+            "consumed": "Approved action consumed",
         }[event.event_type]
         details = event.details
         lines = [
@@ -941,6 +1091,56 @@ class GitHubTrackerAdapter:
             return PMReport.from_payload(payload)
         except (TypeError, ValueError) as error:
             raise TrackerError("GitHub PM report comment marker is invalid") from error
+
+    @staticmethod
+    def _publication_comment_body(record: PublicationRecord) -> str:
+        marker = json.dumps(
+            record.payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        title = (
+            "Remote publication confirmed"
+            if record.status == "succeeded"
+            else "Publication repair required"
+        )
+        lines = [
+            f"{_PUBLICATION_MARKER_PREFIX}{marker}{_PUBLICATION_MARKER_SUFFIX}",
+            f"## {title} · {record.action_id}",
+            "",
+            f"- Status: {record.status}",
+            f"- Revision: `{record.revision}`",
+            f"- Action: {record.action}",
+            "- Target: `" + normalized_json(record.target) + "`",
+            f"- Approval: {record.approval_request_id}",
+            f"- Timestamp: {record.occurred_at}",
+        ]
+        if record.evidence is not None:
+            lines.extend(
+                (
+                    f"- Provider: {record.evidence.provider}",
+                    f"- Remote evidence: {record.evidence.remote_url}",
+                )
+            )
+        if record.reason is not None:
+            lines.extend(("", record.reason))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _publication_from_comment(body: str) -> PublicationRecord:
+        try:
+            payload = GitHubTrackerAdapter._structured_marker_payload(
+                body,
+                prefix=_PUBLICATION_MARKER_PREFIX,
+                suffix=_PUBLICATION_MARKER_SUFFIX,
+                record_kind="publication record",
+            )
+            return PublicationRecord.from_payload(payload)
+        except (TypeError, ValueError) as error:
+            raise TrackerError(
+                "GitHub publication comment marker is invalid"
+            ) from error
 
     @staticmethod
     def _delivery_lane_registry_body(registry: DeliveryLaneRegistry) -> str:

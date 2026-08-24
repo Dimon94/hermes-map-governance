@@ -14,6 +14,7 @@ from .application import (
     GovernanceAuthorizationError,
     MapBindingError,
     MapTransitionError,
+    PublicationRepairRequired,
     StaleProjectionError,
 )
 from .coordinator import (
@@ -25,8 +26,10 @@ from .ceo_tool import register_ceo_capabilities
 from .pm_tool import register_pm_capabilities
 from .prerequisites import SetupApplyError
 from .runtime import (
+    ProfileResolutionError,
     application_for_profile,
     application_for_storage,
+    publisher_application_for_profile,
     prerequisite_application_for_storage,
 )
 from .tracker import TrackerError
@@ -164,6 +167,37 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
         help="Stable idempotency identity for a protected transition attempt",
     )
 
+    publish = commands.add_parser(
+        "publish", help="Execute one chairman-approved action as the publisher"
+    )
+    publish.add_argument("--map", required=True, help="Bound Map Issue node id")
+    publish.add_argument(
+        "--control-profile",
+        required=True,
+        help="Canonical CEO/control-plane profile owning governance storage",
+    )
+    publish.add_argument(
+        "--approval-request", required=True, help="Approved publication request id"
+    )
+    publish.add_argument(
+        "--mutation-id", required=True, help="Stable publication action identity"
+    )
+    reconcile_publication = commands.add_parser(
+        "reconcile-publication",
+        help="Resolve an uncertain publication by provider readback only",
+    )
+    reconcile_publication.add_argument(
+        "--map", required=True, help="Bound Map Issue node id"
+    )
+    reconcile_publication.add_argument(
+        "--control-profile",
+        required=True,
+        help="Canonical CEO/control-plane profile owning governance storage",
+    )
+    reconcile_publication.add_argument(
+        "--action-id", required=True, help="Existing publication action identity"
+    )
+
     outbox = commands.add_parser("outbox", help="Inspect and recover durable effects")
     outbox_commands = outbox.add_subparsers(dest="outbox_command", required=True)
     status = outbox_commands.add_parser("status", help="Inspect one durable effect")
@@ -286,6 +320,53 @@ def register(ctx) -> None:
                         },
                         sort_keys=True,
                     ),
+                    file=sys.stderr,
+                )
+                return 1
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        if args.maps_command in {"publish", "reconcile-publication"}:
+            try:
+                privileged = publisher_application_for_profile(
+                    args.control_profile,
+                    request_profile_name=ctx.profile_name,
+                )
+                report = (
+                    privileged.publish_map(
+                        map_id=args.map,
+                        approval_request_id=args.approval_request,
+                        mutation_id=args.mutation_id,
+                    )
+                    if args.maps_command == "publish"
+                    else privileged.reconcile_publication(
+                        map_id=args.map,
+                        action_id=args.action_id,
+                    )
+                )
+            except ProfileResolutionError:
+                print(
+                    json.dumps(
+                        {
+                            "error": {
+                                "type": "publisher_profile_denied",
+                                "map_id": args.map,
+                                "reason": "request profile has no privileged publisher capability",
+                                "retryable": False,
+                            }
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            except (
+                ApprovalEnforcementError,
+                ApprovalRequestConflict,
+                GovernanceAuthorizationError,
+                PublicationRepairRequired,
+            ) as error:
+                print(
+                    json.dumps({"error": error.as_dict()}, sort_keys=True),
                     file=sys.stderr,
                 )
                 return 1

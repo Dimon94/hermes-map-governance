@@ -69,6 +69,7 @@ elif any(
         "MapGovernanceDecisionHistory",
         "MapGovernanceApprovalHistory",
         "MapGovernancePMReportHistory",
+        "MapGovernancePublicationHistory",
     )
 ):
     url = next(value.removeprefix("url=") for value in arguments if value.startswith("url="))

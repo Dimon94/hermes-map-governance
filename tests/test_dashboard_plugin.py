@@ -363,6 +363,10 @@ def test_rest_binding_and_refresh_routes_delegate_with_explicit_profile(
             calls.append(("transition_map", arguments))
             return {"operation": "transition_map"}
 
+        def cancel_map(self, **arguments):
+            calls.append(("cancel_map", arguments))
+            return {"operation": "cancel_map"}
+
         def map_detail(self, **arguments):
             calls.append(("map_detail", arguments))
             return {"operation": "map_detail"}
@@ -755,6 +759,10 @@ def test_rest_chairman_decision_uses_authenticated_request_identity(
             calls.append(("transition_map", arguments))
             return {"operation": "transition_map"}
 
+        def cancel_map(self, **arguments):
+            calls.append(("cancel_map", arguments))
+            return {"operation": "cancel_map"}
+
     monkeypatch.setattr(
         adapter,
         "application_for_profile",
@@ -781,11 +789,23 @@ def test_rest_chairman_decision_uses_authenticated_request_identity(
                     "mutation_id": "transition-1",
                 },
             )
-        return decision, transition
+            cancellation = await client.post(
+                "/api/plugins/map-governance/maps/I_atlas_41/cancel?profile=ceo",
+                json={
+                    "approval_request_id": "cancel-approval-1",
+                    "mutation_id": "cancel-action-1",
+                },
+            )
+        return decision, transition, cancellation
 
-    decision, transition = asyncio.run(exercise_routes())
+    decision, transition, cancellation = asyncio.run(exercise_routes())
 
-    assert decision.status_code == transition.status_code == 200
+    assert (
+        decision.status_code
+        == transition.status_code
+        == cancellation.status_code
+        == 200
+    )
     actor = calls[0][1]["actor_identity"]
     assert actor.role == "chairman"
     assert actor.profile_name == "ceo"
@@ -794,6 +814,15 @@ def test_rest_chairman_decision_uses_authenticated_request_identity(
     assert calls[1][1]["actor_identity"] == actor
     assert calls[1][1]["approval_request_id"] == "approval-1"
     assert calls[1][1]["mutation_id"] == "transition-1"
+    assert calls[2] == (
+        "cancel_map",
+        {
+            "map_id": "I_atlas_41",
+            "actor_identity": actor,
+            "approval_request_id": "cancel-approval-1",
+            "mutation_id": "cancel-action-1",
+        },
+    )
 
 
 def test_rest_chairman_decision_rejects_missing_interactive_identity(

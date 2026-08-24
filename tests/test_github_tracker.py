@@ -7,6 +7,12 @@ import pytest
 from map_governance.approvals import ApprovalHistoryEvent
 from map_governance.coordinator import DeliveryLaneRegistry
 from map_governance.reports import PMReport, PMReportDraft
+from map_governance.publication import (
+    AcceptanceEvidence,
+    PublicationAction,
+    PublicationRecord,
+    RemotePublicationEvidence,
+)
 from map_governance.tracker import (
     GitHubTrackerAdapter,
     StructuredDecision,
@@ -25,6 +31,20 @@ class ScriptedRunner:
     def run(self, arguments):
         self.calls.append(list(arguments))
         return json.dumps(self.payloads.pop(0))
+
+
+def _acceptance_evidence() -> AcceptanceEvidence:
+    return AcceptanceEvidence(
+        revision="a" * 40,
+        delivered_scope=("The declared outcome is delivered.",),
+        validations=("The outcome-level acceptance suite passed.",),
+        known_limitations=(),
+        rollback_considerations=("Restore the previous remote revision.",),
+        requested_publication_action=PublicationAction(
+            action="push",
+            target={"repository": "acme/atlas", "ref": "refs/heads/main"},
+        ),
+    )
 
 
 def _issue_resource(*, stage="authorized"):
@@ -546,6 +566,7 @@ def test_github_pm_report_history_reconstructs_authoritative_records():
             summary="Outcome evidence is ready for executive review.",
             timestamp="2026-08-23T10:30:00Z",
             evidence=("The outcome-level acceptance suite passed.",),
+            acceptance=_acceptance_evidence(),
         ),
     )
     marker = json.dumps(
@@ -584,6 +605,66 @@ def test_github_pm_report_history_reconstructs_authoritative_records():
 
     assert [record.report for record in records] == [report]
     assert records[0].tracker_record_id == "IC_pm_acceptance_1"
+
+
+def test_github_publication_marker_round_trips_immutable_remote_evidence():
+    evidence = RemotePublicationEvidence(
+        action_id="publish-atlas-main-a",
+        revision="a" * 40,
+        action="push",
+        target={"repository": "acme/atlas", "ref": "refs/heads/main"},
+        provider="github",
+        remote_id="commit-a",
+        remote_url="https://github.com/acme/atlas/commit/" + "a" * 40,
+        published_at="2026-08-24T08:05:00Z",
+    )
+    record = PublicationRecord(
+        record_id="publication:publish-atlas-main-a:succeeded",
+        action_id=evidence.action_id,
+        map_id="I_atlas_41",
+        approval_request_id="approval-publish-atlas-main-a",
+        status="succeeded",
+        revision=evidence.revision,
+        action=evidence.action,
+        target=evidence.target,
+        occurred_at=evidence.published_at,
+        evidence=evidence,
+    )
+
+    body = GitHubTrackerAdapter._publication_comment_body(record)
+
+    assert body.startswith("<!-- map-governance:publication:v1 ")
+    assert "Remote publication confirmed" in body
+    assert GitHubTrackerAdapter._publication_from_comment(body) == record
+
+
+@pytest.mark.parametrize(
+    ("reason", "graphql_reason"),
+    [("completed", "COMPLETED"), ("not_planned", "NOT_PLANNED")],
+)
+def test_github_issue_close_uses_exact_reason_and_requires_readback(
+    reason,
+    graphql_reason,
+):
+    closed = _issue_resource(stage="acceptance")
+    closed["state"] = "CLOSED"
+    closed["stateReason"] = graphql_reason
+    runner = ScriptedRunner(
+        {"data": {"resource": _issue_resource(stage="acceptance")}},
+        {"data": {"updateIssue": {"issue": {"id": "I_atlas_41"}}}},
+        {"data": {"resource": closed}},
+    )
+
+    issue = GitHubTrackerAdapter(runner=runner).close_issue(
+        _issue_resource()["url"],
+        issue_id="I_atlas_41",
+        state_reason=reason,
+    )
+
+    assert issue.state == "closed"
+    assert issue.state_reason == reason
+    mutation = runner.calls[1]
+    assert f"stateReason={graphql_reason}" in mutation
 
 
 def test_delivery_lane_registry_marker_round_trips_the_public_contract():

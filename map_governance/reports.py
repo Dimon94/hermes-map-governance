@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import json
 from typing import Any
+
+from .publication import AcceptanceEvidence
 
 
 PM_REPORT_TYPES = frozenset(
@@ -67,6 +69,8 @@ class PMReportDraft:
     decision_class: str | None = None
     scope: dict[str, Any] | None = None
     options: tuple[str, ...] = ()
+    acceptance: AcceptanceEvidence | None = None
+    _historical_payload: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -102,6 +106,21 @@ class PMReportDraft:
             )
         if self.report_type == "acceptance" and not self.evidence:
             raise ValueError("PM acceptance report must include evidence")
+        if (
+            self.report_type == "acceptance"
+            and self.acceptance is None
+            and not self._historical_payload
+        ):
+            raise ValueError(
+                "PM acceptance report must include structured acceptance evidence"
+            )
+        if self.acceptance is not None:
+            if self.report_type != "acceptance":
+                raise ValueError(
+                    "Only a PM acceptance report may include acceptance evidence"
+                )
+            if not isinstance(self.acceptance, AcceptanceEvidence):
+                raise TypeError("PM acceptance evidence has an invalid type")
         if self.report_type == "question":
             object.__setattr__(
                 self,
@@ -162,6 +181,8 @@ class PMReportDraft:
             payload["decision_class"] = self.decision_class
             payload["scope"] = self.scope
             payload["options"] = list(self.options)
+        if self.acceptance is not None:
+            payload["acceptance"] = self.acceptance.payload()
         return payload
 
 
@@ -189,6 +210,11 @@ class PMReport:
         normalized = dict(payload)
         assignment_map_id = normalized.pop("assignment_map_id", None)
         normalized["report_type"] = normalized.pop("type", None)
+        raw_acceptance = normalized.get("acceptance")
+        if isinstance(raw_acceptance, dict):
+            normalized["acceptance"] = AcceptanceEvidence.from_payload(raw_acceptance)
+        elif normalized.get("report_type") == "acceptance":
+            normalized["_historical_payload"] = True
         return cls(
             assignment_map_id=assignment_map_id,
             content=PMReportDraft(**normalized),

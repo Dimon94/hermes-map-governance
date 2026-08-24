@@ -403,8 +403,8 @@
     authorized: ["delivery", "parked"],
     delivery: ["decision", "acceptance", "parked"],
     decision: ["delivery", "parked"],
-    acceptance: ["delivery", "done", "parked"],
-    parked: ["discovery", "cancelled"],
+    acceptance: ["delivery", "parked"],
+    parked: ["discovery"],
   };
 
   function updateCard(board, mapId, update) {
@@ -1764,6 +1764,93 @@
                                   );
                                 },
                               ),
+                        ),
+                        React.createElement(
+                          "section",
+                          { className: "space-y-2", "aria-label": "Acceptance evidence" },
+                          React.createElement(
+                            "h3",
+                            { className: "font-medium text-foreground" },
+                            "Acceptance evidence",
+                          ),
+                          detailState.detail.acceptance
+                            ? React.createElement(
+                                "article",
+                                { className: "space-y-1 rounded-md border p-3" },
+                                React.createElement(
+                                  "p",
+                                  null,
+                                  "Exact revision: ",
+                                  React.createElement(
+                                    "code",
+                                    null,
+                                    detailState.detail.acceptance.revision,
+                                  ),
+                                ),
+                                React.createElement(
+                                  "p",
+                                  null,
+                                  "Delivered scope: "
+                                    + (detailState.detail.acceptance.delivered_scope || []).join("; "),
+                                ),
+                                React.createElement(
+                                  "p",
+                                  null,
+                                  "Validations: "
+                                    + (detailState.detail.acceptance.validations || []).join("; "),
+                                ),
+                                React.createElement(
+                                  "p",
+                                  null,
+                                  "Known limitations: "
+                                    + ((detailState.detail.acceptance.known_limitations || []).join("; ")
+                                      || "None declared"),
+                                ),
+                                React.createElement(
+                                  "p",
+                                  null,
+                                  "Rollback considerations: "
+                                    + (detailState.detail.acceptance.rollback_considerations || []).join("; "),
+                                ),
+                                React.createElement(
+                                  "p",
+                                  null,
+                                  "Requested remote action: ",
+                                  React.createElement(
+                                    "code",
+                                    null,
+                                    JSON.stringify(
+                                      detailState.detail.acceptance.requested_publication_action,
+                                    ),
+                                  ),
+                                ),
+                                React.createElement(
+                                  "p",
+                                  null,
+                                  "Evidence hash: ",
+                                  React.createElement(
+                                    "code",
+                                    null,
+                                    detailState.detail.acceptance.acceptance_evidence_hash,
+                                  ),
+                                ),
+                              )
+                            : React.createElement("p", null, "No structured acceptance evidence"),
+                          React.createElement(
+                            "p",
+                            null,
+                            "Remote state: "
+                              + ((detailState.detail.publication || {}).state
+                                || "not_published"),
+                          ),
+                          detailState.detail.acceptance_outcome
+                            ? React.createElement(
+                                "p",
+                                { role: "status" },
+                                "Acceptance changes requested: "
+                                  + detailState.detail.acceptance_outcome.requested_changes,
+                              )
+                            : null,
                         ),
                         React.createElement(
                           "section",

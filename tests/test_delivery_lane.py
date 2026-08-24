@@ -1807,6 +1807,18 @@ def test_public_collect_seam_records_acceptance_without_projecting_lane_details(
     assert card["delivery_summary"]["latest"]["summary"] == (
         "Local delivery is validated and ready for acceptance review."
     )
+    acceptance = application.map_detail(map_id=MAP_ID)["acceptance"]
+    assert acceptance["revision"] == "c" * 40
+    assert acceptance["delivered_scope"] == [
+        "The declared Map delivery scope is locally integrated and validated."
+    ]
+    assert acceptance["requested_publication_action"] == {
+        "action": "push",
+        "target": {
+            "repository": "acme/atlas",
+            "ref": f"refs/heads/{lane.integration_branch}",
+        },
+    }
     board_text = json.dumps(card, sort_keys=True)
     for lane_detail in (
         lane.lane_id,

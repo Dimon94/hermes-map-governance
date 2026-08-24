@@ -143,6 +143,19 @@ function fetchJSON(path, options) {
         },
       ],
       approvals: approval ? { count: 1, items: [approval] } : { count: 0, items: [] },
+      acceptance: {
+        revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        delivered_scope: ["Chairman-gated publication and closeout"],
+        validations: ["Focused and full checks passed"],
+        known_limitations: ["Privileged publisher required"],
+        rollback_considerations: ["Restore the previous remote ref"],
+        requested_publication_action: {
+          action: "push",
+          target: { repository: "acme/atlas", ref: "refs/heads/main" },
+        },
+        acceptance_evidence_hash: "sha256:acceptance-evidence",
+      },
+      publication: { state: "not_published", records: [] },
       delivery_summary: mode === "pm-report" ? {
         state: "reported",
         count: 2,
@@ -491,6 +504,14 @@ if (mode !== "empty") {
   assert.match(detailText, /Recent confirmed decisions/);
   assert.match(detailText, /decision-atlas-scope-002/);
   assert.match(detailText, /Hold the public beta until cohort evidence is reviewed/);
+  assert.match(detailText, /Acceptance evidence/);
+  assert.match(detailText, /Exact revision:.*aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/s);
+  assert.match(detailText, /Chairman-gated publication and closeout/);
+  assert.match(detailText, /Focused and full checks passed/);
+  assert.match(detailText, /Privileged publisher required/);
+  assert.match(detailText, /Restore the previous remote ref/);
+  assert.match(detailText, /refs\/heads\/main/);
+  assert.match(detailText, /Remote state: not_published/);
   assert.match(
     detailText,
     mode === "approval"

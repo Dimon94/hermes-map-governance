@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import copy
 import fcntl
+import grp
 import hashlib
 import json
 import os
+import pwd
 import re
 import stat
 import tempfile
@@ -163,13 +165,13 @@ def _normalize_desired(value: Mapping[str, Any]) -> dict[str, Any]:
 
     profiles = _mapping(desired.get("profiles"), name="profiles")
     normalized_profiles: dict[str, str] = {}
-    for role in ("ceo", "pm"):
+    for role in ("ceo", "pm", "publisher"):
         profile = _non_empty(profiles.get(role), name=f"profiles.{role}").lower()
         if profile != "default" and not _PROFILE_RE.fullmatch(profile):
             raise ValueError(f"profiles.{role} is not a valid Hermes profile id")
         normalized_profiles[role] = profile
-    if normalized_profiles["ceo"] == normalized_profiles["pm"]:
-        raise ValueError("profiles.ceo and profiles.pm must be distinct")
+    if len(set(normalized_profiles.values())) != len(normalized_profiles):
+        raise ValueError("CEO, PM, and publisher profiles must be distinct")
 
     skills = _mapping(desired.get("skills"), name="skills")
     plugin_skills = skills.get("plugin")
@@ -374,10 +376,27 @@ def _normalize_desired(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(publisher_required, bool):
         raise ValueError("authorities.publisher.required must be boolean")
     publisher_account = str(publisher.get("account") or "").strip()
+    publisher_gh_config_dir = str(publisher.get("gh_config_dir") or "").strip()
+    worker_os_user = str(worker.get("os_user") or "").strip()
+    worker_git_executable = str(worker.get("git_executable") or "").strip()
+    publisher_os_user = str(publisher.get("os_user") or "").strip()
+    publisher_git_executable = str(publisher.get("git_executable") or "").strip()
+    publisher_gh_executable = str(publisher.get("gh_executable") or "").strip()
+    publisher_control_group = str(publisher.get("control_group") or "").strip()
     if publisher_kind == "none":
-        if publisher_ref != "none" or publisher_account or publisher_required:
+        if (
+            publisher_ref != "none"
+            or publisher_account
+            or publisher_gh_config_dir
+            or publisher_os_user
+            or publisher_git_executable
+            or publisher_gh_executable
+            or publisher_control_group
+            or publisher_required
+        ):
             raise ValueError(
-                "A disabled publisher must use credential_ref none, no account, and required false"
+                "A disabled publisher must use credential_ref none, no account or "
+                "GH_CONFIG_DIR, and required false"
             )
     else:
         if not _ACCOUNT_RE.fullmatch(publisher_account):
@@ -385,7 +404,50 @@ def _normalize_desired(value: Mapping[str, Any]) -> dict[str, Any]:
         expected_publisher_ref = f"gh:{hostname}:{publisher_account}"
         if publisher_ref != expected_publisher_ref:
             raise ValueError(
-                "publisher credential_ref must be gh:HOST:ACCOUNT and match the selected host/account"
+                "Publisher credential_ref must use gh:HOST:ACCOUNT and match setup"
+            )
+        publication_enabled = publisher_required or any(
+            item["publication_required"] for item in normalized_repositories
+        )
+        if publication_enabled:
+            worker_os_user = _non_empty(
+                worker_os_user, name="authorities.worker.os_user"
+            )
+            worker_git_executable = _normalize_path(
+                worker_git_executable,
+                name="authorities.worker.git_executable",
+            )
+            publisher_os_user = _non_empty(
+                publisher_os_user, name="authorities.publisher.os_user"
+            )
+            publisher_control_group = _non_empty(
+                publisher_control_group,
+                name="authorities.publisher.control_group",
+            )
+            try:
+                worker_uid = pwd.getpwnam(worker_os_user).pw_uid
+                publisher_uid = pwd.getpwnam(publisher_os_user).pw_uid
+                grp.getgrnam(publisher_control_group)
+            except KeyError as error:
+                raise ValueError(
+                    "Worker/publisher OS identities and control group must exist"
+                ) from error
+            if worker_uid == publisher_uid:
+                raise ValueError(
+                    "Worker and publisher must use distinct OS service identities"
+                )
+        if publication_enabled or publisher_gh_config_dir:
+            publisher_gh_config_dir = _normalize_path(
+                publisher_gh_config_dir,
+                name="authorities.publisher.gh_config_dir",
+            )
+            publisher_git_executable = _normalize_path(
+                publisher_git_executable,
+                name="authorities.publisher.git_executable",
+            )
+            publisher_gh_executable = _normalize_path(
+                publisher_gh_executable,
+                name="authorities.publisher.gh_executable",
             )
     if worker_ref == publisher_ref:
         raise ValueError("worker and publisher credential references must be distinct")
@@ -425,11 +487,21 @@ def _normalize_desired(value: Mapping[str, Any]) -> dict[str, Any]:
             "repositories": normalized_repositories,
         },
         "authorities": {
-            "worker": {"kind": "local_git", "credential_ref": worker_ref},
+            "worker": {
+                "kind": "local_git",
+                "credential_ref": worker_ref,
+                "os_user": worker_os_user,
+                "git_executable": worker_git_executable,
+            },
             "publisher": {
                 "kind": publisher_kind,
                 "credential_ref": publisher_ref,
                 "account": publisher_account,
+                "gh_config_dir": publisher_gh_config_dir,
+                "os_user": publisher_os_user,
+                "git_executable": publisher_git_executable,
+                "gh_executable": publisher_gh_executable,
+                "control_group": publisher_control_group,
                 "required": publisher_required,
             },
         },

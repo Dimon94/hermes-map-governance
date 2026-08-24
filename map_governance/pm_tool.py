@@ -20,6 +20,7 @@ from .coordinator import (
     DeliveryLaneSpec,
 )
 from .reports import PMReportDraft
+from .publication import AcceptanceEvidence, PublicationAction
 from .runtime import application_for_pm_request
 from .tracker import TrackerError
 
@@ -90,8 +91,68 @@ PM_TOOL_SCHEMA = {
                         "minItems": 2,
                         "items": {"type": "string", "minLength": 1},
                     },
+                    "acceptance": {
+                        "type": "object",
+                        "properties": {
+                            "revision": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{40}$",
+                            },
+                            "delivered_scope": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "validations": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "known_limitations": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "rollback_considerations": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "requested_action": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": [
+                                            "push",
+                                            "pull_request",
+                                            "merge",
+                                            "release",
+                                        ],
+                                    },
+                                    "target": {"type": "object"},
+                                },
+                                "required": ["action", "target"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "required": [
+                            "revision",
+                            "delivered_scope",
+                            "validations",
+                            "known_limitations",
+                            "rollback_considerations",
+                            "requested_action",
+                        ],
+                        "additionalProperties": False,
+                    },
                 },
                 "required": ["record_id", "type", "summary", "timestamp"],
+                "allOf": [
+                    {
+                        "if": {"properties": {"type": {"const": "acceptance"}}},
+                        "then": {"required": ["evidence", "acceptance"]},
+                    }
+                ],
                 "additionalProperties": False,
             },
         },
@@ -293,6 +354,17 @@ def _delivery_lane(raw: Any) -> DeliveryLaneSpec:
     )
 
 
+def _acceptance_evidence(raw: Any) -> AcceptanceEvidence:
+    if not isinstance(raw, dict):
+        raise ValueError("report.acceptance must be an object")
+    payload = dict(raw)
+    requested = payload.pop("requested_action", None)
+    if not isinstance(requested, dict):
+        raise ValueError("report.acceptance.requested_action must be an object")
+    payload["requested_publication_action"] = PublicationAction.from_payload(requested)
+    return AcceptanceEvidence(**payload)
+
+
 def register_pm_capabilities(ctx) -> None:
     """Register the opt-in PM Skill and its independent named Toolset."""
     registered_profile = str(ctx.profile_name)
@@ -320,6 +392,8 @@ def register_pm_capabilities(ctx) -> None:
                     raise ValueError("report is required for the report action")
                 draft = dict(raw_report)
                 draft["report_type"] = draft.pop("type", None)
+                if draft.get("acceptance") is not None:
+                    draft["acceptance"] = _acceptance_evidence(draft["acceptance"])
                 result = application.report_pm(
                     request_identity=identity,
                     report=PMReportDraft(**draft),

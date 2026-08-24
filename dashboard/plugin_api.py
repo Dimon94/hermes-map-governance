@@ -85,6 +85,11 @@ class ApprovalDecisionRequest(BaseModel):
     note: str = Field(min_length=1)
 
 
+class CancelMapRequest(BaseModel):
+    approval_request_id: str = Field(min_length=1, max_length=128)
+    mutation_id: str = Field(min_length=1, max_length=128)
+
+
 class OutboxRecoveryRequest(BaseModel):
     limit: int = Field(default=100, ge=1, le=1000)
 
@@ -524,4 +529,22 @@ async def decide_approval(
         actor_identity=_chairman_identity(http_request, profile=profile),
         decision=request.decision,
         note=request.note,
+    )
+
+
+@router.post("/maps/{map_id}/cancel")
+async def cancel_map(
+    map_id: str,
+    request: CancelMapRequest,
+    http_request: Request,
+    profile: str = Query(min_length=1),
+):
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "cancel_map",
+        map_id=map_id,
+        actor_identity=_chairman_identity(http_request, profile=profile),
+        approval_request_id=request.approval_request_id,
+        mutation_id=request.mutation_id,
     )

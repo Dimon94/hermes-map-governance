@@ -60,18 +60,38 @@ Hermes Kanban task。插件数据位于当前请求 profile 的 Hermes 原生插
 `maps setup` 只管理普通 Hermes/plugin behavioral configuration，不读取当前 shell
 来猜 profile、Skill、repository 或 authority，也不接收 secret。GitHub credential 只以
 `gh:<host>:<account>` provider/auth-context reference 表示，而且必须与所选 host/account
-一致；token 仍由 `gh`/keychain
-持有。可从 [`docs/setup-example.json`](docs/setup-example.json) 复制一份 JSON
+一致；token 仍由 `gh`/keychain 持有，并且 privileged subprocess 只读取 setup 中显式、
+owner-only（0700）、非 symlink 的 `gh_config_dir`，不继承 worker/PM 的 ambient `gh` 登录。
+启用 publication 时还必须声明两个真实存在且 UID 不同的 worker/publisher OS service user，
+以及两者共同加入的 `control_group`。worker 首次 composition 会把 worker-owned plugin storage、
+配置和 SQLite durable state 固定为仅该 control group 可读写的精确 ownership/mode；publisher 只接受该契约，
+不会复制或另建 approval ledger、Outbox 或 closeout truth。
+CEO/PM/worker composition 必须由 worker user 启动，privileged CLI 必须由 publisher user
+启动；两侧运行时都会核对实际 euid。Git 与 GitHub CLI 必须
+使用 setup 固定的 absolute、root/publisher-owned、不可 group/world write executable。push
+不让 publisher 对 worker checkout 运行 Git：acceptance 提交时，worker composition 使用独立的
+`worker.git_executable`，在 shared control storage 的 `publication-handoffs/` 内以隔离 bare
+staging 原子生成并校验 content-addressed、worker-owned/control-group-readable handoff；
+publisher 以 `O_NOFOLLOW` 校验真实 UID/mode/link count，复制到 publisher-owned bare staging
+并校验 exact commit。远端 push 再禁用 hooks、ambient Git config、credential helper 与非 HTTPS
+transport，因而不会在持 credential 的进程中执行 worker checkout 里的 hook、config 或 program。
+正常结果会立即删除 action staging；进程崩溃残留只保留 24 小时并按严格 owned-name/mode GC。
+可从 [`docs/setup-example.json`](docs/setup-example.json) 复制一份 JSON
 desired-state 文件，内容包含：
 
-- 不同的 CEO/PM profile ID；
+- 彼此不同的 CEO、PM 与 CLI-only publisher profile ID；publisher profile 不得启用
+  CEO/PM model toolset；
 - plugin Skills `map-governance:ceo`、`map-governance:pm`，以及既有外部 owner
   Skills `delivery-pipeline`、`implement` 的绝对 `SKILL.md` 路径；
 - `codex`、`claude` 或 `mixed` routing policy；
 - routing default、missing-integration 的 `blocked` / `fallback` 行为，以及每个 repository 的
   attribute-to-worker policy；
 - 已选择的 GitHub Project identity、repository coordinate 与本地 repository path；
-- `local_git` worker authority 和独立的 publisher provider reference；
+- `local_git` worker authority、worker-owned/root-owned Git executable 和独立的 publisher
+  provider reference；
+- 不同的 worker/publisher OS service user、共同的 `control_group`、publisher-only
+  `gh_config_dir`，以及固定的
+  `git_executable` / `gh_executable`；
 - Herdr executable 名称或绝对路径。
 
 计划阶段不写入任何状态，并返回稳定 action ID、before/after、operator authority、config
@@ -103,6 +123,9 @@ Doctor 为每项 prerequisite 返回独立 `pass`、`warning` 或 `fail` evidenc
 隔离、Skill discovery、现有 storage owner/mode 与 SQLite immutable read-only open、GitHub
 auth/Project/repository capability、registry coordinate cross-check、local worker write authority、
 单独的 publisher authority，以及 Herdr version 和 Hermes/Codex/Claude integration state。
+worker 身份只能把完整且隔离的 publisher 配置报告为 `warning`，不会用自己的 ambient GitHub
+权限冒充 publisher 的 live `pass`；privileged publisher composition 会在每次远程变更前，以
+publisher-only `gh_config_dir` 验证 exact account 及每个 allowlisted repository 的写权限。
 它不创建 storage、DB、journal、lock，不安装 integration，不修改 profile/config/credential，
 也不会输出 subprocess stderr 或 credential body。缺 publisher credential 不会让 local
 execution worker 失败；只有明确要求 publication 的 repository 才把 publisher 缺失判为
@@ -209,6 +232,47 @@ whole-Map question/blocker 才可投影 `decision`，terminal failure 只形成�
 状态；后续 checkpoint、acceptance 或 failure 会取代已处理 question/blocker 的 pending badge，
 完整历史仍由 Issue comment 与 Map detail 保留。
 
+结构化 acceptance 绑定一个完整 Git revision，并列出 delivered scope、validations、known
+limitations、rollback considerations 与一个 exact remote action/target。PM 和 worker 到此为止；
+它们拿不到 publisher credential，也不能把 acceptance 直接投影为 `done`。Chairman approval
+必须匹配最新 acceptance report identity、revision、target、content hash 与 setup 绑定的
+publisher authority reference；内容、revision、target、publisher host/account、reject、revoke
+或 expiry 任一变化后旧 grant 都不可重放。独立 privileged publisher 只接收该最小 approved
+action，不接收 PM/lane/prompt 状态；Map detail/CEO inspect 会从当前 acceptance 与 setup authority
+派生 secret-free 的 exact approval scope/payload，董事长无需读取或猜测 setup。其 publication 与
+tracker adapter 复用同一个已 resolve/校验的 setup 固定
+`gh_executable`、publisher-only `gh_config_dir` 和 host，不继承 ambient token/config。成功后先把
+`map-governance:publication:v1` immutable
+remote evidence 写入 Map Issue history，再通过同一 Outbox 关闭 Issue 为 `completed` 并派生
+`done`；取消则必须使用 cancellation grant，以 `not_planned` close 派生 `cancelled`。任何
+remote partial failure 只写 repair-required governance incident，不自动重做未知是否已成功的
+动作，也绝不 close Issue。授权有效性绑定 durable remote-call marker 的 `attempted_at`；provider
+回读的 `published_at` 只是 immutable observation time，延迟回读不会把一次已授权尝试误判为
+过期重放。readback 必须区分 exact match、confirmed absent 与 drift/ambiguous；后两种分别形成
+不可重放的 aborted closeout 或保持 repair-required，且 incident tracker-confirmed 后才可记录
+resolution。approval 在最后 preflight 后、remote-call marker 写入前会用同一个
+`attempted_at` 再核验 consumption、expiry、latest acceptance revision 与 target，避免检查与执行
+之间的 expiry/content TOCTOU。
+
+Publisher 只通过显式 privileged CLI composition 启用；普通 CEO/PM application 与 toolset 不会
+注入该 capability。CLI 在执行前核对 setup-owned repository allowlist、配置的 GitHub account、
+exact revision 与 target：
+
+```bash
+hermes maps publish --map MAP_ID \
+  --control-profile CEO_PROFILE \
+  --approval-request APPROVAL_REQUEST_ID \
+  --mutation-id STABLE_ACTION_ID
+```
+
+不确定的远端结果只能用同一 action 的 provider readback 修复；该命令不会再次执行远端 mutation：
+
+```bash
+hermes maps reconcile-publication --map MAP_ID \
+  --control-profile CEO_PROFILE \
+  --action-id STABLE_ACTION_ID
+```
+
 PM question 还会持久化 Map-bound scope、blocking impact、evidence、options、decision class
 与 stable correlation id。tracker（以及 whole-Map blocker 的 stage）确认后，Outbox 才向该 Map
 canonical CEO session 投递一次 correlation-bound turn。CEO 通过同一 application seam 回答：
@@ -287,6 +351,7 @@ Operator 可用 `hermes maps outbox status --effect EFFECT_ID` 检查 attempt hi
 `hermes maps outbox recover --limit 100` 运行到期 action，并用带稳定 repair id 和说明的
 `hermes maps outbox repair --effect EFFECT_ID --repair-id REPAIR_ID --note NOTE`
 显式重排 terminal intent。Repair 只增加审计记录并重置执行状态，不删除历史或静默吞掉失败。
+`publisher.execute` 明确排除在通用 repair 之外，必须使用上述 evidence-only reconciliation。
 
 ## Restart recovery 与 identity repair
 
@@ -396,7 +461,7 @@ plugins:
 - `hermes maps health` 与 `/api/plugins/map-governance/health` 返回同一 readiness。
 - `/api/plugins/map-governance/board` 提供按 GitHub Project 分组的 board 投影；
   `/projects`、`/bindings`、`/refresh`、`/transitions`、approval decision、Map detail 与
-  canonical session open routes 是同一应用接口的薄适配器。
+  authenticated cancellation、canonical session open routes 是同一应用接口的薄适配器。
 - `/api/plugins/map-governance/events` 使用 Hermes 公共 WebSocket auth/upgrade contract，
   提供 durable cursor catch-up、live tail 与 cursor-expiry refresh protocol。
 - `registry.db` 属于 `map-governance` 命名空间，由请求中的 profile 选择，且与

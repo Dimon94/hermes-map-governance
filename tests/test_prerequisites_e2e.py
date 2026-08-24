@@ -159,7 +159,7 @@ def test_setup_then_doctor_uses_only_isolated_config_and_read_only_fake_boundari
 
     desired = {
         "schema_version": 1,
-        "profiles": {"ceo": "ceo", "pm": "pm"},
+        "profiles": {"ceo": "ceo", "pm": "pm", "publisher": "default"},
         "skills": {
             "plugin": ["map-governance:ceo", "map-governance:pm"],
             "external": [

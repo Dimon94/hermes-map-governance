@@ -107,8 +107,14 @@ class EffectConfirmation:
     """Downstream readback proving one semantic effect is already present."""
 
     acknowledgment: dict[str, Any]
+    reconciled_by_readback: bool
 
-    def __init__(self, acknowledgment: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        acknowledgment: Mapping[str, Any],
+        *,
+        reconciled_by_readback: bool = False,
+    ) -> None:
         if not isinstance(acknowledgment, Mapping):
             raise ValueError("Effect acknowledgment must be a JSON object")
         object.__setattr__(
@@ -116,6 +122,7 @@ class EffectConfirmation:
             "acknowledgment",
             json.loads(normalized_json(dict(acknowledgment))),
         )
+        object.__setattr__(self, "reconciled_by_readback", reconciled_by_readback)
 
 
 class EffectAdapter(Protocol):
@@ -261,17 +268,41 @@ class OutboxDispatcher:
                 ) from error
             confirmation = adapter.readback(intent)
             self._inject("after_initial_readback", intent)
+            if (
+                intent.effect_type == "publisher.execute"
+                and confirmation is not None
+                and not self._repository.external_call_started(intent.effect_id)
+            ):
+                raise EffectTerminalError(
+                    "Pre-existing remote state cannot retroactively satisfy a new "
+                    "publication grant"
+                )
             reconciled_by_readback = confirmation is not None
             if confirmation is None:
+                if (
+                    intent.effect_type == "publisher.execute"
+                    and self._repository.external_call_started(intent.effect_id)
+                ):
+                    raise EffectTerminalError(
+                        "Publisher outcome is uncertain after a prior external call"
+                    )
                 self._inject("before_external_call", intent)
                 adapter.apply(intent)
                 self._inject("after_external_call", intent)
                 confirmation = adapter.readback(intent)
                 if confirmation is None:
+                    if intent.effect_type == "publisher.execute":
+                        raise EffectTerminalError(
+                            "Publisher call returned without immutable remote evidence"
+                        )
                     raise EffectRetryableError(
                         "External effect was not confirmed by downstream readback"
                     )
             self._inject("after_confirmation", intent)
+            confirmation = EffectConfirmation(
+                confirmation.acknowledgment,
+                reconciled_by_readback=reconciled_by_readback,
+            )
             self._completion(intent, confirmation)
             self._inject("after_completion", intent)
             self._inject("before_acknowledgment", intent)
@@ -467,8 +498,8 @@ class _LeaseHeartbeat:
 class OutboxRepository:
     """Persist Outbox intents in the plugin-owned SQLite registry."""
 
-    def __init__(self, storage_root: Path) -> None:
-        storage = PluginStorage(storage_root)
+    def __init__(self, storage_root: Path, *, shared_gid: int | None = None) -> None:
+        storage = PluginStorage(storage_root, shared_gid=shared_gid)
         storage.check_readiness()
         self.database = storage.database
 
@@ -693,6 +724,45 @@ class OutboxRepository:
                 (effect_id,),
             ).fetchone()
         return self._intent(row) if row is not None else None
+
+    def external_call_started(self, effect_id: str) -> bool:
+        """Return whether a privileged publisher call crossed its mutation point."""
+        return self.external_call_started_at(effect_id) is not None
+
+    def external_call_started_at(self, effect_id: str) -> str | None:
+        """Return the durable authorization-window attempt timestamp, if any."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT started_at FROM outbox_external_calls WHERE effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+        return str(row["started_at"]) if row is not None else None
+
+    def mark_external_call_started(
+        self,
+        *,
+        effect_id: str,
+        owner_id: str,
+        now: str,
+    ) -> None:
+        """Durably fence a publisher intent before its first remote mutation."""
+        started_at = self._format_timestamp(self._timestamp(now, name="now"))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._owned_lease(
+                connection,
+                effect_id=effect_id,
+                owner_id=owner_id,
+                now=started_at,
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO outbox_external_calls(effect_id, started_at)
+                VALUES (?, ?)
+                """,
+                (effect_id, started_at),
+            )
+            connection.commit()
 
     def effect_intents(
         self,
@@ -1363,6 +1433,111 @@ class OutboxRepository:
         if repaired is None:  # pragma: no cover
             raise RuntimeError("Repaired Outbox intent disappeared")
         return EnqueuedIntent(intent=self._intent(repaired), created=True)
+
+    def acknowledge_terminal_readback(
+        self,
+        *,
+        effect_id: str,
+        resolution_id: str,
+        note: str,
+        acknowledgment: Mapping[str, Any],
+        resolved_at: str,
+        successor_effect_id: str,
+        successor_effect_type: str,
+        successor_map_id: str,
+        successor_payload: Mapping[str, Any],
+    ) -> OutboxIntent:
+        """Atomically record the evidence successor and resolve a terminal effect."""
+        identity = self._text(resolution_id, name="resolution_id", maximum=256)
+        resolution_note = self._text(note, name="resolution_note")
+        resolution_time = self._format_timestamp(
+            self._timestamp(resolved_at, name="resolved_at")
+        )
+        if not isinstance(acknowledgment, Mapping):
+            raise ValueError("Outbox acknowledgment must be a JSON object")
+        acknowledgment_json = normalized_json(dict(acknowledgment))
+        successor = self._prepare_intent(
+            effect_id=successor_effect_id,
+            effect_type=successor_effect_type,
+            map_id=successor_map_id,
+            payload=successor_payload,
+            created_at=resolution_time,
+        )
+        resolved: sqlite3.Row | None = None
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_resolution = connection.execute(
+                "SELECT * FROM outbox_repairs WHERE repair_id = ?",
+                (identity,),
+            ).fetchone()
+            row = connection.execute(
+                "SELECT * FROM outbox_intents WHERE effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Outbox effect does not exist: {effect_id}")
+            if existing_resolution is not None:
+                if (
+                    existing_resolution["effect_id"] != effect_id
+                    or existing_resolution["note"] != resolution_note
+                    or row["state"] != "succeeded"
+                    or row["acknowledgment_json"] != acknowledgment_json
+                ):
+                    raise OutboxConflictError(
+                        "Outbox evidence resolution identity has different content: "
+                        f"{identity}"
+                    )
+                self._enqueue_prepared(connection, successor)
+                connection.commit()
+                return self._intent(row)
+            if row["state"] != "terminal" or not row["terminal_reason"]:
+                raise ValueError(
+                    "Only a terminal Outbox effect can be resolved by readback"
+                )
+            connection.execute(
+                """
+                INSERT INTO outbox_repairs(
+                    repair_id, effect_id, note, requested_at,
+                    prior_terminal_reason, prior_attempt_count
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identity,
+                    effect_id,
+                    resolution_note,
+                    resolution_time,
+                    row["terminal_reason"],
+                    int(row["attempt_count"]),
+                ),
+            )
+            self._enqueue_prepared(connection, successor)
+            connection.execute(
+                """
+                UPDATE outbox_intents
+                SET state = 'succeeded', owner_id = NULL,
+                    lease_expires_at = NULL, next_attempt_at = NULL,
+                    acknowledged_at = ?, acknowledgment_json = ?,
+                    last_error_type = NULL, last_error_message = NULL,
+                    terminal_reason = NULL, updated_at = ?
+                WHERE effect_id = ? AND state = 'terminal'
+                """,
+                (
+                    resolution_time,
+                    acknowledgment_json,
+                    resolution_time,
+                    effect_id,
+                ),
+            )
+            resolved = connection.execute(
+                "SELECT * FROM outbox_intents WHERE effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+            if resolved is not None:
+                self._emit_update(connection, resolved)
+            connection.commit()
+        if resolved is None:  # pragma: no cover
+            raise RuntimeError("Resolved Outbox intent disappeared")
+        return self._intent(resolved)
 
     def operator_status(self, effect_id: str) -> dict[str, Any]:
         """Return an operator-safe delivery record with explicit repair action."""

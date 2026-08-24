@@ -379,7 +379,14 @@ class ApprovalHistoryEvent:
             "request_id",
             _non_empty_string(self.request_id, name="request_id", maximum=128),
         )
-        allowed = {"requested", "approved", "rejected", "revision", "revoked"}
+        allowed = {
+            "requested",
+            "approved",
+            "rejected",
+            "revision",
+            "revoked",
+            "consumed",
+        }
         if self.event_type not in allowed:
             raise ValueError("Approval event_type is not supported")
         object.__setattr__(
@@ -418,7 +425,14 @@ def approval_events_semantically_compatible(
         return False
     if existing.event_type == "requested":
         return existing.details == requested.details
-    stable_keys = {"actor_id", "actor_profile", "note", "decision"}
+    stable_keys = {
+        "actor_id",
+        "actor_profile",
+        "note",
+        "decision",
+        "mutation_id",
+        "action",
+    }
     return all(
         existing.details.get(key) == requested.details.get(key)
         for key in stable_keys

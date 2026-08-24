@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import copy
+import grp
 import hashlib
 import json
 import os
+import pwd
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -21,6 +24,11 @@ from map_governance.prerequisites import (
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 8, 24, 1, 30, tzinfo=timezone.utc)
+
+
+def _other_os_user() -> str:
+    current_uid = os.geteuid()
+    return next(user.pw_name for user in pwd.getpwall() if user.pw_uid != current_uid)
 
 
 def _skill(path: Path, name: str) -> Path:
@@ -92,7 +100,7 @@ def _desired(
 ) -> dict:
     return {
         "schema_version": 1,
-        "profiles": {"ceo": "ceo", "pm": "pm"},
+        "profiles": {"ceo": "ceo", "pm": "pm", "publisher": "default"},
         "skills": {
             "plugin": ["map-governance:ceo", "map-governance:pm"],
             "external": [
@@ -135,11 +143,21 @@ def _desired(
             ],
         },
         "authorities": {
-            "worker": {"kind": "local_git", "credential_ref": "local-git"},
+            "worker": {
+                "kind": "local_git",
+                "credential_ref": "local-git",
+                "os_user": pwd.getpwuid(os.geteuid()).pw_name,
+                "git_executable": "/usr/local/bin/git",
+            },
             "publisher": {
                 "kind": "gh",
                 "credential_ref": "gh:github.com:release-bot",
                 "account": "release-bot",
+                "gh_config_dir": str(repository.parent / "publisher-gh-config"),
+                "os_user": _other_os_user(),
+                "git_executable": "/usr/local/bin/git",
+                "gh_executable": "/usr/local/bin/gh",
+                "control_group": grp.getgrgid(os.getgid()).gr_name,
                 "required": publication_required,
             },
         },
@@ -151,10 +169,12 @@ class FakeRunner:
     def __init__(self, results: dict[tuple[str, ...], CommandResult]):
         self.results = results
         self.calls: list[tuple[str, ...]] = []
+        self.environments: list[dict[str, str] | None] = []
 
-    def run(self, arguments, *, timeout):
+    def run(self, arguments, *, timeout, environment=None):
         argv = tuple(arguments)
         self.calls.append(argv)
+        self.environments.append(dict(environment) if environment is not None else None)
         return self.results.get(
             argv,
             CommandResult(
@@ -443,7 +463,21 @@ def _command_results(repository: Path) -> dict[tuple[str, ...], CommandResult]:
         owner_type="organization",
         number=7,
     )
-    return {
+    auth_payload = json.dumps(
+        {
+            "hosts": {
+                "github.com": [
+                    {
+                        "state": "success",
+                        "active": True,
+                        "login": "release-bot",
+                        "scopes": "read:project, repo",
+                    }
+                ]
+            }
+        }
+    )
+    results = {
         (
             "gh",
             "auth",
@@ -456,20 +490,7 @@ def _command_results(repository: Path) -> dict[tuple[str, ...], CommandResult]:
         ): CommandResult(
             arguments=(),
             returncode=0,
-            stdout=json.dumps(
-                {
-                    "hosts": {
-                        "github.com": [
-                            {
-                                "state": "success",
-                                "active": True,
-                                "login": "release-bot",
-                                "scopes": "read:project, repo",
-                            }
-                        ]
-                    }
-                }
-            ),
+            stdout=auth_payload,
             stderr="",
         ),
         tuple(project_query_argv): CommandResult(
@@ -533,6 +554,40 @@ def _command_results(repository: Path) -> dict[tuple[str, ...], CommandResult]:
             stderr="",
         ),
     }
+    results[
+        (
+            "/usr/local/bin/gh",
+            "auth",
+            "status",
+            "--active",
+            "--hostname",
+            "github.com",
+            "--json",
+            "hosts",
+        )
+    ] = CommandResult(arguments=(), returncode=0, stdout=auth_payload, stderr="")
+    results[
+        (
+            "/usr/local/bin/gh",
+            "repo",
+            "view",
+            "github.com/acme/atlas",
+            "--json",
+            "nameWithOwner,viewerPermission,isArchived",
+        )
+    ] = CommandResult(
+        arguments=(),
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "nameWithOwner": "acme/atlas",
+                "viewerPermission": "WRITE",
+                "isArchived": False,
+            }
+        ),
+        stderr="",
+    )
+    return results
 
 
 @pytest.fixture
@@ -547,6 +602,7 @@ def isolated(tmp_path):
     control = _profile(home, "default", "hermes-cli", [skills_a, skills_b])
     repository = tmp_path / "atlas"
     repository.mkdir()
+    (tmp_path / "publisher-gh-config").mkdir(mode=0o700)
     (repository / ".git").mkdir()
     storage = control / "plugin-data" / "map-governance"
     _registry(storage)
@@ -887,6 +943,30 @@ def test_setup_rejects_a_shared_ceo_and_pm_profile(isolated):
         _application(isolated).setup_plan(desired=desired)
 
 
+def test_setup_rejects_shared_worker_and_publisher_os_identity_for_publication(
+    isolated,
+):
+    desired = copy.deepcopy(isolated["desired"])
+    desired["github"]["repositories"][0]["publication_required"] = True
+    desired["authorities"]["publisher"]["required"] = True
+    desired["authorities"]["worker"]["os_user"] = desired["authorities"]["publisher"][
+        "os_user"
+    ]
+
+    with pytest.raises(ValueError, match="distinct OS service identities"):
+        _application(isolated).setup_plan(desired=desired)
+
+
+def test_setup_rejects_nonexistent_worker_os_identity_for_publication(isolated):
+    desired = copy.deepcopy(isolated["desired"])
+    desired["github"]["repositories"][0]["publication_required"] = True
+    desired["authorities"]["publisher"]["required"] = True
+    desired["authorities"]["worker"]["os_user"] = "maps-user-does-not-exist"
+
+    with pytest.raises(ValueError, match="identities and control group must exist"):
+        _application(isolated).setup_plan(desired=desired)
+
+
 def test_setup_rejects_token_shaped_credential_refs_and_recomputed_forged_plans(
     isolated,
 ):
@@ -1010,8 +1090,58 @@ def test_doctor_reports_profile_skill_storage_binding_and_authority_failures(iso
     assert checks["profiles.separation"]["status"] == "pass"
     assert checks["skills.external.delivery-pipeline"]["status"] == "fail"
     assert checks["storage.permissions"]["status"] == "fail"
-    assert checks["repository.acme/atlas.publisher"]["status"] == "pass"
+    assert checks["repository.acme/atlas.publisher"]["status"] == "fail"
     assert "token" not in json.dumps(report).lower()
+
+
+def test_worker_doctor_accepts_isolated_publisher_service_configuration(
+    isolated, monkeypatch
+):
+    desired = copy.deepcopy(isolated["desired"])
+    desired["github"]["repositories"][0]["publication_required"] = True
+    desired["authorities"]["publisher"]["required"] = True
+    desired["authorities"]["worker"]["git_executable"] = "/usr/bin/git"
+    desired["authorities"]["publisher"]["git_executable"] = "/usr/bin/git"
+    desired["authorities"]["publisher"]["gh_executable"] = "/usr/bin/git"
+    plan = _application(isolated).setup_plan(desired=desired)
+    _application(isolated).setup_apply(
+        plan=plan,
+        selected_action_ids=["config.prerequisites"],
+    )
+    worker_name = desired["authorities"]["worker"]["os_user"]
+    publisher_name = desired["authorities"]["publisher"]["os_user"]
+    control_group = grp.getgrnam(desired["authorities"]["publisher"]["control_group"])
+    shared_group = SimpleNamespace(
+        gr_gid=control_group.gr_gid,
+        gr_mem=[worker_name, publisher_name],
+    )
+    gh_config_dir = Path(desired["authorities"]["publisher"]["gh_config_dir"])
+    publisher_uid = pwd.getpwnam(publisher_name).pw_uid
+    original_stat = Path.stat
+    config_values = list(original_stat(gh_config_dir))
+    config_values[4] = publisher_uid
+    publisher_owned_config = os.stat_result(config_values)
+
+    def controlled_stat(path, *args, **kwargs):
+        if path == gh_config_dir:
+            return publisher_owned_config
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "map_governance.prerequisites.grp.getgrnam", lambda _name: shared_group
+    )
+    monkeypatch.setattr(Path, "stat", controlled_stat)
+
+    report = _application(isolated).doctor()
+
+    checks = {check["id"]: check for check in report["checks"]}
+    assert checks["authority.separation"]["status"] == "pass"
+    assert checks["authority.worker"]["status"] == "pass"
+    assert checks["authority.publisher"]["status"] == "warning"
+    assert (
+        checks["authority.publisher"]["evidence"]["isolated_service_configured"] is True
+    )
+    assert checks["repository.acme/atlas.publisher"]["status"] == "warning"
 
 
 def test_doctor_opens_a_read_only_registry_without_requiring_database_write_mode(

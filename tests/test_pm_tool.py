@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import map_governance.pm_tool as pm_tool
 import map_governance.runtime as runtime
-from map_governance import GovernanceRequestIdentity, StaleProjectionError
+from map_governance import (
+    AcceptanceEvidence,
+    GovernanceRequestIdentity,
+    StaleProjectionError,
+)
 from map_governance.coordinator import DeliveryLaneSpec
 from map_governance.storage import PluginStorage
 
@@ -216,6 +220,74 @@ def test_pm_report_handler_injects_request_identity_and_cannot_select_a_map(
         )
         is None
     )
+
+
+def test_pm_acceptance_report_builds_content_bound_evidence_without_credentials(
+    monkeypatch,
+):
+    calls = []
+
+    class ApplicationProbe:
+        def report_pm(self, **arguments):
+            calls.append(arguments)
+            return {"operation": "report"}
+
+        def enforce_assigned_pm_toolset(self, **_arguments):
+            return True
+
+    monkeypatch.setattr(
+        pm_tool,
+        "application_for_pm_request",
+        lambda _profile, **_identity: ApplicationProbe(),
+    )
+    tools = []
+    context = SimpleNamespace(
+        profile_name="pm",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: tools.append(kwargs),
+        register_hook=lambda *args: None,
+    )
+    pm_tool.register_pm_capabilities(context)
+
+    result = json.loads(
+        tools[0]["handler"](
+            {
+                "action": "report",
+                "report": {
+                    "record_id": "acceptance-content-bound-001",
+                    "type": "acceptance",
+                    "summary": "The local revision is ready for review.",
+                    "timestamp": "2026-08-24T08:00:00Z",
+                    "evidence": ["Focused and full checks passed."],
+                    "acceptance": {
+                        "revision": "a" * 40,
+                        "delivered_scope": ["Governed closeout"],
+                        "validations": ["Full suite passed"],
+                        "known_limitations": [],
+                        "rollback_considerations": ["Restore prior ref"],
+                        "requested_action": {
+                            "action": "push",
+                            "target": {
+                                "repository": "acme/atlas",
+                                "ref": "refs/heads/main",
+                            },
+                        },
+                    },
+                },
+            },
+            session_id="pm-session-atlas",
+        )
+    )
+
+    assert result == {"operation": "report"}
+    acceptance = calls[0]["report"].acceptance
+    assert isinstance(acceptance, AcceptanceEvidence)
+    assert acceptance.revision == "a" * 40
+    assert acceptance.requested_publication_action.target == {
+        "repository": "acme/atlas",
+        "ref": "refs/heads/main",
+    }
+    assert "credential" not in json.dumps(tools[0]["schema"], sort_keys=True).lower()
 
 
 def test_bounded_dispatch_bridge_injects_identity_and_accepts_one_lane_contract(

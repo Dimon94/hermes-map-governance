@@ -5,7 +5,9 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,15 +18,37 @@ from .events import append_board_event, content_event_id
 
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 19
 
 
 class PluginStorage:
     """Own the Map Governance registry database and nothing outside it."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, shared_gid: int | None = None) -> None:
         self.root = root.resolve()
         self.database = self.root / "registry.db"
+        self._shared_gid = shared_gid
+
+    def _share_path(self, path: Path, *, directory: bool) -> None:
+        if self._shared_gid is None:
+            return
+        metadata = path.lstat()
+        expected_mode = 0o2770 if directory else 0o660
+        if (
+            (directory and not stat.S_ISDIR(metadata.st_mode))
+            or (not directory and not stat.S_ISREG(metadata.st_mode))
+            or stat.S_ISLNK(metadata.st_mode)
+        ):
+            raise PermissionError("Map Governance shared control path is unsafe")
+        if metadata.st_uid == os.geteuid():
+            os.chown(path, -1, self._shared_gid)
+            os.chmod(path, expected_mode)
+            metadata = path.lstat()
+        if (
+            metadata.st_gid != self._shared_gid
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+        ):
+            raise PermissionError("Map Governance shared control path is unsafe")
 
     def check_readiness(self) -> dict[str, str]:
         """Create and verify the minimal storage metadata schema."""
@@ -253,6 +277,12 @@ class PluginStorage:
     def pm_turn_lease(self, map_id: str) -> Iterator[None]:
         """Serialize one Map's coordinator turn reservation across processes."""
         with self._map_lease(namespace="pm-turn", map_id=map_id):
+            yield
+
+    @contextmanager
+    def publication_lease(self, map_id: str) -> Iterator[None]:
+        """Fence acceptance mutation against one privileged publication call."""
+        with self._map_lease(namespace="publication", map_id=map_id):
             yield
 
     @contextmanager
@@ -1134,8 +1164,9 @@ class PluginStorage:
                     map_id, record_id, report_type, summary, reported_at,
                     evidence_json, blocking, continuation_requirement,
                     failure_code, correlation_id, decision_class, scope_json,
-                    options_json, tracker_record_id, tracker_record_url, confirmed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    options_json, acceptance_json, tracker_record_id,
+                    tracker_record_url, confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(map_id, record_id) DO UPDATE SET
                     report_type = excluded.report_type,
                     summary = excluded.summary,
@@ -1148,6 +1179,7 @@ class PluginStorage:
                     decision_class = excluded.decision_class,
                     scope_json = excluded.scope_json,
                     options_json = excluded.options_json,
+                    acceptance_json = excluded.acceptance_json,
                     tracker_record_id = excluded.tracker_record_id,
                     tracker_record_url = excluded.tracker_record_url,
                     confirmed_at = excluded.confirmed_at
@@ -1181,8 +1213,9 @@ class PluginStorage:
                     map_id, record_id, report_type, summary, reported_at,
                     evidence_json, blocking, continuation_requirement,
                     failure_code, correlation_id, decision_class, scope_json,
-                    options_json, tracker_record_id, tracker_record_url, confirmed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    options_json, acceptance_json, tracker_record_id,
+                    tracker_record_url, confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     self._pm_report_projection_values(map_id, report)
@@ -1226,6 +1259,11 @@ class PluginStorage:
                 if report.get("correlation_id") is not None
                 else None
             ),
+            (
+                json.dumps(report["acceptance"], ensure_ascii=False, sort_keys=True)
+                if report.get("acceptance") is not None
+                else None
+            ),
             report["tracker"]["id"],
             report["tracker"]["url"],
             report["confirmed_at"],
@@ -1242,7 +1280,7 @@ class PluginStorage:
                 """
                 SELECT * FROM pm_report_projections
                 WHERE map_id = ?
-                ORDER BY julianday(reported_at) DESC, record_id DESC
+                ORDER BY julianday(confirmed_at) DESC, rowid DESC
                 LIMIT ?
                 """,
                 (map_id, limit),
@@ -1273,6 +1311,8 @@ class PluginStorage:
                 report["decision_class"] = row["decision_class"]
                 report["scope"] = json.loads(row["scope_json"])
                 report["options"] = json.loads(row["options_json"])
+            if row["acceptance_json"] is not None:
+                report["acceptance"] = json.loads(row["acceptance_json"])
             reports.append(report)
         return reports
 
@@ -1293,6 +1333,7 @@ class PluginStorage:
             )
         latest_report = dict(latest[0])
         latest_report.pop("evidence", None)
+        latest_report.pop("acceptance", None)
         badge_type = {
             ("question", False): "non_blocking_question",
             ("question", True): "blocking_question",
@@ -1315,13 +1356,170 @@ class PluginStorage:
             ),
         }
 
+    def save_publication_projection(
+        self,
+        *,
+        map_id: str,
+        record: dict[str, Any],
+    ) -> None:
+        """Cache one tracker-confirmed publication record for Map detail."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO publication_record_projections(
+                    record_id, map_id, action_id, approval_request_id, status,
+                    revision, action, target_json, evidence_json, reason,
+                    occurred_at, tracker_record_id, tracker_record_url,
+                    confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(record_id) DO UPDATE SET
+                    map_id = excluded.map_id,
+                    action_id = excluded.action_id,
+                    approval_request_id = excluded.approval_request_id,
+                    status = excluded.status,
+                    revision = excluded.revision,
+                    action = excluded.action,
+                    target_json = excluded.target_json,
+                    evidence_json = excluded.evidence_json,
+                    reason = excluded.reason,
+                    occurred_at = excluded.occurred_at,
+                    tracker_record_id = excluded.tracker_record_id,
+                    tracker_record_url = excluded.tracker_record_url,
+                    confirmed_at = excluded.confirmed_at
+                """,
+                self._publication_projection_values(map_id, record),
+            )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="publication.upserted",
+                identity=str(record["record_id"]),
+                payload={"publication": record},
+                committed_at=str(record["confirmed_at"]),
+            )
+
+    def replace_publication_projections(
+        self,
+        *,
+        map_id: str,
+        records: list[dict[str, Any]],
+    ) -> None:
+        """Rebuild the publication cache exclusively from Issue history."""
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM publication_record_projections WHERE map_id = ?",
+                (map_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO publication_record_projections(
+                    record_id, map_id, action_id, approval_request_id, status,
+                    revision, action, target_json, evidence_json, reason,
+                    occurred_at, tracker_record_id, tracker_record_url,
+                    confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    self._publication_projection_values(map_id, record)
+                    for record in records
+                ],
+            )
+
+    @staticmethod
+    def _publication_projection_values(
+        map_id: str,
+        record: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        return (
+            record["record_id"],
+            map_id,
+            record["action_id"],
+            record["approval_request_id"],
+            record["status"],
+            record["revision"],
+            record["action"],
+            normalized_json(record["target"]),
+            (
+                normalized_json(record["evidence"])
+                if record.get("evidence") is not None
+                else None
+            ),
+            record.get("reason"),
+            record["occurred_at"],
+            record["tracker"]["id"],
+            record["tracker"]["url"],
+            record["confirmed_at"],
+        )
+
+    def recent_publication_records(self, *, map_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM publication_record_projections
+                WHERE map_id = ?
+                ORDER BY rowid ASC
+                """,
+                (map_id,),
+            ).fetchall()
+        records = []
+        for row in rows:
+            record = {
+                "record_id": row["record_id"],
+                "action_id": row["action_id"],
+                "map_id": row["map_id"],
+                "approval_request_id": row["approval_request_id"],
+                "status": row["status"],
+                "revision": row["revision"],
+                "action": row["action"],
+                "target": json.loads(row["target_json"]),
+                "occurred_at": row["occurred_at"],
+                "tracker": {
+                    "id": row["tracker_record_id"],
+                    "url": row["tracker_record_url"],
+                },
+                "confirmed_at": row["confirmed_at"],
+            }
+            if row["evidence_json"] is not None:
+                record["evidence"] = json.loads(row["evidence_json"])
+            if row["reason"] is not None:
+                record["reason"] = row["reason"]
+            records.append(record)
+        return records
+
+    def publication_summary(self, *, map_id: str) -> dict[str, Any]:
+        records = self.recent_publication_records(map_id=map_id)
+        unresolved_incidents = [
+            record
+            for index, record in enumerate(records)
+            if record["status"] == "repair_required"
+            and not any(
+                later["action_id"] == record["action_id"]
+                and later["status"] in {"succeeded", "aborted"}
+                for later in records[index + 1 :]
+            )
+        ]
+        state = "not_published"
+        if unresolved_incidents:
+            state = "repair_required"
+        elif any(record["status"] == "succeeded" for record in records):
+            state = "published"
+        elif any(record["status"] == "aborted" for record in records):
+            state = "aborted"
+        return {
+            "state": state,
+            "records": records,
+            "unresolved_incidents": unresolved_incidents,
+        }
+
     @contextmanager
     def _map_lease(self, *, namespace: str, map_id: str) -> Iterator[None]:
         lease_root = self.root / f".{namespace}-leases"
         lease_root.mkdir(parents=True, exist_ok=True)
+        self._share_path(lease_root, directory=True)
         lease_name = hashlib.sha256(map_id.encode()).hexdigest()
         lease_path = lease_root / f"{lease_name}.lock"
         with lease_path.open("a+b") as lease:
+            self._share_path(lease_path, directory=False)
             fcntl.flock(lease.fileno(), fcntl.LOCK_EX)
             try:
                 yield
@@ -2089,6 +2287,7 @@ class PluginStorage:
         decisions: dict[str, list[dict[str, Any]]],
         reports: dict[str, list[dict[str, Any]]],
         approvals: dict[str, list[dict[str, Any]]],
+        publications: dict[str, list[dict[str, Any]]],
         synchronized_at: str,
     ) -> None:
         """Atomically publish one complete authoritative project reconcile."""
@@ -2173,9 +2372,9 @@ class PluginStorage:
                         map_id, record_id, report_type, summary, reported_at,
                         evidence_json, blocking, continuation_requirement,
                         failure_code, correlation_id, decision_class, scope_json,
-                        options_json, tracker_record_id, tracker_record_url,
-                        confirmed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        options_json, acceptance_json, tracker_record_id,
+                        tracker_record_url, confirmed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         self._pm_report_projection_values(card["id"], report)
@@ -2186,6 +2385,24 @@ class PluginStorage:
                     connection,
                     map_id=card["id"],
                     approvals=approvals.get(card["id"], []),
+                )
+                connection.execute(
+                    "DELETE FROM publication_record_projections WHERE map_id = ?",
+                    (card["id"],),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO publication_record_projections(
+                        record_id, map_id, action_id, approval_request_id, status,
+                        revision, action, target_json, evidence_json, reason,
+                        occurred_at, tracker_record_id, tracker_record_url,
+                        confirmed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        self._publication_projection_values(card["id"], record)
+                        for record in publications.get(card["id"], [])
+                    ],
                 )
             connection.execute(
                 """
@@ -2207,6 +2424,7 @@ class PluginStorage:
                     map_id: [approval["public"] for approval in map_approvals]
                     for map_id, map_approvals in approvals.items()
                 },
+                "publications": publications,
                 "last_success_at": synchronized_at,
             }
             append_board_event(
@@ -3126,11 +3344,19 @@ class PluginStorage:
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         self.root.mkdir(parents=True, exist_ok=True)
+        self._share_path(self.root, directory=True)
         connection = sqlite3.connect(self.database)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA journal_mode=WAL")
+            for path in (
+                self.database,
+                self.database.with_name(f"{self.database.name}-wal"),
+                self.database.with_name(f"{self.database.name}-shm"),
+            ):
+                if path.exists():
+                    self._share_path(path, directory=False)
             self._ensure_schema(connection)
             yield connection
             connection.commit()
@@ -3472,6 +3698,7 @@ class PluginStorage:
                 decision_class TEXT,
                 scope_json TEXT,
                 options_json TEXT,
+                acceptance_json TEXT,
                 tracker_record_id TEXT NOT NULL,
                 tracker_record_url TEXT NOT NULL,
                 confirmed_at TEXT NOT NULL,
@@ -3490,11 +3717,72 @@ class PluginStorage:
             ("decision_class", "TEXT"),
             ("scope_json", "TEXT"),
             ("options_json", "TEXT"),
+            ("acceptance_json", "TEXT"),
         ):
             if name not in pm_report_columns:
                 connection.execute(
                     f"ALTER TABLE pm_report_projections ADD COLUMN {name} {declaration}"
                 )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS publication_record_projections (
+                record_id TEXT PRIMARY KEY,
+                map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
+                action_id TEXT NOT NULL,
+                approval_request_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'succeeded', 'repair_required', 'aborted'
+                )),
+                revision TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target_json TEXT NOT NULL,
+                evidence_json TEXT,
+                reason TEXT,
+                occurred_at TEXT NOT NULL,
+                tracker_record_id TEXT NOT NULL,
+                tracker_record_url TEXT NOT NULL,
+                confirmed_at TEXT NOT NULL
+            )
+            """
+        )
+        publication_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'publication_record_projections'"
+        ).fetchone()
+        if publication_schema is not None and "'aborted'" not in str(
+            publication_schema["sql"]
+        ):
+            connection.execute(
+                "ALTER TABLE publication_record_projections "
+                "RENAME TO publication_record_projections_v18"
+            )
+            connection.execute(
+                """
+                CREATE TABLE publication_record_projections (
+                    record_id TEXT PRIMARY KEY,
+                    map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
+                    action_id TEXT NOT NULL,
+                    approval_request_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'succeeded', 'repair_required', 'aborted'
+                    )),
+                    revision TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    target_json TEXT NOT NULL,
+                    evidence_json TEXT,
+                    reason TEXT,
+                    occurred_at TEXT NOT NULL,
+                    tracker_record_id TEXT NOT NULL,
+                    tracker_record_url TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO publication_record_projections "
+                "SELECT * FROM publication_record_projections_v18"
+            )
+            connection.execute("DROP TABLE publication_record_projections_v18")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS coordinator_lifecycle (
@@ -3603,6 +3891,14 @@ class PluginStorage:
                 requested_at TEXT NOT NULL,
                 prior_terminal_reason TEXT NOT NULL,
                 prior_attempt_count INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbox_external_calls (
+                effect_id TEXT PRIMARY KEY REFERENCES outbox_intents(effect_id),
+                started_at TEXT NOT NULL
             )
             """
         )

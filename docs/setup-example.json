@@ -2,7 +2,8 @@
   "schema_version": 1,
   "profiles": {
     "ceo": "maps-ceo",
-    "pm": "maps-pm"
+    "pm": "maps-pm",
+    "publisher": "maps-publisher"
   },
   "skills": {
     "plugin": [
@@ -57,12 +58,19 @@
   "authorities": {
     "worker": {
       "kind": "local_git",
-      "credential_ref": "local-git"
+      "credential_ref": "local-git",
+      "os_user": "maps-worker",
+      "git_executable": "/usr/bin/git"
     },
     "publisher": {
       "kind": "gh",
       "credential_ref": "gh:github.com:governance-bot",
       "account": "governance-bot",
+      "gh_config_dir": "/Users/example/.hermes/profiles/maps-publisher/gh-config",
+      "os_user": "maps-publisher",
+      "git_executable": "/usr/bin/git",
+      "gh_executable": "/usr/local/bin/gh",
+      "control_group": "maps-governance",
       "required": false
     }
   },

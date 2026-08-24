@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Mapping, Protocol
+from contextlib import nullcontext
+from typing import Any, Callable, ContextManager, Mapping, Protocol
 
 from .approvals import (
     ApprovalHistoryEvent,
@@ -17,6 +18,13 @@ from .outbox import (
     OutboxIntent,
 )
 from .reports import PMReport, TrackerPMReportRecord
+from .publication import (
+    ApprovedPublicationAction,
+    PublicationRecord,
+    PublicationPartialFailure,
+    PublisherBoundary,
+    RemotePublicationEvidence,
+)
 from .sessions import CanonicalSession
 from .stages import executive_stage
 from .tracker import (
@@ -26,6 +34,7 @@ from .tracker import (
     TrackerConflictError,
     TrackerDecisionRecord,
     TrackerIssue,
+    TrackerPublicationRecord,
 )
 
 
@@ -33,8 +42,81 @@ TRACKER_STAGE_TRANSITION = "tracker.stage-transition"
 TRACKER_DECISION = "tracker.decision"
 TRACKER_APPROVAL_EVENT = "tracker.approval-event"
 TRACKER_PM_REPORT = "tracker.pm-report"
+TRACKER_PUBLICATION_RECORD = "tracker.publication-record"
+TRACKER_ISSUE_CLOSE = "tracker.issue-close"
+PUBLISHER_EXECUTE = "publisher.execute"
 SESSION_RESUME = "session.resume"
 COORDINATOR_RESUME = "coordinator.resume"
+
+
+class PublisherEffectAdapter(EffectAdapter):
+    """Execute only the exact approved action and reconcile provider evidence."""
+
+    def __init__(
+        self,
+        boundary: PublisherBoundary,
+        *,
+        execution_fence: Callable[[OutboxIntent], ContextManager[None]] | None = None,
+        before_execute: Callable[[OutboxIntent], None] | None = None,
+    ) -> None:
+        self._boundary = boundary
+        self._execution_fence = execution_fence or (lambda _intent: nullcontext())
+        self._before_execute = before_execute or (lambda _intent: None)
+
+    def readback(self, intent: OutboxIntent) -> EffectConfirmation | None:
+        if intent.effect_type != PUBLISHER_EXECUTE:
+            raise EffectTerminalError(
+                f"Unsupported publisher effect: {intent.effect_type}"
+            )
+        action = ApprovedPublicationAction.from_payload(
+            TrackerEffectAdapter._object(intent.payload, "action")
+        )
+        evidence = self._boundary.readback(action)
+        if evidence is None:
+            return None
+        if not isinstance(evidence, RemotePublicationEvidence):
+            raise EffectTerminalError("Publisher readback has invalid evidence")
+        if (
+            evidence.action_id != action.action_id
+            or evidence.revision != action.revision
+            or evidence.action != action.action
+            or evidence.target != action.target
+        ):
+            raise EffectTerminalError(
+                "Publisher readback belongs to another revision or target"
+            )
+        return EffectConfirmation({"evidence": evidence.payload()})
+
+    def apply(self, intent: OutboxIntent) -> None:
+        action = ApprovedPublicationAction.from_payload(
+            TrackerEffectAdapter._object(intent.payload, "action")
+        )
+        with self._execution_fence(intent):
+            try:
+                self._boundary.validate_authority()
+                self._boundary.validate_action(action)
+                prepare = getattr(self._boundary, "prepare_action", None)
+                if prepare is not None:
+                    prepare(action)
+            except Exception as error:
+                raise EffectTerminalError(
+                    "Publisher authority or action failed final preflight"
+                ) from error
+            try:
+                self._before_execute(intent)
+            except Exception:
+                abort = getattr(self._boundary, "abort_action", None)
+                if abort is not None:
+                    abort(action)
+                raise
+            try:
+                self._boundary.execute(action)
+            except PublicationPartialFailure:
+                raise
+            except Exception as error:
+                raise PublicationPartialFailure(
+                    f"Publisher execution returned an unknown remote outcome: {error}"
+                ) from error
 
 
 class SessionResumeBoundary(Protocol):
@@ -162,10 +244,20 @@ class TrackerEffectPayloadConflict(EffectTerminalError):
 class TrackerEffectAdapter(EffectAdapter):
     """Apply tracker mutations and prove them through authoritative readback."""
 
-    def __init__(self, tracker: TrackerAdapter) -> None:
+    def __init__(
+        self,
+        tracker: TrackerAdapter,
+        *,
+        publication_fence: Callable[[OutboxIntent], ContextManager[None]] | None = None,
+    ) -> None:
         self._tracker = tracker
+        self._publication_fence = publication_fence or (lambda _intent: nullcontext())
 
     def readback(self, intent: OutboxIntent) -> EffectConfirmation | None:
+        if intent.effect_type == TRACKER_ISSUE_CLOSE:
+            return self._issue_close_readback(intent)
+        if intent.effect_type == TRACKER_PUBLICATION_RECORD:
+            return self._publication_readback(intent)
         if intent.effect_type == TRACKER_APPROVAL_EVENT:
             return self._approval_readback(intent)
         if intent.effect_type == TRACKER_PM_REPORT:
@@ -193,6 +285,27 @@ class TrackerEffectAdapter(EffectAdapter):
         )
 
     def apply(self, intent: OutboxIntent) -> None:
+        if intent.effect_type == TRACKER_ISSUE_CLOSE:
+            with self._publication_fence(intent):
+                if self._issue_close_readback(intent) is None:
+                    payload = intent.payload
+                    self._tracker.close_issue(
+                        self._required(payload, "issue_url"),
+                        issue_id=self._required(payload, "issue_id"),
+                        state_reason=self._required(payload, "state_reason"),
+                    )
+            return
+        if intent.effect_type == TRACKER_PUBLICATION_RECORD:
+            with self._publication_fence(intent):
+                payload = intent.payload
+                self._tracker.append_publication_record(
+                    self._required(payload, "issue_url"),
+                    issue_id=self._required(payload, "issue_id"),
+                    record=PublicationRecord.from_payload(
+                        self._object(payload, "record")
+                    ),
+                )
+            return
         if intent.effect_type == TRACKER_APPROVAL_EVENT:
             payload = intent.payload
             self._tracker.append_approval_event(
@@ -229,6 +342,118 @@ class TrackerEffectAdapter(EffectAdapter):
                 current_stage=error.current_stage,
                 requested_stage=error.requested_stage,
             ) from error
+
+    def _issue_close_readback(
+        self,
+        intent: OutboxIntent,
+    ) -> EffectConfirmation | None:
+        payload = intent.payload
+        issue_url = self._required(payload, "issue_url")
+        issue_id = self._required(payload, "issue_id")
+        state_reason = self._required(payload, "state_reason")
+        if state_reason == "not_planned":
+            event_id = self._required(payload, "consumption_event_id")
+            request_id = self._required(payload, "approval_request_id")
+            mutation_id = self._required(payload, "protected_mutation_id")
+            payload_hash = self._required(payload, "approval_payload_hash")
+            matching = [
+                record.event
+                for record in self._tracker.list_approval_events(issue_url)
+                if record.event.event_id == event_id
+            ]
+            if len(matching) != 1:
+                raise EffectTerminalError(
+                    "Not-planned closeout requires one immutable consumption event"
+                )
+            event = matching[0]
+            if (
+                event.request_id != request_id
+                or event.event_type != "consumed"
+                or event.payload_hash != payload_hash
+                or event.details.get("mutation_id") != mutation_id
+                or event.details.get("action") != "cancel_map"
+            ):
+                raise EffectTerminalError(
+                    "Not-planned closeout consumption authority changed"
+                )
+        elif state_reason == "completed":
+            record_id = self._required(payload, "publication_record_id")
+            records = self._tracker.list_publication_records(issue_url)
+            matching = [
+                record for record in records if record.record.record_id == record_id
+            ]
+            if len(matching) != 1 or matching[0].record.status != "succeeded":
+                raise EffectTerminalError(
+                    "Completed closeout requires immutable publication evidence"
+                )
+            unresolved = {
+                item.record.action_id
+                for index, item in enumerate(records)
+                if item.record.status == "repair_required"
+                and not any(
+                    later.record.action_id == item.record.action_id
+                    and later.record.status in {"succeeded", "aborted"}
+                    for later in records[index + 1 :]
+                )
+            }
+            if unresolved:
+                raise EffectTerminalError(
+                    "Completed closeout is blocked by an unresolved publication incident"
+                )
+            expected_report_id = self._required(payload, "acceptance_report_id")
+            acceptance_reports = [
+                item.report.content.record_id
+                for item in self._tracker.list_pm_reports(issue_url)
+                if item.report.content.report_type == "acceptance"
+            ]
+            if not acceptance_reports or acceptance_reports[-1] != expected_report_id:
+                raise EffectTerminalError(
+                    "Completed closeout acceptance lineage changed after publication"
+                )
+        issue = self._tracker.get_issue(issue_url)
+        if issue.id != issue_id:
+            raise EffectTerminalError("Bound GitHub Issue identity changed")
+        if issue.state == "open":
+            expected_stage = self._required(payload, "expected_stage")
+            if self._stage(issue) != expected_stage:
+                raise EffectTerminalError(
+                    "Completed closeout expected another authoritative Map stage"
+                )
+            return None
+        if issue.state == "closed" and issue.state_reason == state_reason:
+            return EffectConfirmation({"issue": self.issue_payload(issue)})
+        raise EffectTerminalError("Issue is already closed with another reason")
+
+    def _publication_readback(
+        self,
+        intent: OutboxIntent,
+    ) -> EffectConfirmation | None:
+        payload = intent.payload
+        requested = PublicationRecord.from_payload(self._object(payload, "record"))
+        matching: TrackerPublicationRecord | None = None
+        for record in self._tracker.list_publication_records(
+            self._required(payload, "issue_url")
+        ):
+            if record.record.record_id != requested.record_id:
+                continue
+            if matching is not None and matching.record != record.record:
+                raise TrackerEffectPayloadConflict(
+                    "tracker publication marker has conflicting history"
+                )
+            matching = matching or record
+        if matching is None:
+            return None
+        if matching.record != requested:
+            raise TrackerEffectPayloadConflict(
+                "tracker publication marker belongs to another payload"
+            )
+        return EffectConfirmation(
+            {
+                "record": matching.record.payload(),
+                "tracker_record_id": matching.tracker_record_id,
+                "tracker_record_url": matching.tracker_record_url,
+            }
+        )
 
     def _decision_readback(
         self,

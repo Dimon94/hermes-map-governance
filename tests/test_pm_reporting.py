@@ -9,10 +9,12 @@ import sqlite3
 import pytest
 
 from map_governance import (
+    AcceptanceEvidence,
     GovernanceAuthorizationError,
     GovernanceRequestIdentity,
     MapGovernanceApplication,
     PMReportConflict,
+    PublicationAction,
     TrackerPMReportConfirmationError,
 )
 from map_governance.reports import PMReport, PMReportDraft, TrackerPMReportRecord
@@ -27,6 +29,20 @@ OTHER_MAP_ID = "I_atlas_42"
 OTHER_ISSUE_URL = "https://github.com/acme/atlas/issues/42"
 PROJECT_URL = "https://github.com/orgs/acme/projects/7"
 PM_IDENTITY = GovernanceRequestIdentity("pm", "pm-session-atlas")
+
+
+def _acceptance_evidence() -> AcceptanceEvidence:
+    return AcceptanceEvidence(
+        revision="a" * 40,
+        delivered_scope=("The declared outcome is delivered.",),
+        validations=("The outcome contract suite passed.",),
+        known_limitations=(),
+        rollback_considerations=("Restore the previous integration revision.",),
+        requested_publication_action=PublicationAction(
+            action="push",
+            target={"repository": "acme/atlas", "ref": "refs/heads/main"},
+        ),
+    )
 
 
 class PMTracker:
@@ -404,6 +420,7 @@ def test_question_commits_complete_contract_before_one_canonical_ceo_turn(tmp_pa
             summary="The accepted outcomes are ready for chairman review.",
             timestamp="2026-08-23T10:00:00Z",
             evidence=("Outcome contract suite passed.",),
+            acceptance=_acceptance_evidence(),
         ),
         PMReportDraft(
             record_id="failure-1",
@@ -500,6 +517,7 @@ def test_controllable_coordinator_runs_every_report_type_without_lane_leakage(
             summary="The agreed outcomes are ready for executive acceptance.",
             timestamp="2026-08-23T10:04:00Z",
             evidence=("The outcome-level contract suite passed.",),
+            acceptance=_acceptance_evidence(),
         ),
         PMReportDraft(
             record_id="failure-scenario",
@@ -900,6 +918,7 @@ def test_acceptance_report_submits_evidence_without_approving_or_closing_the_map
             summary="The outcome is ready for executive review.",
             timestamp="2026-08-23T10:08:00Z",
             evidence=("The public outcome contract passed.",),
+            acceptance=_acceptance_evidence(),
         ),
     )
 
