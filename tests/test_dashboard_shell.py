@@ -239,3 +239,23 @@ def test_map_card_renders_terminal_outbox_reason_and_repair_command():
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout == "dashboard Outbox repair ready\n"
+
+
+def test_dashboard_previews_and_applies_only_selected_safe_identity_repairs():
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail("Node.js is required to exercise the dashboard plugin bundle")
+    result = subprocess.run(
+        [
+            node,
+            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
+            "identity-repair",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "dashboard identity repair ready\n"

@@ -22,6 +22,7 @@ from map_governance.tracker import TrackerError, TrackerIssue, TrackerProject
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_URL = "https://github.com/orgs/acme/projects/7"
 ISSUE_URL = "https://github.com/acme/atlas/issues/41"
+JOURNAL_NOW = datetime(2026, 8, 23, 8, 0, tzinfo=timezone.utc)
 
 
 class TrackerBoundary:
@@ -118,6 +119,18 @@ def application(storage_root: Path) -> MapGovernanceApplication:
     )
 
 
+def event_journal(
+    storage_root: Path,
+    *,
+    settings: BoardEventSettings | None = None,
+) -> BoardEventJournal:
+    return BoardEventJournal(
+        storage_root / "registry.db",
+        settings=settings,
+        clock=lambda: JOURNAL_NOW,
+    )
+
+
 def test_committed_projection_events_resume_in_order_after_restart(tmp_path):
     storage_root = tmp_path / "plugin-data" / "map-governance"
     first_process = application(storage_root)
@@ -150,7 +163,7 @@ def test_committed_projection_events_resume_in_order_after_restart(tmp_path):
 def test_stable_event_id_is_idempotent_only_for_the_same_payload(tmp_path):
     storage_root = tmp_path / "plugin-data" / "map-governance"
     application(storage_root).health()
-    journal = BoardEventJournal(storage_root / "registry.db")
+    journal = event_journal(storage_root)
 
     created = journal.commit(
         event_id="map:I_atlas_41:version-1",
@@ -186,7 +199,7 @@ def test_stable_event_id_is_idempotent_only_for_the_same_payload(tmp_path):
 def test_out_of_order_stable_event_replay_cannot_regress_a_resource(tmp_path):
     storage_root = tmp_path / "plugin-data" / "map-governance"
     application(storage_root).health()
-    journal = BoardEventJournal(storage_root / "registry.db")
+    journal = event_journal(storage_root)
     shared = {
         "project_id": "PVT_acme_7",
         "map_id": "I_atlas_41",
@@ -221,7 +234,7 @@ def test_out_of_order_stable_event_replay_cannot_regress_a_resource(tmp_path):
 def test_rolled_back_transaction_never_exposes_its_board_event(tmp_path):
     storage_root = tmp_path / "plugin-data" / "map-governance"
     application(storage_root).health()
-    journal = BoardEventJournal(storage_root / "registry.db")
+    journal = event_journal(storage_root)
 
     with pytest.raises(RuntimeError, match="abort governance state"):
         with journal.atomic() as connection:
@@ -242,7 +255,7 @@ def test_rolled_back_transaction_never_exposes_its_board_event(tmp_path):
 def test_concurrent_commits_receive_one_total_durable_order(tmp_path):
     storage_root = tmp_path / "plugin-data" / "map-governance"
     application(storage_root).health()
-    journal = BoardEventJournal(storage_root / "registry.db")
+    journal = event_journal(storage_root)
 
     def commit(index: int) -> None:
         journal.commit(
@@ -265,8 +278,8 @@ def test_concurrent_commits_receive_one_total_durable_order(tmp_path):
 def test_concurrent_reads_report_one_consistent_journal_snapshot(tmp_path):
     storage_root = tmp_path / "plugin-data" / "map-governance"
     application(storage_root).health()
-    journal = BoardEventJournal(
-        storage_root / "registry.db",
+    journal = event_journal(
+        storage_root,
         settings=BoardEventSettings(max_events=1_000),
     )
     finished = Event()
@@ -299,8 +312,8 @@ def test_concurrent_reads_report_one_consistent_journal_snapshot(tmp_path):
 def test_expired_cursor_requires_one_full_projection_refresh(tmp_path):
     storage_root = tmp_path / "plugin-data" / "map-governance"
     application(storage_root).health()
-    journal = BoardEventJournal(
-        storage_root / "registry.db",
+    journal = event_journal(
+        storage_root,
         settings=BoardEventSettings(max_events=2, retention_seconds=86_400),
     )
     for index in range(1, 4):
@@ -397,7 +410,7 @@ def test_lagging_consumer_never_holds_or_blocks_governance_writers(tmp_path):
     storage_root = tmp_path / "plugin-data" / "map-governance"
     application(storage_root).health()
     settings = BoardEventSettings(max_events=5, retention_seconds=1_000_000_000)
-    journal = BoardEventJournal(storage_root / "registry.db", settings=settings)
+    journal = event_journal(storage_root, settings=settings)
     journal.commit(
         event_id="consumer-baseline",
         project_id="PVT_acme_7",
@@ -427,7 +440,7 @@ def test_lagging_consumer_never_holds_or_blocks_governance_writers(tmp_path):
     expired = journal.read(cursor=lagging_cursor)
     assert expired["status"] == "refresh_required"
     assert expired["latest_cursor"] == 101
-    restarted = BoardEventJournal(storage_root / "registry.db", settings=settings)
+    restarted = event_journal(storage_root, settings=settings)
     assert restarted.read(cursor=96)["cursor"] == 101
 
 

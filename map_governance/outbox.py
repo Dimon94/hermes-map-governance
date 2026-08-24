@@ -727,6 +727,18 @@ class OutboxRepository:
             if intent.state != "succeeded"
         )
 
+    def all_unfinished_intents(self) -> tuple[OutboxIntent, ...]:
+        """Return all durable work still visible to restart reconciliation."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM outbox_intents
+                WHERE state <> 'succeeded'
+                ORDER BY created_at, effect_id
+                """
+            ).fetchall()
+        return tuple(self._intent(row) for row in rows)
+
     def expedite_retry(self, *, effect_id: str, now: str) -> None:
         """Make a scheduled retry due after an explicit synchronous user retry."""
         timestamp = self._format_timestamp(self._timestamp(now, name="now"))

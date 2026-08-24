@@ -503,6 +503,129 @@ def test_restart_recovers_workspace_created_before_coordinate_commit(tmp_path):
     assert not any(call[3:5] == ("workspace", "create") for call in runner.calls)
 
 
+def test_repair_preview_rediscovers_one_owned_runtime_without_mutation(tmp_path):
+    storage = PluginStorage(tmp_path / "plugin-data")
+    request = _request(tmp_path)
+    lifecycle = storage.coordinator_lifecycle(created_at="2026-08-24T00:00:00Z")
+    namespace = CoordinatorRuntime.session_namespace(lifecycle)
+    label = CoordinatorRuntime.workspace_label(lifecycle, request.map_id)
+    agent_name = CoordinatorRuntime.agent_name(lifecycle, request.map_id)
+    marker = CoordinatorRuntime.ownership_marker(lifecycle, request.map_id)
+    storage.reserve_pm_runtime(
+        map_id=request.map_id,
+        session_namespace=namespace,
+        workspace_label=label,
+        agent_id=agent_name,
+        ownership_marker=marker,
+        lifecycle_id=lifecycle,
+        context=request.context,
+        updated_at="2026-08-24T00:00:00Z",
+        session_ownership_marker=CoordinatorRuntime.session_ownership_marker(lifecycle),
+    )
+    storage.update_pm_runtime(
+        map_id=request.map_id,
+        state="repair_required",
+        workspace_id=None,
+        window_id=None,
+        pane_id=None,
+        agent_session_id=None,
+        failure={
+            "reason": "partial_coordinates",
+            "retryable": False,
+            "repair_required": True,
+        },
+        updated_at="2026-08-24T00:00:01Z",
+    )
+    runner = ScriptedRunner(
+        [
+            _session_list(namespace),
+            _workspace_list({"workspace_id": "w-recovered", "label": label}),
+            _result(
+                {
+                    "result": {
+                        "workspace": {
+                            "workspace_id": "w-recovered",
+                            "label": label,
+                            "active_tab_id": "w-recovered:t1",
+                        }
+                    }
+                }
+            ),
+            _result(
+                {
+                    "result": {
+                        "panes": [
+                            {
+                                "workspace_id": "w-recovered",
+                                "tab_id": "w-recovered:t1",
+                                "pane_id": "w-recovered:p1",
+                                "cwd": request.context.repository_path,
+                            }
+                        ]
+                    }
+                }
+            ),
+            _result(
+                {
+                    "result": {
+                        "agent": {
+                            "name": agent_name,
+                            "agent": "hermes",
+                            "workspace_id": "w-recovered",
+                            "tab_id": "w-recovered:t1",
+                            "pane_id": "w-recovered:p1",
+                            "agent_session": {
+                                "agent": "hermes",
+                                "kind": "id",
+                                "value": "hermes-session-recovered",
+                            },
+                        }
+                    }
+                }
+            ),
+        ]
+    )
+    runtime = CoordinatorRuntime(
+        storage=storage,
+        runner=runner,
+        clock=lambda: "2026-08-24T00:00:02Z",
+    )
+
+    preview = runtime.preview_repair(map_id=request.map_id)
+
+    assert preview == {
+        "before": {
+            "workspace_id": None,
+            "window_id": None,
+            "pane_id": None,
+            "agent_session_id": None,
+            "state": "repair_required",
+            "repair_reason": "partial_coordinates",
+        },
+        "after": {
+            "workspace_id": "w-recovered",
+            "window_id": "w-recovered:t1",
+            "pane_id": "w-recovered:p1",
+            "agent_session_id": "hermes-session-recovered",
+            "state": "pm_ready",
+        },
+        "evidence": {
+            "session_namespace": namespace,
+            "workspace_label": label,
+            "ownership_marker": marker,
+            "exact_workspace_count": 1,
+            "exact_pane_count": 1,
+            "exact_agent_count": 1,
+        },
+    }
+    assert runner.starts == []
+    assert not any(
+        operation in call
+        for call in runner.calls
+        for operation in ("create", "start", "kill", "delete")
+    )
+
+
 @pytest.mark.parametrize(
     ("bad_result", "reason"),
     [

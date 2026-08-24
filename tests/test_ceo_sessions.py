@@ -418,6 +418,10 @@ def test_zero_candidates_mints_once_and_persists_one_bootstrap_user_turn(tmp_pat
     assert backend.create_calls[0]["source"] == "desktop"
     assert len(backend.bootstrap_calls) == 1
     bootstrap = backend.bootstrap_calls[0]
+    assert HermesSessionAdapter(backend).has_bootstrap_marker(
+        root_session_id=first["ceo_session"]["root_session_id"],
+        idempotency_key=bootstrap["idempotency_key"],
+    )
     assert (
         canonical_session_identity(profile_name=PROFILE, map_id=MAP_ID)
         in bootstrap["content"]
@@ -477,6 +481,10 @@ def test_application_restart_and_compression_continue_the_recorded_lineage(tmp_p
     restarted = _application(tmp_path, backend, storage_root=storage_root)
     reopened = restarted.open_map(map_id=card["id"])
 
+    assert HermesSessionAdapter(backend).has_bootstrap_marker(
+        root_session_id=root,
+        idempotency_key=backend.bootstrap_calls[0]["idempotency_key"],
+    )
     assert reopened["ceo_session"] == {
         "state": "ready",
         "root_session_id": root,

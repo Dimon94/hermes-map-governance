@@ -399,6 +399,7 @@ class PrerequisiteApplication:
         profile_configs = self._doctor_profiles(checks, desired)
         self._doctor_skills(checks, desired, profile_configs)
         registry = self._doctor_storage(checks)
+        self._doctor_recovery(checks, registry)
         auth = self._doctor_github(checks, desired)
         self._doctor_bindings(checks, desired, registry)
         self._doctor_herdr(checks, desired)
@@ -621,9 +622,7 @@ class PrerequisiteApplication:
                 )
             )
 
-    def _doctor_storage(
-        self, checks: list[dict[str, Any]]
-    ) -> dict[str, list[dict[str, Any]]] | None:
+    def _doctor_storage(self, checks: list[dict[str, Any]]) -> dict[str, Any] | None:
         root = self._storage_root
         try:
             metadata = root.lstat()
@@ -729,7 +728,7 @@ class PrerequisiteApplication:
             )
         )
         database = root / "registry.db"
-        registry: dict[str, list[dict[str, Any]]] | None = None
+        registry: dict[str, Any] | None = None
         try:
             database_metadata = database.lstat()
             if (
@@ -765,7 +764,50 @@ class PrerequisiteApplication:
                         """
                     )
                 ]
-                registry = {"projects": projects, "maps": maps}
+                table_names = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                recovery = None
+                if {
+                    "ceo_session_bindings",
+                    "pm_runtime_bindings",
+                    "outbox_intents",
+                } <= table_names:
+                    recovery = {
+                        "available": True,
+                        "ceo_session_repair_required": int(
+                            connection.execute(
+                                """
+                                SELECT COUNT(*) FROM ceo_session_bindings
+                                WHERE state = 'repair_required'
+                                """
+                            ).fetchone()[0]
+                        ),
+                        "pm_runtime_repair_required": int(
+                            connection.execute(
+                                """
+                                SELECT COUNT(*) FROM pm_runtime_bindings
+                                WHERE state = 'repair_required'
+                                """
+                            ).fetchone()[0]
+                        ),
+                        "unfinished_outbox": int(
+                            connection.execute(
+                                """
+                                SELECT COUNT(*) FROM outbox_intents
+                                WHERE state <> 'succeeded'
+                                """
+                            ).fetchone()[0]
+                        ),
+                    }
+                registry = {
+                    "projects": projects,
+                    "maps": maps,
+                    "recovery": recovery,
+                }
             database_ready = True
             schema_version = int(metadata_row["schema_version"])
         except (OSError, sqlite3.Error, TypeError, ValueError):
@@ -792,6 +834,65 @@ class PrerequisiteApplication:
             )
         )
         return registry
+
+    @staticmethod
+    def _doctor_recovery(
+        checks: list[dict[str, Any]],
+        registry: Mapping[str, Any] | None,
+    ) -> None:
+        recovery = registry.get("recovery") if registry is not None else None
+        if not isinstance(recovery, Mapping):
+            checks.append(
+                _check(
+                    "recovery.registry",
+                    "warning" if registry is not None else "fail",
+                    "Restart recovery evidence is unavailable",
+                    {
+                        "available": False,
+                        "ceo_session_repair_required": 0,
+                        "pm_runtime_repair_required": 0,
+                        "unfinished_outbox": 0,
+                    },
+                    remediation=(
+                        "Upgrade or explicitly repair the plugin registry; doctor will not initialize it."
+                    ),
+                )
+            )
+            return
+        session_repairs = int(recovery["ceo_session_repair_required"])
+        runtime_repairs = int(recovery["pm_runtime_repair_required"])
+        unfinished = int(recovery["unfinished_outbox"])
+        if session_repairs or runtime_repairs:
+            status = "fail"
+            summary = "Identity bindings require explicit safe repair"
+            remediation = "Run maps repair preview and explicitly apply only verified safe actions."
+        elif unfinished:
+            status = "warning"
+            summary = "Durable Outbox work remains recoverable"
+            remediation = "Run maps recover or allow the backend dispatcher to reconcile durable work."
+        else:
+            status = "pass"
+            summary = "Durable restart state has no outstanding repair"
+            remediation = None
+        checks.append(
+            _check(
+                "recovery.registry",
+                status,
+                summary,
+                {
+                    "available": True,
+                    "ceo_session_repair_required": session_repairs,
+                    "pm_runtime_repair_required": runtime_repairs,
+                    "unfinished_outbox": unfinished,
+                },
+                remediation=remediation,
+                command=(
+                    ["hermes", "maps", "repair", "preview", "--profile", "PROFILE"]
+                    if status == "fail"
+                    else None
+                ),
+            )
+        )
 
     @staticmethod
     def project_command(
@@ -1301,7 +1402,7 @@ class PrerequisiteApplication:
         self,
         checks: list[dict[str, Any]],
         desired: Mapping[str, Any] | None,
-        registry: Mapping[str, list[dict[str, Any]]] | None,
+        registry: Mapping[str, Any] | None,
     ) -> None:
         if desired is None or registry is None:
             checks.extend(

@@ -297,6 +297,92 @@ def test_native_maps_commands_delegate_to_the_application(
     ]
 
 
+def test_native_recovery_and_identity_repair_are_profile_scoped_and_explicit(
+    tmp_path, monkeypatch, capsys
+):
+    calls = []
+
+    class ApplicationProbe:
+        def recover_restart(self, **arguments):
+            calls.append(("recover_restart", arguments))
+            return {"state": "recovered"}
+
+        def preview_repairs(self):
+            calls.append(("preview_repairs", {}))
+            return {"plan_id": "identity-repair:one", "actions": []}
+
+        def apply_repairs(self, **arguments):
+            calls.append(("apply_repairs", arguments))
+            return {"state": "applied"}
+
+    monkeypatch.setattr(
+        native,
+        "application_for_profile",
+        lambda profile: (
+            calls.append(("profile", {"profile": profile})) or ApplicationProbe()
+        ),
+    )
+    registrations = []
+    context = SimpleNamespace(
+        state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
+        register_cli_command=lambda **command: registrations.append(command),
+    )
+    native.register(context)
+    command = registrations[0]
+    parser = ArgumentParser()
+    command["setup_fn"](parser)
+    plan = tmp_path / "repair-plan.json"
+    plan.write_text(
+        json.dumps({"plan_id": "identity-repair:one", "actions": []}),
+        encoding="utf-8",
+    )
+
+    arguments = [
+        parser.parse_args(["recover", "--profile", "ceo", "--limit", "25"]),
+        parser.parse_args(["repair", "preview", "--profile", "ceo"]),
+        parser.parse_args(
+            [
+                "repair",
+                "apply",
+                "--profile",
+                "ceo",
+                "--file",
+                str(plan),
+                "--action",
+                "safe-action-1",
+                "--authorizer",
+                "basic:local-operator",
+            ]
+        ),
+    ]
+
+    assert [command["handler_fn"](args) for args in arguments] == [0, 0, 0]
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == [
+        {"state": "recovered"},
+        {"actions": [], "plan_id": "identity-repair:one"},
+        {"state": "applied"},
+    ]
+    assert calls == [
+        ("profile", {"profile": "ceo"}),
+        ("recover_restart", {"outbox_limit": 25}),
+        ("profile", {"profile": "ceo"}),
+        ("preview_repairs", {}),
+        ("profile", {"profile": "ceo"}),
+        (
+            "apply_repairs",
+            {
+                "plan": {"plan_id": "identity-repair:one", "actions": []},
+                "selected_action_ids": ["safe-action-1"],
+                "authorizer": "basic:local-operator",
+            },
+        ),
+    ]
+
+
 def test_native_setup_and_doctor_use_prerequisite_seam_without_operational_storage(
     tmp_path, monkeypatch, capsys
 ):

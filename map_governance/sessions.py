@@ -124,6 +124,13 @@ class CEOSessionRunner(Protocol):
 
     def resolve(self, *, root_session_id: str) -> CanonicalSession | None: ...
 
+    def has_bootstrap_marker(
+        self,
+        *,
+        root_session_id: str,
+        idempotency_key: str,
+    ) -> bool: ...
+
     def has_resume_marker(
         self,
         *,
@@ -250,6 +257,23 @@ class HermesSessionAdapter:
             session,
             bootstrap_sent=session.bootstrap_sent,
             operation="CEO Skill loading",
+        )
+
+    def has_bootstrap_marker(
+        self,
+        *,
+        root_session_id: str,
+        idempotency_key: str,
+    ) -> bool:
+        """Verify the exact persisted Map bootstrap before identity repair."""
+        session = self.resolve(root_session_id=root_session_id)
+        if session is None:
+            return False
+        return bool(
+            self._backend.has_message_id(
+                session.root_session_id,
+                idempotency_key,
+            )
         )
 
     def has_resume_marker(

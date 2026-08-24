@@ -777,6 +777,7 @@ def test_restart_adopts_tracker_confirmed_decision_after_crash_before_ledger_upd
 
 
 def test_bind_rebuilds_approval_ledger_from_authoritative_issue_history(tmp_path):
+    clock = _clock_box()
     tracker = ApprovalTracker()
     packet = _packet()
     tracker.approval_records[ISSUE_URL].extend(
@@ -814,7 +815,7 @@ def test_bind_rebuilds_approval_ledger_from_authoritative_issue_history(tmp_path
         ]
     )
 
-    application, _ = _application(tmp_path, tracker)
+    application, _ = _application(tmp_path, tracker, clock=clock)
 
     approval = application.map_detail(map_id=MAP_ID)["approvals"]["items"][0]
     assert approval["status"] == "approved"

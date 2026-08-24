@@ -37,6 +37,37 @@ function useState(initialValue) {
 function fetchJSON(path, options) {
   requestedPaths.push(path);
   requestedOptions.push(options || {});
+  if (path.includes("/repair/preview?profile=")) {
+    return Promise.resolve({
+      plan_id: "identity-repair:preview-1",
+      actions: [
+        {
+          id: "ceo-session:I_atlas_41:rebind:canonical-root",
+          kind: "ceo_session.rebind",
+          map_id: "I_atlas_41",
+          safe: true,
+          before: { state: "repair_required", root_session_id: "missing-root" },
+          after: { state: "ready", root_session_id: "canonical-root" },
+          evidence: { exact_candidate_count: 1 },
+        },
+      ],
+      blocked: [
+        {
+          resource: "pm_runtime",
+          map_id: "I_other_7",
+          reason: "workspace_recovery_ambiguous",
+          evidence: { exact_workspace_count: 2 },
+        },
+      ],
+    });
+  }
+  if (path.includes("/repair/apply?profile=")) {
+    return Promise.resolve({
+      state: "applied",
+      authorizer: "basic:operator-1",
+      applied_action_ids: ["ceo-session:I_atlas_41:rebind:canonical-root"],
+    });
+  }
   if (path.includes("/approvals/approval-delivery-001/decision?profile=")) {
     chairmanDecisionRecorded = true;
     return Promise.resolve({ status: "approved" });
@@ -758,6 +789,48 @@ assert.deepEqual(JSON.parse(requestedOptions[applyIndex].body).selected_action_i
 ]);
 hookIndex = 0;
 assert.match(textContent(registeredPage()), /readback confirmed/);
+if (mode === "identity-repair") {
+  const repairButton = findNode(
+    readyTree,
+    (node) => node.type === "Button" && /Repair/.test(textContent(node)),
+  );
+  assert.ok(repairButton, "Maps page exposes identity repair preview");
+  repairButton.props.onClick();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const previewIndex = requestedPaths.findIndex((path) => path.includes("/repair/preview?profile="));
+  assert.notEqual(previewIndex, -1);
+  hookIndex = 0;
+  const repairPlanTree = registeredPage();
+  const repairPlanText = textContent(repairPlanTree);
+  assert.match(repairPlanText, /Identity repair/);
+  assert.match(repairPlanText, /workspace recovery ambiguous/);
+  assert.match(repairPlanText, /exact_candidate_count/);
+  assert.doesNotMatch(repairPlanText, /delete|kill|close Issue/i);
+  const repairAction = findNode(
+    repairPlanTree,
+    (node) => node.type === "input" && node.props.type === "checkbox",
+  );
+  assert.ok(repairAction);
+  repairAction.props.onChange();
+  hookIndex = 0;
+  const repairSelectedTree = registeredPage();
+  const applyRepair = findNode(
+    repairSelectedTree,
+    (node) => node.type === "Button" && /Apply selected safe repairs/.test(textContent(node)),
+  );
+  assert.equal(applyRepair.props.disabled, false);
+  applyRepair.props.onClick();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const repairApplyIndex = requestedPaths.findIndex((path) => path.includes("/repair/apply?profile="));
+  assert.notEqual(repairApplyIndex, -1);
+  assert.deepEqual(JSON.parse(requestedOptions[repairApplyIndex].body).selected_action_ids, [
+    "ceo-session:I_atlas_41:rebind:canonical-root",
+  ]);
+  hookIndex = 0;
+  assert.match(textContent(registeredPage()), /authorizer basic:operator-1/);
+}
 refreshButton.props.onClick();
 await new Promise((resolve) => setImmediate(resolve));
 await new Promise((resolve) => setImmediate(resolve));
@@ -784,5 +857,7 @@ process.stdout.write(
       ? "dashboard Outbox repair ready\n"
     : mode === "commission"
       ? "dashboard PM commission ready\n"
+    : mode === "identity-repair"
+      ? "dashboard identity repair ready\n"
       : "dashboard board ready\n",
 );

@@ -73,8 +73,10 @@ from .reports import (
 from .coordinator import (
     DELIVERY_TRANSPORT_RECOVERY_LIMITATION,
     CommissioningAuthorizationError,
+    CommissioningContext,
     CommissioningPrerequisiteError,
     CommissioningPrerequisiteResolver,
+    CoordinatorRuntimeError,
     CoordinatorRuntimeBoundary,
     DeliveryLaneRegistry,
     DeliveryLaneSpec,
@@ -485,6 +487,754 @@ class MapGovernanceApplication:
                     "Bind an existing GitHub Map Issue to start a governance board."
                 ),
             },
+        }
+
+    def recover_restart(self, *, outbox_limit: int = 100) -> dict[str, Any]:
+        """Rebuild durable projections and reconnect recorded runtime identities.
+
+        Recovery intentionally differs from ``open_map``: it never mints a CEO
+        session.  Only a previously recorded lineage that still resolves to its
+        exact canonical title is reconnected automatically.
+        """
+        rebuilt = self.refresh()
+        session_results: list[dict[str, Any]] = []
+        if self._session_runner is not None and self._profile_name:
+            for binding in self._storage.ceo_session_registry():
+                map_id = str(binding["map_id"])
+                if binding["profile_name"] != self._profile_name:
+                    self._record_ceo_repair_required(
+                        map_id=map_id,
+                        reason="canonical_profile_mismatch",
+                        candidate_count=0,
+                        preserve_existing_identity=True,
+                    )
+                    session_results.append(
+                        {
+                            "map_id": map_id,
+                            "state": "repair_required",
+                            "reason": "canonical_profile_mismatch",
+                            "evidence": {
+                                "recorded_profile_name": binding["profile_name"],
+                                "requested_profile_name": self._profile_name,
+                            },
+                        }
+                    )
+                    continue
+                try:
+                    result = self._recover_ceo_session(binding)
+                except CEOSessionRepairRequired as error:
+                    self._record_ceo_repair_required(
+                        map_id=map_id,
+                        reason=error.reason,
+                        candidate_count=error.candidate_count,
+                    )
+                    result = {
+                        "map_id": map_id,
+                        "state": "repair_required",
+                        "reason": error.reason,
+                    }
+                except (OSError, RuntimeError):
+                    result = {
+                        "map_id": map_id,
+                        "state": "pending",
+                        "reason": "session_reconnect_pending",
+                    }
+                session_results.append(result)
+
+        runtime_results = self._recover_pm_runtimes()
+        outbox = self.recover_outbox(limit=outbox_limit)
+        outbox["unfinished"] = [
+            {
+                "effect_id": intent.effect_id,
+                "effect_type": intent.effect_type,
+                "state": intent.state,
+                "attempt_count": intent.attempt_count,
+            }
+            for intent in self._outbox.all_unfinished_intents()
+        ]
+        projection_stale = any(
+            project.get("authority", {}).get("state") != "healthy"
+            for project in rebuilt["projects"]
+        )
+        repair_required = any(
+            item["state"] == "repair_required"
+            for item in [*session_results, *runtime_results]
+        ) or any(item["state"] == "terminal" for item in outbox["unfinished"])
+        pending = any(
+            item["state"] == "pending" for item in [*session_results, *runtime_results]
+        ) or bool(outbox["unfinished"])
+        return {
+            "state": (
+                "repair_required"
+                if repair_required
+                else "pending"
+                if pending
+                else "stale"
+                if projection_stale
+                else "recovered"
+            ),
+            "projections": {
+                "project_count": len(rebuilt["projects"]),
+                "map_count": len(rebuilt["maps"]),
+                "state": "stale" if projection_stale else "rebuilt",
+            },
+            "ceo_sessions": session_results,
+            "pm_runtimes": runtime_results,
+            "outbox": outbox,
+        }
+
+    def _recover_ceo_session(self, binding: Mapping[str, Any]) -> dict[str, Any]:
+        session_runner = self._session_runner
+        profile_name = self._profile_name
+        if session_runner is None or not profile_name:  # pragma: no cover
+            raise RuntimeError("CEO session recovery is not configured")
+        map_id = str(binding["map_id"])
+        expected_title = canonical_session_title(map_id)
+        if binding["state"] == "repair_required":
+            exact_candidates = session_runner.find_exact(title=expected_title)
+            reason = str(
+                binding.get("repair_reason") or "recorded_session_lineage_missing"
+            )
+            if len(exact_candidates) > 1:
+                reason = "multiple_exact_canonical_sessions"
+            recorded_root = str(binding.get("root_session_id") or "")
+            if (
+                len(exact_candidates) == 1
+                and recorded_root
+                and exact_candidates[0].root_session_id == recorded_root
+            ):
+                session = exact_candidates[0]
+            else:
+                self._record_ceo_repair_required(
+                    map_id=map_id,
+                    reason=reason,
+                    candidate_count=len(exact_candidates),
+                )
+                return {
+                    "map_id": map_id,
+                    "state": "repair_required",
+                    "reason": reason,
+                }
+        else:
+            root_session_id = str(binding["root_session_id"])
+            session = session_runner.resolve(root_session_id=root_session_id)
+            exact_candidates = session_runner.find_exact(title=expected_title)
+            if (
+                len(exact_candidates) != 1
+                or session is None
+                or session.title != expected_title
+                or exact_candidates[0].root_session_id != root_session_id
+            ):
+                reason = (
+                    "multiple_exact_canonical_sessions"
+                    if len(exact_candidates) > 1
+                    else (
+                        "recorded_session_lineage_missing"
+                        if session is None
+                        else (
+                            "recorded_session_lineage_conflicting"
+                            if session.title != expected_title
+                            else "canonical_session_inventory_conflicting"
+                        )
+                    )
+                )
+                self._record_ceo_repair_required(
+                    map_id=map_id,
+                    reason=reason,
+                    candidate_count=len(exact_candidates),
+                )
+                return {
+                    "map_id": map_id,
+                    "state": "repair_required",
+                    "reason": reason,
+                }
+        context = self._storage.map_session_context(map_id)
+        if context is None:
+            self._record_ceo_repair_required(
+                map_id=map_id,
+                reason="map_binding_missing",
+                candidate_count=0,
+            )
+            return {
+                "map_id": map_id,
+                "state": "repair_required",
+                "reason": "map_binding_missing",
+            }
+        identity = canonical_session_identity(
+            profile_name=profile_name,
+            map_id=map_id,
+        )
+        bootstrap_hash = str(binding.get("bootstrap_hash") or "")
+        if not bootstrap_hash:
+            bootstrap_hash = hashlib.sha256(
+                self._ceo_bootstrap(
+                    context,
+                    canonical_identity=identity,
+                ).encode()
+            ).hexdigest()
+        ready = self._ready_session(
+            map_id=map_id,
+            identity=identity,
+            title=expected_title,
+            session=session,
+            bootstrap_hash=bootstrap_hash,
+        )["ceo_session"]
+        return {
+            "map_id": map_id,
+            "state": "reconnected",
+            "root_session_id": ready["root_session_id"],
+            "live_session_id": ready["live_session_id"],
+        }
+
+    def _record_ceo_repair_required(
+        self,
+        *,
+        map_id: str,
+        reason: str,
+        candidate_count: int,
+        preserve_existing_identity: bool = False,
+    ) -> None:
+        profile_name = self._profile_name or ""
+        self._storage.save_ceo_session_repair_required(
+            map_id=map_id,
+            profile_name=profile_name,
+            canonical_identity=canonical_session_identity(
+                profile_name=profile_name,
+                map_id=map_id,
+            ),
+            canonical_title=canonical_session_title(map_id),
+            reason=reason,
+            candidate_count=candidate_count,
+            updated_at=self._synchronized_at(),
+            preserve_existing_identity=preserve_existing_identity,
+        )
+
+    def _recover_pm_runtimes(self) -> list[dict[str, Any]]:
+        if (
+            self._coordinator_runtime is None
+            or self._commissioning_prerequisites is None
+        ):
+            return []
+        results: list[dict[str, Any]] = []
+        for recorded in self._storage.pm_runtimes():
+            map_id = str(recorded["map_id"])
+            if recorded["state"] == "repair_required":
+                results.append(
+                    {
+                        "map_id": map_id,
+                        "state": "repair_required",
+                        "reason": str(
+                            (recorded.get("failure") or {}).get(
+                                "reason", "runtime_repair_required"
+                            )
+                        ),
+                    }
+                )
+                continue
+            try:
+                issue, context = self._verified_runtime_map_binding(recorded)
+                rediscovered = self._coordinator_runtime.ensure_root(
+                    RootRuntimeRequest(
+                        map_id=map_id,
+                        map_url=issue.url,
+                        context=context,
+                    )
+                )
+                stable_fields = (
+                    "map_id",
+                    "project_id",
+                    "project_url",
+                    "repository",
+                    "repository_path",
+                    "pm_profile",
+                    "routing_policy",
+                    "herdr_executable",
+                    "session_namespace",
+                    "workspace_label",
+                    "agent_id",
+                    "ownership_marker",
+                    "lifecycle_id",
+                )
+                if rediscovered is None or any(
+                    str(rediscovered.get(name) or "") != str(recorded.get(name) or "")
+                    for name in stable_fields
+                ):
+                    raise ValueError("runtime_rediscovery_identity_conflict")
+            except CoordinatorRuntimeError as error:
+                if error.repair_required:
+                    self._coordinator_runtime.record_failure(
+                        map_id=map_id,
+                        reason=error.reason,
+                        retryable=error.retryable,
+                        repair_required=True,
+                    )
+                    results.append(
+                        {
+                            "map_id": map_id,
+                            "state": "repair_required",
+                            "reason": error.reason,
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "map_id": map_id,
+                            "state": "pending",
+                            "reason": error.reason,
+                        }
+                    )
+                continue
+            except (CommissioningPrerequisiteError, TrackerError) as error:
+                results.append(
+                    {
+                        "map_id": map_id,
+                        "state": "pending",
+                        "reason": type(error).__name__,
+                    }
+                )
+                continue
+            except ValueError as error:
+                reason = str(error)
+                self._coordinator_runtime.record_failure(
+                    map_id=map_id,
+                    reason=reason,
+                    retryable=False,
+                    repair_required=True,
+                )
+                results.append(
+                    {
+                        "map_id": map_id,
+                        "state": "repair_required",
+                        "reason": reason,
+                    }
+                )
+                continue
+            results.append(
+                {
+                    "map_id": map_id,
+                    "state": "rediscovered",
+                    "runtime_state": str(rediscovered["state"]),
+                }
+            )
+        return results
+
+    def preview_repairs(self) -> dict[str, Any]:
+        """Preview only identity changes that current evidence proves safe."""
+        actions: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+        if self._session_runner is not None and self._profile_name:
+            for binding in self._storage.ceo_session_registry():
+                if binding["state"] != "repair_required":
+                    continue
+                map_id = str(binding["map_id"])
+                if binding["profile_name"] != self._profile_name:
+                    blocked.append(
+                        {
+                            "resource": "ceo_session",
+                            "map_id": map_id,
+                            "reason": "canonical_profile_mismatch",
+                            "evidence": {
+                                "recorded_profile_name": binding["profile_name"],
+                                "requested_profile_name": self._profile_name,
+                            },
+                        }
+                    )
+                    continue
+                title = str(binding["canonical_title"])
+                candidates = self._session_runner.find_exact(title=title)
+                evidence = {
+                    "profile_name": self._profile_name,
+                    "canonical_title": title,
+                    "exact_candidate_count": len(candidates),
+                }
+                if len(candidates) != 1:
+                    blocked.append(
+                        {
+                            "resource": "ceo_session",
+                            "map_id": map_id,
+                            "reason": (
+                                "canonical_session_missing"
+                                if not candidates
+                                else "canonical_session_ambiguous"
+                            ),
+                            "evidence": evidence,
+                        }
+                    )
+                    continue
+                candidate = candidates[0]
+                bootstrap_verified = self._ceo_candidate_bootstrap_verified(
+                    binding=binding,
+                    candidate=candidate,
+                )
+                if not bootstrap_verified:
+                    blocked.append(
+                        {
+                            "resource": "ceo_session",
+                            "map_id": map_id,
+                            "reason": "canonical_session_bootstrap_unverified",
+                            "evidence": {
+                                **evidence,
+                                "bootstrap_marker_verified": False,
+                            },
+                        }
+                    )
+                    continue
+                owner = self._storage.ceo_session_root_owner(candidate.root_session_id)
+                if owner not in {None, map_id} or (
+                    candidate.root_session_id == binding["root_session_id"]
+                    and candidate.live_session_id == binding["live_session_id"]
+                ):
+                    blocked.append(
+                        {
+                            "resource": "ceo_session",
+                            "map_id": map_id,
+                            "reason": (
+                                "canonical_session_bound_to_another_map"
+                                if owner not in {None, map_id}
+                                else "canonical_lineage_resolution_conflict"
+                            ),
+                            "evidence": evidence,
+                        }
+                    )
+                    continue
+                before = {
+                    "root_session_id": binding["root_session_id"],
+                    "live_session_id": binding["live_session_id"],
+                    "state": binding["state"],
+                    "repair_reason": binding["repair_reason"],
+                }
+                after = {
+                    "root_session_id": candidate.root_session_id,
+                    "live_session_id": candidate.live_session_id,
+                    "state": "ready",
+                }
+                actions.append(
+                    {
+                        "id": (
+                            f"ceo-session:{map_id}:rebind:{candidate.root_session_id}"
+                        ),
+                        "kind": "ceo_session.rebind",
+                        "map_id": map_id,
+                        "safe": True,
+                        "before": before,
+                        "after": after,
+                        "evidence": {
+                            **evidence,
+                            "bootstrap_marker_verified": True,
+                            "candidate_last_activity_at": (candidate.last_activity_at),
+                        },
+                    }
+                )
+        if self._coordinator_runtime is not None:
+            preview_runtime = getattr(
+                self._coordinator_runtime,
+                "preview_repair",
+                None,
+            )
+            for recorded in self._storage.pm_runtimes():
+                if recorded["state"] != "repair_required":
+                    continue
+                map_id = str(recorded["map_id"])
+                if not callable(preview_runtime):
+                    blocked.append(
+                        {
+                            "resource": "pm_runtime",
+                            "map_id": map_id,
+                            "reason": "runtime_repair_preview_unavailable",
+                            "evidence": {"map_binding_verified": False},
+                        }
+                    )
+                    continue
+                if not self._runtime_map_binding_verified(recorded):
+                    blocked.append(
+                        {
+                            "resource": "pm_runtime",
+                            "map_id": map_id,
+                            "reason": "runtime_map_binding_conflict",
+                            "evidence": {"map_binding_verified": False},
+                        }
+                    )
+                    continue
+                try:
+                    candidate = preview_runtime(map_id=map_id)
+                except CoordinatorRuntimeError as error:
+                    blocked.append(
+                        {
+                            "resource": "pm_runtime",
+                            "map_id": map_id,
+                            "reason": error.reason,
+                            "evidence": {
+                                **error.evidence(),
+                                "map_binding_verified": True,
+                            },
+                        }
+                    )
+                    continue
+                if not isinstance(candidate, Mapping):
+                    blocked.append(
+                        {
+                            "resource": "pm_runtime",
+                            "map_id": map_id,
+                            "reason": "runtime_repair_evidence_malformed",
+                            "evidence": {"map_binding_verified": True},
+                        }
+                    )
+                    continue
+                before = candidate.get("before")
+                after = candidate.get("after")
+                evidence = candidate.get("evidence")
+                if not all(
+                    isinstance(value, Mapping) for value in (before, after, evidence)
+                ):
+                    blocked.append(
+                        {
+                            "resource": "pm_runtime",
+                            "map_id": map_id,
+                            "reason": "runtime_repair_evidence_malformed",
+                            "evidence": {"map_binding_verified": True},
+                        }
+                    )
+                    continue
+                action_digest = hashlib.sha256(
+                    normalized_json(after).encode()
+                ).hexdigest()[:16]
+                actions.append(
+                    {
+                        "id": f"pm-runtime:{map_id}:rebind:{action_digest}",
+                        "kind": "pm_runtime.rebind_coordinates",
+                        "map_id": map_id,
+                        "safe": True,
+                        "before": dict(before),
+                        "after": dict(after),
+                        "evidence": {
+                            **dict(evidence),
+                            "map_binding_verified": True,
+                        },
+                    }
+                )
+        return self._identity_repair_plan(actions=actions, blocked=blocked)
+
+    def _ceo_candidate_bootstrap_verified(
+        self,
+        *,
+        binding: Mapping[str, Any],
+        candidate: CanonicalSession,
+    ) -> bool:
+        session_runner = self._session_runner
+        bootstrap_hash = str(binding.get("bootstrap_hash") or "")
+        canonical_identity = str(binding.get("canonical_identity") or "")
+        verifier = getattr(session_runner, "has_bootstrap_marker", None)
+        if not bootstrap_hash or not canonical_identity or not callable(verifier):
+            return False
+        return bool(
+            verifier(
+                root_session_id=candidate.root_session_id,
+                idempotency_key=(f"{canonical_identity}:bootstrap:{bootstrap_hash}"),
+            )
+        )
+
+    def _runtime_map_binding_verified(self, recorded: Mapping[str, Any]) -> bool:
+        try:
+            self._verified_runtime_map_binding(recorded)
+        except (CommissioningPrerequisiteError, TrackerError, ValueError):
+            return False
+        return True
+
+    def _verified_runtime_map_binding(
+        self,
+        recorded: Mapping[str, Any],
+    ) -> tuple[TrackerIssue, CommissioningContext]:
+        prerequisites = self._commissioning_prerequisites
+        if prerequisites is None:
+            raise ValueError("runtime_prerequisites_missing")
+        map_id = str(recorded.get("map_id") or "")
+        binding = self._storage.map_binding(map_id)
+        if binding is None:
+            raise ValueError("runtime_map_binding_missing")
+        project = self._storage.project_binding(str(binding["project_id"]))
+        if project is None:
+            raise ValueError("runtime_map_binding_missing")
+        issue = self._tracker.get_issue(str(binding["issue_url"]))
+        context = prerequisites.commissioning_context(
+            project_id=str(binding["project_id"]),
+            repository=issue.repository,
+        )
+        expected = {
+            "map_id": map_id,
+            "project_id": str(binding["project_id"]),
+            "project_url": str(project["project_url"]),
+            "repository": issue.repository,
+            "repository_path": context.repository_path,
+            "pm_profile": context.pm_profile,
+            "routing_policy": context.routing_policy,
+            "herdr_executable": context.herdr_executable,
+        }
+        if (
+            issue.id != map_id
+            or issue.url != binding["issue_url"]
+            or any(
+                str(recorded.get(name) or "") != value
+                for name, value in expected.items()
+            )
+        ):
+            raise ValueError("runtime_map_binding_conflict")
+        return issue, context
+
+    def apply_repairs(
+        self,
+        *,
+        plan: Mapping[str, Any],
+        selected_action_ids: list[str],
+        authorizer: str,
+    ) -> dict[str, Any]:
+        """Apply selected, still-proven identity repairs and audit authority."""
+        authorizer = str(authorizer).strip()
+        if not authorizer or len(authorizer) > 256:
+            raise ValueError("Repair authorizer is required")
+        if not selected_action_ids or any(
+            not isinstance(item, str) or not item.strip()
+            for item in selected_action_ids
+        ):
+            raise ValueError("At least one repair action must be selected")
+        if len(set(selected_action_ids)) != len(selected_action_ids):
+            raise ValueError("Repair action selection contains duplicates")
+        if not isinstance(plan, Mapping):
+            raise ValueError("Repair plan must be an object")
+        supplied_actions = plan.get("actions")
+        supplied_blocked = plan.get("blocked")
+        if not isinstance(supplied_actions, list) or not isinstance(
+            supplied_blocked, list
+        ):
+            raise ValueError("Repair plan is malformed")
+        expected = self._identity_repair_plan(
+            actions=supplied_actions,
+            blocked=supplied_blocked,
+        )
+        if plan.get("plan_id") != expected["plan_id"]:
+            raise ValueError("Repair plan identity does not match its content")
+        supplied_by_id = {
+            str(action.get("id")): action
+            for action in supplied_actions
+            if isinstance(action, Mapping)
+        }
+        if any(action_id not in supplied_by_id for action_id in selected_action_ids):
+            raise ValueError("Selected repair action is not in the preview")
+        idempotent_action_ids: list[str] = []
+        pending_action_ids: list[str] = []
+        for action_id in selected_action_ids:
+            supplied = supplied_by_id[action_id]
+            repair_id = f"{plan['plan_id']}:{action_id}"
+            prior = next(
+                (
+                    item
+                    for item in self._storage.identity_repair_history(
+                        map_id=str(supplied["map_id"])
+                    )
+                    if item["repair_id"] == repair_id
+                ),
+                None,
+            )
+            if prior is None:
+                pending_action_ids.append(action_id)
+                continue
+            resource_type = (
+                "ceo_session"
+                if supplied.get("kind") == "ceo_session.rebind"
+                else "pm_runtime"
+            )
+            if any(
+                (
+                    prior["plan_id"] != plan["plan_id"],
+                    prior["action_id"] != action_id,
+                    prior["resource_type"] != resource_type,
+                    prior["authorizer"] != authorizer,
+                    normalized_json(prior["before"])
+                    != normalized_json(supplied["before"]),
+                    normalized_json(prior["after"])
+                    != normalized_json(supplied["after"]),
+                    normalized_json(prior["evidence"])
+                    != normalized_json(supplied["evidence"]),
+                )
+            ):
+                raise ValueError("Repair identity was reused with different content")
+            idempotent_action_ids.append(action_id)
+        current_by_id = {
+            action["id"]: action for action in self.preview_repairs()["actions"]
+        }
+        for action_id in pending_action_ids:
+            supplied = supplied_by_id[action_id]
+            current = current_by_id.get(action_id)
+            if current is None or normalized_json(current) != normalized_json(supplied):
+                raise ValueError("Repair preview is stale; generate a new preview")
+
+        applied_action_ids: list[str] = []
+        for action_id in pending_action_ids:
+            action = dict(supplied_by_id[action_id])
+            if action.get("safe") is not True:
+                raise ValueError("Selected identity repair is not proven safe")
+            repair_id = f"{plan['plan_id']}:{action_id}"
+            if action.get("kind") == "ceo_session.rebind":
+                self._storage.apply_ceo_session_binding_repair(
+                    repair_id=repair_id,
+                    plan_id=str(plan["plan_id"]),
+                    action_id=action_id,
+                    map_id=str(action["map_id"]),
+                    authorizer=authorizer,
+                    before=dict(action["before"]),
+                    after=dict(action["after"]),
+                    evidence=dict(action["evidence"]),
+                    last_activity_at=action["evidence"].get(
+                        "candidate_last_activity_at"
+                    ),
+                    applied_at=self._synchronized_at(),
+                )
+            elif action.get("kind") == "pm_runtime.rebind_coordinates":
+                self._storage.apply_pm_runtime_binding_repair(
+                    repair_id=repair_id,
+                    plan_id=str(plan["plan_id"]),
+                    action_id=action_id,
+                    map_id=str(action["map_id"]),
+                    authorizer=authorizer,
+                    before=dict(action["before"]),
+                    after=dict(action["after"]),
+                    evidence=dict(action["evidence"]),
+                    applied_at=self._synchronized_at(),
+                )
+            else:
+                raise ValueError("Selected identity repair is not proven safe")
+            applied_action_ids.append(action_id)
+        return {
+            "state": "applied",
+            "plan_id": plan["plan_id"],
+            "authorizer": authorizer,
+            "applied_action_ids": applied_action_ids,
+            "idempotent_action_ids": idempotent_action_ids,
+        }
+
+    def identity_repair_history(self, *, map_id: str) -> list[dict[str, Any]]:
+        """Return durable identity-binding repair authority and evidence."""
+        return self._storage.identity_repair_history(map_id=map_id)
+
+    def _identity_repair_plan(
+        self,
+        *,
+        actions: list[dict[str, Any]],
+        blocked: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        content = {
+            "schema_version": 1,
+            "profile_name": self._profile_name,
+            "actions": actions,
+            "blocked": blocked,
+        }
+        plan_id = (
+            "identity-repair:"
+            + hashlib.sha256(normalized_json(content).encode()).hexdigest()[:24]
+        )
+        return {
+            **content,
+            "plan_id": plan_id,
+            "generated_at": self._synchronized_at(),
         }
 
     def _ensure_project_writable(self, *, project_id: str) -> None:
@@ -4527,7 +5277,11 @@ class MapGovernanceApplication:
                     identity=identity,
                     title=title,
                     reason="canonical_profile_mismatch",
+                    preserve_existing_identity=True,
                 )
+            stored_bootstrap_hash = str(
+                existing_binding.get("bootstrap_hash") or bootstrap_hash
+            )
             root_session_id = existing_binding["root_session_id"]
             if root_session_id:
                 resolved = self._session_runner.resolve(
@@ -4539,12 +5293,9 @@ class MapGovernanceApplication:
                         identity=identity,
                         title=title,
                         session=resolved,
-                        bootstrap_hash=bootstrap_hash,
+                        bootstrap_hash=stored_bootstrap_hash,
                     )
 
-            # Repair state is a projection, not a permanent gate. Reconcile on
-            # every open so a restored backend or manually repaired ambiguity
-            # can recover without rewriting or forking decision history.
             recovered = self._session_runner.find_exact(title=title)
             if len(recovered) > 1:
                 return self._repair_required(
@@ -4555,24 +5306,12 @@ class MapGovernanceApplication:
                     candidate_count=len(recovered),
                     ambiguity=True,
                 )
-            if recovered:
-                initialized = self._session_runner.initialize(
-                    recovered[0],
-                    bootstrap=bootstrap,
-                    idempotency_key=idempotency_key,
-                )
-                return self._ready_session(
-                    map_id=map_id,
-                    identity=identity,
-                    title=title,
-                    session=initialized,
-                    bootstrap_hash=bootstrap_hash,
-                )
             return self._repair_required(
                 map_id=map_id,
                 identity=identity,
                 title=title,
                 reason="recorded_session_lineage_missing_or_mismatched",
+                candidate_count=len(recovered),
             )
 
         matches = self._session_runner.find_exact(title=title)
@@ -4767,6 +5506,7 @@ class MapGovernanceApplication:
         reason: str,
         candidate_count: int = 0,
         ambiguity: bool = False,
+        preserve_existing_identity: bool = False,
     ):
         self._storage.save_ceo_session_repair_required(
             map_id=map_id,
@@ -4776,6 +5516,7 @@ class MapGovernanceApplication:
             reason=reason,
             candidate_count=candidate_count,
             updated_at=self._synchronized_at(),
+            preserve_existing_identity=preserve_existing_identity,
         )
         error_type = CEOSessionAmbiguityError if ambiguity else CEOSessionRepairRequired
         raise error_type(reason=reason, candidate_count=candidate_count)

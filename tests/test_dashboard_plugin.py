@@ -154,6 +154,103 @@ def test_rest_setup_and_doctor_delegate_to_the_pure_prerequisite_seam(
     ]
 
 
+def test_rest_recovery_and_safe_repair_delegate_with_authenticated_authorizer(
+    monkeypatch,
+):
+    adapter = _load_dashboard_adapter()
+    api = FastAPI()
+
+    @api.middleware("http")
+    async def authenticated_operator(request, call_next):
+        request.state.session = SimpleNamespace(provider="basic", user_id="operator-1")
+        return await call_next(request)
+
+    api.include_router(adapter.router, prefix="/api/plugins/map-governance")
+    calls = []
+
+    class ApplicationProbe:
+        def recover_restart(self, **arguments):
+            calls.append(("recover_restart", arguments))
+            return {"state": "recovered"}
+
+        def preview_repairs(self):
+            calls.append(("preview_repairs", {}))
+            return {"plan_id": "identity-repair:one", "actions": []}
+
+        def apply_repairs(self, **arguments):
+            calls.append(("apply_repairs", arguments))
+            return {"state": "applied"}
+
+        def identity_repair_history(self, **arguments):
+            calls.append(("identity_repair_history", arguments))
+            return [{"repair_id": "repair-1"}]
+
+    monkeypatch.setattr(
+        adapter,
+        "application_for_profile",
+        lambda profile: (
+            calls.append(("profile", {"profile": profile})) or ApplicationProbe()
+        ),
+    )
+
+    async def exercise_routes():
+        transport = httpx.ASGITransport(app=api)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            recovery = await client.post(
+                "/api/plugins/map-governance/recovery?profile=ceo",
+                json={"limit": 25},
+            )
+            preview = await client.get(
+                "/api/plugins/map-governance/repair/preview?profile=ceo"
+            )
+            apply = await client.post(
+                "/api/plugins/map-governance/repair/apply?profile=ceo",
+                json={
+                    "plan": {"plan_id": "identity-repair:one", "actions": []},
+                    "selected_action_ids": ["safe-action-1"],
+                },
+            )
+            history = await client.get(
+                "/api/plugins/map-governance/maps/I_atlas_41/repairs?profile=ceo"
+            )
+        return recovery, preview, apply, history
+
+    recovery, preview, apply, history = asyncio.run(exercise_routes())
+
+    assert [
+        response.status_code for response in (recovery, preview, apply, history)
+    ] == [
+        200,
+        200,
+        200,
+        200,
+    ]
+    assert recovery.json() == {"state": "recovered"}
+    assert preview.json()["plan_id"] == "identity-repair:one"
+    assert apply.json() == {"state": "applied"}
+    assert history.json() == [{"repair_id": "repair-1"}]
+    assert calls == [
+        ("profile", {"profile": "ceo"}),
+        ("recover_restart", {"outbox_limit": 25}),
+        ("profile", {"profile": "ceo"}),
+        ("preview_repairs", {}),
+        ("profile", {"profile": "ceo"}),
+        (
+            "apply_repairs",
+            {
+                "plan": {"plan_id": "identity-repair:one", "actions": []},
+                "selected_action_ids": ["safe-action-1"],
+                "authorizer": "basic:operator-1",
+            },
+        ),
+        ("profile", {"profile": "ceo"}),
+        ("identity_repair_history", {"map_id": "I_atlas_41"}),
+    ]
+
+
 def test_event_stream_contract_uses_hermes_isolated_dependencies(hermes_host_root):
     runtime = hermes_host_root / "venv" / "bin" / "python"
     assert runtime.is_file(), "Hermes isolated Python runtime is required"

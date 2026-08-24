@@ -113,6 +113,36 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
     refresh = commands.add_parser("refresh", help="Refresh board projections")
     refresh.add_argument("--project", help="Refresh only this configured Project")
 
+    recover = commands.add_parser(
+        "recover", help="Rebuild and reconcile durable Map runtime state"
+    )
+    recover.add_argument("--profile", required=True, help="Explicit CEO profile")
+    recover.add_argument("--limit", type=int, default=100, help="Outbox work limit")
+
+    repair = commands.add_parser(
+        "repair", help="Preview or apply safe identity-binding repairs"
+    )
+    repair_commands = repair.add_subparsers(dest="repair_command", required=True)
+    repair_preview = repair_commands.add_parser(
+        "preview", help="Preview only repairs proven safe by current evidence"
+    )
+    repair_preview.add_argument("--profile", required=True, help="Explicit CEO profile")
+    repair_apply = repair_commands.add_parser(
+        "apply", help="Apply explicitly selected actions from a repair preview"
+    )
+    repair_apply.add_argument("--profile", required=True, help="Explicit CEO profile")
+    repair_apply.add_argument("--file", required=True, help="Saved repair preview JSON")
+    repair_apply.add_argument(
+        "--action",
+        action="append",
+        required=True,
+        dest="actions",
+        help="Stable safe repair action ID; repeat to select more",
+    )
+    repair_apply.add_argument(
+        "--authorizer", required=True, help="Operator identity recorded in repair audit"
+    )
+
     transition = commands.add_parser(
         "transition",
         help="Request a governed Map stage transition",
@@ -186,9 +216,9 @@ def register(ctx) -> None:
             with open(path, encoding="utf-8") as handle:
                 payload = json.load(handle)
         except OSError:
-            raise ValueError("Setup JSON file is unavailable") from None
+            raise ValueError("JSON input file is unavailable") from None
         except json.JSONDecodeError:
-            raise ValueError("Setup JSON file is invalid JSON") from None
+            raise ValueError("Input file is invalid JSON") from None
         if not isinstance(payload, dict):
             raise ValueError("Setup JSON root must be an object")
         return payload
@@ -220,6 +250,36 @@ def register(ctx) -> None:
                         {
                             "error": {
                                 "type": "setup_input_error",
+                                "reason": str(error),
+                                "retryable": False,
+                            }
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        if args.maps_command in {"recover", "repair"}:
+            selected = application_for_profile(args.profile)
+            try:
+                if args.maps_command == "recover":
+                    report = selected.recover_restart(outbox_limit=args.limit)
+                elif args.repair_command == "preview":
+                    report = selected.preview_repairs()
+                else:
+                    report = selected.apply_repairs(
+                        plan=read_json_file(args.file),
+                        selected_action_ids=args.actions,
+                        authorizer=args.authorizer,
+                    )
+            except ValueError as error:
+                print(
+                    json.dumps(
+                        {
+                            "error": {
+                                "type": "identity_repair_error",
                                 "reason": str(error),
                                 "retryable": False,
                             }

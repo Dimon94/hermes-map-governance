@@ -609,6 +609,148 @@ class CoordinatorRuntime:
             with self._storage.coordinator_session_lease():
                 return self._ensure_root(request)
 
+    def preview_repair(self, *, map_id: str) -> dict[str, Any]:
+        """Read one safe opaque-coordinate repair without mutating Herdr."""
+        with self._storage.pm_runtime_lease(map_id):
+            record = self._storage.pm_runtime(map_id)
+            if record is None or record.get("state") != "repair_required":
+                raise CoordinatorRuntimeError(
+                    reason="runtime_repair_not_required",
+                    retryable=False,
+                    repair_required=True,
+                )
+            self._validate_recorded_ownership_identity(record)
+            executable = str(record.get("herdr_executable") or "herdr")
+            namespace = str(record["session_namespace"])
+            if namespace not in self._sessions(executable):
+                raise CoordinatorRuntimeError(
+                    reason="owned_session_unavailable",
+                    retryable=True,
+                )
+            prefix = [executable, "--session", namespace]
+            workspaces = self._result(
+                self._command_json([*prefix, "workspace", "list"])
+            ).get("workspaces")
+            matching_workspaces = (
+                [
+                    workspace
+                    for workspace in workspaces
+                    if isinstance(workspace, Mapping)
+                    and workspace.get("label") == record["workspace_label"]
+                ]
+                if isinstance(workspaces, list)
+                else []
+            )
+            if len(matching_workspaces) != 1:
+                raise CoordinatorRuntimeError(
+                    reason=(
+                        "owned_workspace_unavailable"
+                        if not matching_workspaces
+                        else "workspace_recovery_ambiguous"
+                    ),
+                    retryable=not matching_workspaces,
+                    repair_required=True,
+                )
+            workspace_id = self._opaque(matching_workspaces[0].get("workspace_id"))
+            workspace = self._workspace_from(
+                self._command_json([*prefix, "workspace", "get", workspace_id])
+            )
+            if (
+                workspace.get("workspace_id") != workspace_id
+                or workspace.get("label") != record["workspace_label"]
+            ):
+                raise CoordinatorRuntimeError(
+                    reason="workspace_ownership_mismatch",
+                    retryable=False,
+                    repair_required=True,
+                )
+            window_id = self._opaque(workspace.get("active_tab_id"))
+            panes = self._result(
+                self._command_json(
+                    [*prefix, "pane", "list", "--workspace", workspace_id]
+                )
+            ).get("panes")
+            matching_panes = (
+                [
+                    pane
+                    for pane in panes
+                    if isinstance(pane, Mapping)
+                    and pane.get("workspace_id") == workspace_id
+                    and pane.get("tab_id") == window_id
+                    and pane.get("cwd") == record["repository_path"]
+                ]
+                if isinstance(panes, list)
+                else []
+            )
+            if len(matching_panes) != 1:
+                raise CoordinatorRuntimeError(
+                    reason=(
+                        "owned_pane_unavailable"
+                        if not matching_panes
+                        else "workspace_recovery_ambiguous"
+                    ),
+                    retryable=not matching_panes,
+                    repair_required=True,
+                )
+            pane_id = self._opaque(matching_panes[0].get("pane_id"))
+            agent = self._get_agent([*prefix, "agent", "get", str(record["agent_id"])])
+            if agent is None:
+                raise CoordinatorRuntimeError(
+                    reason="owned_agent_unavailable",
+                    retryable=True,
+                    repair_required=True,
+                )
+            expected_agent = {
+                "name": record["agent_id"],
+                "agent": "hermes",
+                "workspace_id": workspace_id,
+                "tab_id": window_id,
+                "pane_id": pane_id,
+            }
+            if any(agent.get(name) != value for name, value in expected_agent.items()):
+                raise CoordinatorRuntimeError(
+                    reason="opaque_coordinate_mismatch",
+                    retryable=False,
+                    repair_required=True,
+                )
+            agent_session = agent.get("agent_session")
+            if (
+                not isinstance(agent_session, Mapping)
+                or agent_session.get("agent") != "hermes"
+                or agent_session.get("kind") != "id"
+            ):
+                raise CoordinatorRuntimeError(
+                    reason="agent_session_identity_unsafe",
+                    retryable=False,
+                    repair_required=True,
+                )
+            failure = record.get("failure") or {}
+            return {
+                "before": {
+                    "workspace_id": record.get("workspace_id"),
+                    "window_id": record.get("window_id"),
+                    "pane_id": record.get("pane_id"),
+                    "agent_session_id": record.get("agent_session_id"),
+                    "state": record["state"],
+                    "repair_reason": failure.get("reason"),
+                },
+                "after": {
+                    "workspace_id": workspace_id,
+                    "window_id": window_id,
+                    "pane_id": pane_id,
+                    "agent_session_id": self._opaque(agent_session.get("value")),
+                    "state": "pm_ready",
+                },
+                "evidence": {
+                    "session_namespace": namespace,
+                    "workspace_label": record["workspace_label"],
+                    "ownership_marker": record["ownership_marker"],
+                    "exact_workspace_count": 1,
+                    "exact_pane_count": 1,
+                    "exact_agent_count": 1,
+                },
+            }
+
     def _ensure_root(self, request: RootRuntimeRequest) -> dict[str, Any]:
         now = self._clock()
         lifecycle = self._storage.coordinator_lifecycle(created_at=now)
@@ -3513,21 +3655,35 @@ class CoordinatorRuntime:
         return isinstance(value, str) and _SENSITIVE_VALUE_RE.search(value) is not None
 
     def _validate_owned_record(self, record: Mapping[str, Any]) -> None:
-        required = (
-            "map_id",
-            "session_namespace",
-            "workspace_label",
+        self._validate_recorded_ownership_identity(record)
+        opaque_coordinates = (
             "workspace_id",
             "window_id",
             "pane_id",
-            "agent_id",
             "agent_session_id",
+        )
+        if any(not record.get(name) for name in opaque_coordinates):
+            raise CoordinatorRuntimeError(
+                reason="partial_coordinates",
+                retryable=False,
+                repair_required=True,
+            )
+
+    def _validate_recorded_ownership_identity(
+        self,
+        record: Mapping[str, Any],
+    ) -> None:
+        stable_identity = (
+            "map_id",
+            "session_namespace",
+            "workspace_label",
+            "agent_id",
             "ownership_marker",
             "lifecycle_id",
         )
-        if any(not record.get(name) for name in required):
+        if any(not record.get(name) for name in stable_identity):
             raise CoordinatorRuntimeError(
-                reason="partial_coordinates",
+                reason="runtime_ownership_identity_missing",
                 retryable=False,
                 repair_required=True,
             )

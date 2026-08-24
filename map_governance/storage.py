@@ -16,7 +16,7 @@ from .events import append_board_event, content_event_id
 
 
 PLUGIN_STORAGE_NAMESPACE = "map-governance"
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 class PluginStorage:
@@ -197,6 +197,33 @@ class PluginStorage:
                 (profile_name,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def ceo_session_registry(self) -> list[dict[str, Any]]:
+        """Return complete binding evidence for explicit operator recovery."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    map_id, profile_name, canonical_identity, canonical_title,
+                    root_session_id, live_session_id, state, last_activity_at,
+                    bootstrap_hash, repair_reason, repair_candidate_count,
+                    updated_at
+                FROM ceo_session_bindings
+                ORDER BY map_id
+                """,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def ceo_session_root_owner(self, root_session_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT map_id FROM ceo_session_bindings
+                WHERE root_session_id = ?
+                """,
+                (root_session_id,),
+            ).fetchone()
+        return str(row["map_id"]) if row is not None else None
 
     @contextmanager
     def ceo_session_lease(self, map_id: str) -> Iterator[None]:
@@ -606,6 +633,108 @@ class PluginStorage:
         failure_json = result.pop("failure_json")
         result["failure"] = json.loads(failure_json) if failure_json else None
         return result
+
+    def pm_runtimes(self) -> list[dict[str, Any]]:
+        """Return every durable PM runtime coordinate for restart recovery."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM pm_runtime_bindings ORDER BY map_id"
+            ).fetchall()
+        results = []
+        for row in rows:
+            result = dict(row)
+            failure_json = result.pop("failure_json")
+            result["failure"] = json.loads(failure_json) if failure_json else None
+            results.append(result)
+        return results
+
+    def apply_pm_runtime_binding_repair(
+        self,
+        *,
+        repair_id: str,
+        plan_id: str,
+        action_id: str,
+        map_id: str,
+        authorizer: str,
+        before: dict[str, Any],
+        after: dict[str, Any],
+        evidence: dict[str, Any],
+        applied_at: str,
+    ) -> bool:
+        """Atomically replace proven opaque coordinates and record authority."""
+        if after.get("state") != "pm_ready":
+            raise ValueError("Runtime repair must return to verified PM-ready state")
+        with self._connect() as connection:
+            if self._identity_repair_replayed(
+                connection,
+                repair_id=repair_id,
+                plan_id=plan_id,
+                action_id=action_id,
+                map_id=map_id,
+                resource_type="pm_runtime",
+                authorizer=authorizer,
+                before=before,
+                after=after,
+                evidence=evidence,
+            ):
+                return False
+            row = connection.execute(
+                "SELECT * FROM pm_runtime_bindings WHERE map_id = ?",
+                (map_id,),
+            ).fetchone()
+            failure = (
+                json.loads(row["failure_json"]) if row and row["failure_json"] else {}
+            )
+            current = {
+                "workspace_id": row["workspace_id"] if row else None,
+                "window_id": row["window_id"] if row else None,
+                "pane_id": row["pane_id"] if row else None,
+                "agent_session_id": row["agent_session_id"] if row else None,
+                "state": row["state"] if row else None,
+                "repair_reason": failure.get("reason"),
+            }
+            if row is None or current != before:
+                raise ValueError("Repair preview no longer matches the runtime binding")
+            connection.execute(
+                """
+                UPDATE pm_runtime_bindings
+                SET workspace_id = ?, window_id = ?, pane_id = ?,
+                    agent_session_id = ?, state = 'pm_ready', failure_json = NULL,
+                    updated_at = ?
+                WHERE map_id = ?
+                """,
+                (
+                    after["workspace_id"],
+                    after["window_id"],
+                    after["pane_id"],
+                    after["agent_session_id"],
+                    applied_at,
+                    map_id,
+                ),
+            )
+            self._insert_identity_repair_audit(
+                connection,
+                repair_id=repair_id,
+                plan_id=plan_id,
+                action_id=action_id,
+                map_id=map_id,
+                resource_type="pm_runtime",
+                authorizer=authorizer,
+                before=before,
+                after=after,
+                evidence=evidence,
+                applied_at=applied_at,
+            )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="pm.updated",
+                identity=map_id,
+                payload={"runtime": {"state": "pm_ready"}},
+                committed_at=applied_at,
+                occurrence_id=f"identity-repair:{repair_id}",
+            )
+        return True
 
     def begin_pm_turn(
         self,
@@ -1256,36 +1385,50 @@ class PluginStorage:
         reason: str,
         candidate_count: int,
         updated_at: str,
+        preserve_existing_identity: bool = False,
     ) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO ceo_session_bindings(
-                    map_id, profile_name, canonical_identity, canonical_title,
-                    root_session_id, live_session_id, state, last_activity_at,
-                    bootstrap_hash, repair_reason, repair_candidate_count,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, NULL, NULL, 'repair_required', NULL,
-                          NULL, ?, ?, ?)
-                ON CONFLICT(map_id) DO UPDATE SET
-                    profile_name = excluded.profile_name,
-                    canonical_identity = excluded.canonical_identity,
-                    canonical_title = excluded.canonical_title,
-                    state = 'repair_required',
-                    repair_reason = excluded.repair_reason,
-                    repair_candidate_count = excluded.repair_candidate_count,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    map_id,
-                    profile_name,
-                    canonical_identity,
-                    canonical_title,
-                    reason,
-                    candidate_count,
-                    updated_at,
-                ),
-            )
+            if preserve_existing_identity:
+                cursor = connection.execute(
+                    """
+                    UPDATE ceo_session_bindings
+                    SET state = 'repair_required', repair_reason = ?,
+                        repair_candidate_count = ?, updated_at = ?
+                    WHERE map_id = ?
+                    """,
+                    (reason, candidate_count, updated_at, map_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("CEO session binding is unavailable")
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO ceo_session_bindings(
+                        map_id, profile_name, canonical_identity, canonical_title,
+                        root_session_id, live_session_id, state, last_activity_at,
+                        bootstrap_hash, repair_reason, repair_candidate_count,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, NULL, NULL, 'repair_required', NULL,
+                              NULL, ?, ?, ?)
+                    ON CONFLICT(map_id) DO UPDATE SET
+                        profile_name = excluded.profile_name,
+                        canonical_identity = excluded.canonical_identity,
+                        canonical_title = excluded.canonical_title,
+                        state = 'repair_required',
+                        repair_reason = excluded.repair_reason,
+                        repair_candidate_count = excluded.repair_candidate_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        map_id,
+                        profile_name,
+                        canonical_identity,
+                        canonical_title,
+                        reason,
+                        candidate_count,
+                        updated_at,
+                    ),
+                )
             self._append_map_resource_event(
                 connection,
                 map_id=map_id,
@@ -1303,6 +1446,238 @@ class PluginStorage:
                 committed_at=updated_at,
                 occurrence_id=f"repair:{reason}:{candidate_count}:{updated_at}",
             )
+
+    def apply_ceo_session_binding_repair(
+        self,
+        *,
+        repair_id: str,
+        plan_id: str,
+        action_id: str,
+        map_id: str,
+        authorizer: str,
+        before: dict[str, Any],
+        after: dict[str, Any],
+        evidence: dict[str, Any],
+        last_activity_at: str | None,
+        applied_at: str,
+    ) -> bool:
+        """Atomically rebind one proven lineage and append its operator audit."""
+        with self._connect() as connection:
+            if self._identity_repair_replayed(
+                connection,
+                repair_id=repair_id,
+                plan_id=plan_id,
+                action_id=action_id,
+                map_id=map_id,
+                resource_type="ceo_session",
+                authorizer=authorizer,
+                before=before,
+                after=after,
+                evidence=evidence,
+            ):
+                return False
+
+            row = connection.execute(
+                "SELECT * FROM ceo_session_bindings WHERE map_id = ?",
+                (map_id,),
+            ).fetchone()
+            if row is None or any(
+                row[name] != expected
+                for name, expected in {
+                    "root_session_id": before["root_session_id"],
+                    "live_session_id": before["live_session_id"],
+                    "state": before["state"],
+                    "repair_reason": before["repair_reason"],
+                }.items()
+            ):
+                raise ValueError("Repair preview no longer matches the binding")
+            owner = connection.execute(
+                """
+                SELECT map_id FROM ceo_session_bindings
+                WHERE root_session_id = ? AND map_id <> ?
+                """,
+                (after["root_session_id"], map_id),
+            ).fetchone()
+            if owner is not None:
+                raise ValueError("Replacement CEO lineage belongs to another Map")
+            connection.execute(
+                """
+                UPDATE ceo_session_bindings
+                SET root_session_id = ?, live_session_id = ?, state = 'ready',
+                    last_activity_at = ?, repair_reason = NULL,
+                    repair_candidate_count = NULL, updated_at = ?
+                WHERE map_id = ?
+                """,
+                (
+                    after["root_session_id"],
+                    after["live_session_id"],
+                    last_activity_at,
+                    applied_at,
+                    map_id,
+                ),
+            )
+            self._insert_identity_repair_audit(
+                connection,
+                repair_id=repair_id,
+                plan_id=plan_id,
+                action_id=action_id,
+                map_id=map_id,
+                resource_type="ceo_session",
+                authorizer=authorizer,
+                before=before,
+                after=after,
+                evidence=evidence,
+                applied_at=applied_at,
+            )
+            self._append_map_resource_event(
+                connection,
+                map_id=map_id,
+                event_type="session.updated",
+                identity=map_id,
+                payload={
+                    "ceo_session": {
+                        "state": "ready",
+                        "last_activity_at": last_activity_at,
+                    }
+                },
+                committed_at=applied_at,
+                occurrence_id=f"identity-repair:{repair_id}",
+            )
+        return True
+
+    @staticmethod
+    def _identity_repair_audit_values(
+        *,
+        plan_id: str,
+        action_id: str,
+        map_id: str,
+        resource_type: str,
+        authorizer: str,
+        before: dict[str, Any],
+        after: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> dict[str, str]:
+        return {
+            "plan_id": plan_id,
+            "action_id": action_id,
+            "map_id": map_id,
+            "resource_type": resource_type,
+            "authorizer": authorizer,
+            "before_json": normalized_json(before),
+            "after_json": normalized_json(after),
+            "evidence_json": normalized_json(evidence),
+        }
+
+    @classmethod
+    def _identity_repair_replayed(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        repair_id: str,
+        plan_id: str,
+        action_id: str,
+        map_id: str,
+        resource_type: str,
+        authorizer: str,
+        before: dict[str, Any],
+        after: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> bool:
+        audit = connection.execute(
+            "SELECT * FROM identity_repair_audit WHERE repair_id = ?",
+            (repair_id,),
+        ).fetchone()
+        if audit is None:
+            return False
+        values = cls._identity_repair_audit_values(
+            plan_id=plan_id,
+            action_id=action_id,
+            map_id=map_id,
+            resource_type=resource_type,
+            authorizer=authorizer,
+            before=before,
+            after=after,
+            evidence=evidence,
+        )
+        if any(audit[name] != value for name, value in values.items()):
+            raise ValueError("Repair identity was reused with different content")
+        return True
+
+    @classmethod
+    def _insert_identity_repair_audit(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        repair_id: str,
+        plan_id: str,
+        action_id: str,
+        map_id: str,
+        resource_type: str,
+        authorizer: str,
+        before: dict[str, Any],
+        after: dict[str, Any],
+        evidence: dict[str, Any],
+        applied_at: str,
+    ) -> None:
+        values = cls._identity_repair_audit_values(
+            plan_id=plan_id,
+            action_id=action_id,
+            map_id=map_id,
+            resource_type=resource_type,
+            authorizer=authorizer,
+            before=before,
+            after=after,
+            evidence=evidence,
+        )
+        connection.execute(
+            """
+            INSERT INTO identity_repair_audit(
+                repair_id, plan_id, action_id, map_id, resource_type,
+                authorizer, before_json, after_json, evidence_json, applied_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                repair_id,
+                values["plan_id"],
+                values["action_id"],
+                values["map_id"],
+                values["resource_type"],
+                values["authorizer"],
+                values["before_json"],
+                values["after_json"],
+                values["evidence_json"],
+                applied_at,
+            ),
+        )
+
+    def identity_repair_history(self, *, map_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT repair_id, plan_id, action_id, map_id, resource_type,
+                       authorizer, before_json, after_json, evidence_json,
+                       applied_at
+                FROM identity_repair_audit
+                WHERE map_id = ?
+                ORDER BY applied_at, repair_id
+                """,
+                (map_id,),
+            ).fetchall()
+        return [
+            {
+                "repair_id": row["repair_id"],
+                "plan_id": row["plan_id"],
+                "action_id": row["action_id"],
+                "map_id": row["map_id"],
+                "resource_type": row["resource_type"],
+                "authorizer": row["authorizer"],
+                "before": json.loads(row["before_json"]),
+                "after": json.loads(row["after_json"]),
+                "evidence": json.loads(row["evidence_json"]),
+                "applied_at": row["applied_at"],
+            }
+            for row in rows
+        ]
 
     def save_project_projection(
         self,
@@ -3211,6 +3586,25 @@ class PluginStorage:
                 requested_at TEXT NOT NULL,
                 prior_terminal_reason TEXT NOT NULL,
                 prior_attempt_count INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS identity_repair_audit (
+                repair_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                map_id TEXT NOT NULL REFERENCES map_bindings(map_id),
+                resource_type TEXT NOT NULL CHECK(resource_type IN (
+                    'ceo_session', 'pm_runtime'
+                )),
+                authorizer TEXT NOT NULL,
+                before_json TEXT NOT NULL,
+                after_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                UNIQUE(plan_id, action_id)
             )
             """
         )

@@ -12,6 +12,7 @@ from map_governance import (
 )
 from map_governance.outbox import OutboxRepository
 from map_governance.runtime import application_for_storage
+import map_governance.runtime as runtime_composition
 from map_governance.tracker import (
     TrackerConflictError,
     TrackerError,
@@ -180,6 +181,49 @@ def test_profileless_startup_leaves_session_effect_for_a_capable_runtime(tmp_pat
     application = application_for_storage(storage_root)
 
     assert application.outbox_status(effect_id=effect_id)["state"] == "pending"
+
+
+def test_capable_profile_composition_runs_full_restart_recovery_on_startup(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    class ApplicationProbe:
+        def __init__(self, **arguments):
+            calls.append(("init", arguments))
+
+        def recover_restart(self):
+            calls.append(("recover_restart", {}))
+
+        def recover_outbox(self):
+            calls.append(("recover_outbox", {}))
+
+    monkeypatch.setattr(
+        runtime_composition, "MapGovernanceApplication", ApplicationProbe
+    )
+    monkeypatch.setattr(
+        runtime_composition,
+        "HermesSessionDatabaseBackend",
+        lambda path: ("session-backend", path),
+    )
+    monkeypatch.setattr(
+        runtime_composition,
+        "HermesSessionAdapter",
+        lambda backend: ("session-runner", backend),
+    )
+    prerequisites = object()
+    coordinator = object()
+
+    built = runtime_composition.application_for_storage(
+        tmp_path / "plugin-data",
+        profile_name="ceo",
+        state_database=tmp_path / "state.db",
+        commissioning_prerequisites=prerequisites,
+        coordinator_runtime=coordinator,
+    )
+
+    assert isinstance(built, ApplicationProbe)
+    assert [name for name, _arguments in calls] == ["init", "recover_restart"]
 
 
 def test_board_exposes_a_useful_empty_projection_before_any_maps_are_bound(tmp_path):

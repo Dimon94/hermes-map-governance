@@ -59,7 +59,14 @@ def application_for_storage(
         coordinator_resume=coordinator_runtime,
     )
     if recover_pending:
-        application.recover_outbox()
+        if (
+            session_runner is not None
+            and commissioning_prerequisites is not None
+            and coordinator_runtime is not None
+        ):
+            application.recover_restart()
+        else:
+            application.recover_outbox()
     return application
 
 

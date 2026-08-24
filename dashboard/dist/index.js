@@ -291,6 +291,101 @@
     );
   }
 
+  function renderRepairPanel(repairState, actions) {
+    if (repairState.status === "idle") return null;
+    if (repairState.status === "loading" || repairState.status === "applying") {
+      return React.createElement(
+        "p",
+        { className: "text-sm text-muted-foreground", role: "status" },
+        repairState.status === "loading"
+          ? "Inspecting durable identity evidence…"
+          : "Applying selected safe repairs…",
+      );
+    }
+    if (repairState.status === "error") {
+      return React.createElement(
+        "p",
+        { className: "text-sm text-destructive", role: "alert" },
+        repairState.message,
+      );
+    }
+    if (repairState.status === "applied") {
+      return React.createElement(
+        "section",
+        { className: "space-y-2 rounded-md border p-3", "aria-labelledby": "maps-repair-title" },
+        React.createElement("h2", { id: "maps-repair-title", className: "text-sm font-semibold" }, "Identity repair"),
+        React.createElement(
+          "p",
+          { className: "text-sm", role: "status" },
+          "Applied " + repairState.result.applied_action_ids.join(", ")
+            + " · authorizer " + repairState.result.authorizer,
+        ),
+        React.createElement(Button, { type: "button", onClick: actions.preview }, "Preview again"),
+      );
+    }
+    const plan = repairState.plan;
+    return React.createElement(
+      "section",
+      { className: "space-y-3 rounded-md border p-3", "aria-labelledby": "maps-repair-title" },
+      React.createElement("h2", { id: "maps-repair-title", className: "text-sm font-semibold" }, "Identity repair"),
+      React.createElement(
+        "p",
+        { className: "text-xs text-muted-foreground" },
+        "Preview " + plan.plan_id + " · only proven-safe binding changes can be selected.",
+      ),
+      repairState.message
+        ? React.createElement(
+            "p",
+            { className: "text-sm text-destructive", role: "alert" },
+            repairState.message,
+          )
+        : null,
+      (plan.blocked || []).map(function (blocked, index) {
+        return React.createElement(
+          "article",
+          { key: blocked.resource + ":" + blocked.map_id + ":" + index, className: "rounded border border-destructive p-2 text-sm" },
+          React.createElement("p", { className: "font-medium" }, "Blocked · " + blocked.resource + " · " + blocked.map_id),
+          React.createElement("p", null, readableBadge(blocked.reason)),
+          React.createElement("pre", { className: "whitespace-pre-wrap text-xs text-muted-foreground" }, JSON.stringify(blocked.evidence, null, 2)),
+        );
+      }),
+      (plan.actions || []).map(function (action) {
+        const selected = repairState.selectedActionIds.includes(action.id);
+        return React.createElement(
+          "label",
+          { key: action.id, className: "block space-y-1 rounded border p-2 text-sm" },
+          React.createElement("input", {
+            type: "checkbox",
+            checked: selected,
+            onChange: function () { actions.toggle(action.id); },
+          }),
+          " " + action.id + " · " + readableBadge(action.kind),
+          React.createElement(
+            "pre",
+            { className: "max-h-48 overflow-auto whitespace-pre-wrap text-xs text-muted-foreground" },
+            "Before\n" + JSON.stringify(action.before, null, 2)
+              + "\nAfter\n" + JSON.stringify(action.after, null, 2)
+              + "\nEvidence\n" + JSON.stringify(action.evidence, null, 2),
+          ),
+        );
+      }),
+      React.createElement(
+        "div",
+        { className: "flex gap-2" },
+        React.createElement(
+          Button,
+          {
+            type: "button",
+            onClick: actions.apply,
+            disabled: repairState.selectedActionIds.length === 0,
+          },
+          "Apply selected safe repairs",
+        ),
+        React.createElement(Button, { type: "button", onClick: actions.preview }, "Refresh preview"),
+      ),
+    );
+  }
+
   function safeExternalUrl(value) {
     try {
       const parsed = new URL(value);
@@ -613,6 +708,7 @@
     const [approvalState, setApprovalState] = useState({ status: "idle" });
     const [doctorState, setDoctorState] = useState({ status: "idle" });
     const [setupState, setSetupState] = useState({ status: "idle" });
+    const [repairState, setRepairState] = useState({ status: "idle" });
     const [streamState, setStreamState] = useState({ status: "connecting" });
     const streamRef = useRef({ cursor: 0, socket: null, retry: null, disposed: false });
 
@@ -856,6 +952,65 @@
             setSetupState(Object.assign({}, setupState, {
               status: "planned",
               message: error && error.message ? error.message : "Unable to apply setup plan",
+            }));
+          },
+        );
+      },
+    };
+
+    const repairActions = {
+      preview: function () {
+        setRepairState({ status: "loading" });
+        requestProfile().then(function (profile) {
+          return fetchJSON(
+            "/api/plugins/map-governance/repair/preview?profile=" + encodeURIComponent(profile),
+          );
+        }).then(
+          function (plan) {
+            setRepairState({
+              status: "planned",
+              plan: plan,
+              selectedActionIds: [],
+            });
+          },
+          function (error) {
+            setRepairState({
+              status: "error",
+              message: error && error.message ? error.message : "Unable to preview identity repairs",
+            });
+          },
+        );
+      },
+      toggle: function (actionId) {
+        setRepairState(function (current) {
+          const selected = current.selectedActionIds.includes(actionId)
+            ? current.selectedActionIds.filter(function (item) { return item !== actionId; })
+            : current.selectedActionIds.concat([actionId]);
+          return Object.assign({}, current, { selectedActionIds: selected });
+        });
+      },
+      apply: function () {
+        if (!repairState.selectedActionIds.length) return;
+        if (!window.confirm("Apply exactly the selected safe identity-binding repairs?")) return;
+        setRepairState(Object.assign({}, repairState, { status: "applying" }));
+        requestProfile().then(function (profile) {
+          return fetchJSON(
+            "/api/plugins/map-governance/repair/apply?profile=" + encodeURIComponent(profile),
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                plan: repairState.plan,
+                selected_action_ids: repairState.selectedActionIds,
+              }),
+            },
+          );
+        }).then(
+          function (result) { setRepairState({ status: "applied", result: result }); },
+          function (error) {
+            setRepairState(Object.assign({}, repairState, {
+              status: "planned",
+              message: error && error.message ? error.message : "Unable to apply identity repair",
             }));
           },
         );
@@ -1315,9 +1470,15 @@
                 { type: "button", onClick: setupActions.open },
                 "Setup prerequisites",
               ),
+              React.createElement(
+                Button,
+                { type: "button", onClick: repairActions.preview },
+                "Repair identities",
+              ),
             ),
             renderDoctorPanel(doctorState),
             renderSetupPanel(setupState, setupActions),
+            renderRepairPanel(repairState, repairActions),
           ),
         ),
       );
@@ -1346,11 +1507,13 @@
           { className: "flex gap-2" },
           React.createElement(Button, { type: "button", onClick: setupActions.open }, "Setup"),
           React.createElement(Button, { type: "button", onClick: runDoctor }, "Doctor"),
+          React.createElement(Button, { type: "button", onClick: repairActions.preview }, "Repair"),
           React.createElement(Button, { type: "button", onClick: refresh }, "Refresh"),
         ),
       ),
       renderDoctorPanel(doctorState),
       renderSetupPanel(setupState, setupActions),
+      renderRepairPanel(repairState, repairActions),
       state.board.projects.map(function (project) {
         const headingId = "project-" + project.id;
         const authority = project.authority || { state: "healthy" };

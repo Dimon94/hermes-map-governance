@@ -956,6 +956,43 @@ def test_doctor_opens_a_read_only_registry_without_requiring_database_write_mode
     assert not list(isolated["storage"].glob("registry.db-*"))
 
 
+def test_doctor_reports_durable_restart_repair_and_outbox_evidence_read_only(
+    isolated,
+):
+    application = _application(isolated)
+    plan = application.setup_plan(desired=isolated["desired"])
+    application.setup_apply(plan=plan, selected_action_ids=["config.prerequisites"])
+    database = isolated["storage"] / "registry.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE ceo_session_bindings(map_id TEXT, state TEXT);
+            INSERT INTO ceo_session_bindings VALUES ('I_atlas_41', 'repair_required');
+            CREATE TABLE pm_runtime_bindings(map_id TEXT, state TEXT);
+            INSERT INTO pm_runtime_bindings VALUES ('I_atlas_41', 'repair_required');
+            CREATE TABLE outbox_intents(effect_id TEXT, state TEXT);
+            INSERT INTO outbox_intents VALUES ('effect-pending', 'pending');
+            INSERT INTO outbox_intents VALUES ('effect-succeeded', 'succeeded');
+            """
+        )
+    before = database.read_bytes()
+
+    report = application.doctor()
+
+    check = {item["id"]: item for item in report["checks"]}["recovery.registry"]
+    assert check["status"] == "fail"
+    assert check["evidence"] == {
+        "available": True,
+        "ceo_session_repair_required": 1,
+        "pm_runtime_repair_required": 1,
+        "unfinished_outbox": 1,
+    }
+    assert check["remediation"]["description"] == (
+        "Run maps repair preview and explicitly apply only verified safe actions."
+    )
+    assert database.read_bytes() == before
+
+
 def test_doctor_distinguishes_project_read_from_missing_write_capability(isolated):
     application = _application(isolated)
     plan = application.setup_plan(desired=isolated["desired"])

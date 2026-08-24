@@ -94,6 +94,15 @@ class OutboxRepairRequest(BaseModel):
     note: str = Field(min_length=1)
 
 
+class RestartRecoveryRequest(BaseModel):
+    limit: int = Field(default=100, ge=1, le=1000)
+
+
+class IdentityRepairApplyRequest(BaseModel):
+    plan: dict[str, Any]
+    selected_action_ids: list[str] = Field(min_length=1)
+
+
 class SetupPlanRequest(BaseModel):
     desired: dict[str, Any]
 
@@ -219,6 +228,45 @@ async def setup_apply(
     )
 
 
+@router.post("/recovery")
+async def recover_restart(
+    request: RestartRecoveryRequest,
+    profile: str = Query(min_length=1),
+):
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "recover_restart",
+        outbox_limit=request.limit,
+    )
+
+
+@router.get("/repair/preview")
+async def preview_repairs(profile: str = Query(min_length=1)):
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "preview_repairs",
+    )
+
+
+@router.post("/repair/apply")
+async def apply_repairs(
+    request: IdentityRepairApplyRequest,
+    http_request: Request,
+    profile: str = Query(min_length=1),
+):
+    authorizer = _chairman_identity(http_request, profile=profile).actor_id
+    return await asyncio.to_thread(
+        _operation,
+        profile,
+        "apply_repairs",
+        plan=request.plan,
+        selected_action_ids=request.selected_action_ids,
+        authorizer=authorizer,
+    )
+
+
 @router.get("/board")
 async def board(profile: str = Query(min_length=1)):
     application = _application(profile)
@@ -298,6 +346,14 @@ async def stream_events(ws: WebSocket):
 @router.get("/maps/{map_id}")
 async def map_detail(map_id: str, profile: str = Query(min_length=1)):
     return _operation(profile, "map_detail", map_id=map_id)
+
+
+@router.get("/maps/{map_id}/repairs")
+async def identity_repair_history(
+    map_id: str,
+    profile: str = Query(min_length=1),
+):
+    return _operation(profile, "identity_repair_history", map_id=map_id)
 
 
 @router.get("/outbox/{effect_id}")

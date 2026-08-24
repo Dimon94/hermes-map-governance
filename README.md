@@ -280,6 +280,38 @@ Operator 可用 `hermes maps outbox status --effect EFFECT_ID` 检查 attempt hi
 `hermes maps outbox repair --effect EFFECT_ID --repair-id REPAIR_ID --note NOTE`
 显式重排 terminal intent。Repair 只增加审计记录并重置执行状态，不删除历史或静默吞掉失败。
 
+## Restart recovery 与 identity repair
+
+Dashboard backend 使用完整运行时组成时会从同一 `registry.db` 自动执行 restart recovery：
+重新读取 GitHub truth 构建所有 bound Map 投影，按已记录的 root lineage reconnect canonical
+CEO session，验证 Map、repository、profile 与 plugin lifecycle 后 rediscover owned Herdr runtime，
+并按 durable lease/idempotency 状态继续 Outbox work。它不会 mint replacement CEO session，
+也不会 attach、kill 或删除 ownership 未经验证的 pane/session。可显式查看同一恢复报告：
+
+```bash
+hermes maps recover --profile CEO_PROFILE --limit 100
+```
+
+CEO lineage 或 Herdr coordinate 缺失、重复、冲突时会保持 `repair_required` 并保留 evidence。
+Identity binding repair 是独立的 preview/apply 流程；preview 只列出当前证据唯一且 ownership、
+Map binding 均已验证的 safe action，apply 只接受 operator 明确选择的 action，并把认证
+authorizer、before/after 和 evidence 原子写入审计表：
+
+```bash
+hermes maps repair preview --profile CEO_PROFILE > repair-plan.json
+hermes maps repair apply \
+  --profile CEO_PROFILE \
+  --file repair-plan.json \
+  --action SAFE_ACTION_ID \
+  --authorizer AUTHENTICATED_OPERATOR_ID
+```
+
+若 preview 后事实变化，apply 会要求重新 preview。该流程只修改 plugin-owned identity
+binding；不会 close Issue、rewrite tracker history、delete session 或清理任何外部 runtime。
+Dashboard 提供同样的 preview、逐项选择和确认 apply，REST authorizer 始终来自已认证请求，
+不接受客户端自报身份。`maps doctor` 以 immutable read-only SQLite 检查 recovery registry，
+发现 repair-required 或未完成 Outbox work 时只给出 remediation，不触发恢复或修复。
+
 Maps 页面先读取一次带 cursor 的完整 projection，随后只通过 Hermes plugin WebSocket
 消费 SQLite 中已经提交的 ordered board events，按 project/card/detail reducer 局部更新；
 它不会按卡片轮询，也不会在每个 event 后重新加载 application。Cursor 跨进程和重启有效，
