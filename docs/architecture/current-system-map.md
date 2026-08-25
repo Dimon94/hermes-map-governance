@@ -9,6 +9,7 @@ Status: active delivery
 - 仓库：`hermes-map-governance`，GitHub 坐标 `Dimon94/hermes-map-governance`。
 - 产品边界：外部 standalone Hermes plugin；不修改 Hermes core，不复用 Kanban 状态机。
 - 技术栈：Python 3.11+、SQLite、FastAPI/Pydantic dashboard adapter、静态 JavaScript dashboard contribution、pytest 与 Node probe。
+- 测试依赖：仓库根 `package.json` / `package-lock.json` 显式拥有固定的 Playwright 1.58.2；dashboard live probe 使用仓库本地 Chromium，不读取 Hermes 或全局 `node_modules`。
 - 仓库边界：仓库根拥有 prompts、governance docs、tests、development tools 与 CI；它不是安装 payload。
 - Package 边界：`plugin/` 是 runtime code、manifest、after-install、dashboard 与 Skills 的唯一 canonical physical home。没有 copied runtime tree 或 escaping symlink。
 - 公开安装标识符：`https://github.com/Dimon94/hermes-map-governance.git#plugin`。Hermes 只扫描并安装该 repository subdirectory。
@@ -69,6 +70,9 @@ Adapter 不得绕过 application 直接裁决 stage、approval、session authori
 代码合入当前 checkout 后，稳定的最小入口为：
 
 ```bash
+npm ci
+npm run playwright:install
+npm run playwright:preflight
 HERMES_AGENT_ROOT=/path/to/hermes-agent python3 -m pytest -q
 uvx ruff@0.15.10 check plugin tests
 uvx ruff@0.15.10 format --check plugin tests
@@ -81,6 +85,8 @@ python3 -m compileall -q plugin tests
 node --check plugin/dashboard/dist/index.js
 node --check tests/dashboard_shell_probe.mjs
 node --check tests/dashboard_live_probe.mjs
+node --check tests/playwright_runtime.mjs
+node --check tests/playwright_preflight.mjs
 bash -n tools/github-api.sh tools/github-api.test.sh
 bash tools/github-api.test.sh
 git diff --check

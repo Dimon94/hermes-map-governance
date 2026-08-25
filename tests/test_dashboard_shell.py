@@ -70,6 +70,24 @@ def test_maps_dashboard_portfolio_is_filterable_canonical_and_read_only():
     assert result.stdout == "dashboard portfolio ready\n"
 
 
+def test_dashboard_playwright_runtime_is_ready():
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail("Node.js is required to preflight the dashboard browser runtime")
+    result = subprocess.run(
+        [
+            node,
+            str(REPOSITORY_ROOT / "tests" / "playwright_preflight.mjs"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "dashboard Playwright preflight ready\n"
+
+
 @pytest.mark.parametrize(
     "mode",
     [
@@ -81,7 +99,7 @@ def test_maps_dashboard_portfolio_is_filterable_canonical_and_read_only():
         "independent-stale",
     ],
 )
-def test_maps_dashboard_reduces_live_stream_without_full_reload(mode, hermes_host_root):
+def test_maps_dashboard_reduces_live_stream_without_full_reload(mode):
     node = shutil.which("node")
     if node is None:
         pytest.fail("Node.js is required to exercise the dashboard plugin bundle")
@@ -91,7 +109,6 @@ def test_maps_dashboard_reduces_live_stream_without_full_reload(mode, hermes_hos
             str(REPOSITORY_ROOT / "tests" / "dashboard_live_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             mode,
-            str(hermes_host_root),
         ],
         capture_output=True,
         text=True,

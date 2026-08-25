@@ -497,6 +497,9 @@ plugins:
 `HERMES_HOME`：
 
 ```bash
+npm ci
+npm run playwright:install
+npm run playwright:preflight
 HERMES_AGENT_ROOT=/path/to/hermes-agent python3 -m pytest -q
 uvx ruff@0.15.10 check plugin tests
 uvx ruff@0.15.10 format --check plugin tests
@@ -509,6 +512,8 @@ python3 -m compileall -q plugin tests
 node --check plugin/dashboard/dist/index.js
 node --check tests/dashboard_shell_probe.mjs
 node --check tests/dashboard_live_probe.mjs
+node --check tests/playwright_runtime.mjs
+node --check tests/playwright_preflight.mjs
 bash -n tools/github-api.sh tools/github-api.test.sh
 bash tools/github-api.test.sh
 git diff --check

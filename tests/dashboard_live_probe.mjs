@@ -1,15 +1,11 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import path from "node:path";
-import { createRequire } from "node:module";
+import { launchDashboardChromium } from "./playwright_runtime.mjs";
 
 
 const bundlePath = process.argv[2];
 const mode = process.argv[3];
-const hermesRoot = process.argv[4];
-const require = createRequire(import.meta.url);
-const { chromium } = require(path.join(hermesRoot, "node_modules", "playwright"));
-const browser = await chromium.launch({ headless: true });
+const browser = await launchDashboardChromium();
 const browserPage = await browser.newPage();
 const bundleSource = fs.readFileSync(bundlePath, "utf8");
 const result = await browserPage.evaluate(async ({ bundleSource, mode }) => {

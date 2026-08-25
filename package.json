@@ -1,0 +1,12 @@
+{
+  "name": "hermes-map-governance-tests",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "playwright:install": "PLAYWRIGHT_BROWSERS_PATH=0 playwright install --with-deps --only-shell chromium",
+    "playwright:preflight": "node tests/playwright_preflight.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.58.2"
+  }
+}

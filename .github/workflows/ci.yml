@@ -55,6 +55,12 @@ jobs:
           test -f "$HERMES_AGENT_ROOT/hermes_cli/web_dist/index.html"
           echo "HERMES_AGENT_ROOT=$HERMES_AGENT_ROOT" >> "$GITHUB_ENV"
 
+      - name: Prepare dashboard Playwright runtime
+        run: |
+          npm ci
+          npm run playwright:install
+          npm run playwright:preflight
+
       - name: Repository automation
         shell: bash
         run: |
@@ -78,6 +84,8 @@ jobs:
           node --check plugin/dashboard/dist/index.js
           node --check tests/dashboard_shell_probe.mjs
           node --check tests/dashboard_live_probe.mjs
+          node --check tests/playwright_runtime.mjs
+          node --check tests/playwright_preflight.mjs
 
       - name: Dashboard live and stream probes
         run: |
