@@ -22,7 +22,7 @@ from map_governance.tracker import (
 )
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin"
 
 
 class ControllableTracker:

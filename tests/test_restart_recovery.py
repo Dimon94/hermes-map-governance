@@ -20,7 +20,7 @@ from map_governance.storage import PluginStorage
 from map_governance.tracker import TrackerError, TrackerIssue, TrackerProject
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin"
 MAP_ID = "I_atlas_41"
 PROJECT_ID = "PVT_acme_7"
 PROJECT_URL = "https://github.com/orgs/acme/projects/7"

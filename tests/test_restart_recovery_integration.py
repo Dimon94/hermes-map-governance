@@ -18,7 +18,7 @@ from map_governance.sessions import CEO_SESSION_MODEL_CONFIG, CEO_SYSTEM_PROMPT
 from map_governance.storage import PluginStorage
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin"
 MAP_ID = "I_atlas_41"
 PROJECT_ID = "PVT_acme_7"
 PROJECT_URL = "https://github.com/orgs/acme/projects/7"

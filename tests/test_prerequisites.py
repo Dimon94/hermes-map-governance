@@ -22,7 +22,7 @@ from map_governance.prerequisites import (
     YamlConfigRepository,
 )
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin"
 NOW = datetime(2026, 8, 24, 1, 30, tzinfo=timezone.utc)
 
 

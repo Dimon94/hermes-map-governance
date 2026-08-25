@@ -127,11 +127,11 @@ FastAPI/Pydantic dashboard adapter 与静态 JavaScript dashboard contribution�
   直到 manifest 或 accepted ADR 更新版本。
 - 测试使用 pytest。Plugin discovery、profile/session 和 lifecycle integration
   必须设置显式 `HERMES_AGENT_ROOT`，并让运行状态落入临时 `HERMES_HOME`。
-- `dashboard/dist/index.js` 当前是受版本控制的 plugin artifact；修改时同时跑
+- `plugin/dashboard/dist/index.js` 当前是受版本控制的 plugin artifact；修改时同时跑
   Node syntax 与 `tests/dashboard_shell_probe.mjs` 的相关模式。
 - 不新增 npm runtime、bundler 或 Python dependency，除非当前功能无法由 Hermes
   public contract、标准库或已安装 dependency 完成，并补齐可复现安装入口。
-- `map_governance/tracker.py` 构造 `gh` 参数时不经过 shell interpolation。
+- `plugin/map_governance/tracker.py` 构造 `gh` 参数时不经过 shell interpolation。
   Repository automation 使用 repo://tools/github-api.sh，产品 runtime 不依赖它。
 
 ## 11. 坏味道

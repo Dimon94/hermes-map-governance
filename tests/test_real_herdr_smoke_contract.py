@@ -15,11 +15,11 @@ from map_governance.coordinator import (
 )
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _smoke_module():
-    path = PLUGIN_ROOT / "tests" / "real_herdr_mixed_smoke.py"
+    path = REPOSITORY_ROOT / "tests" / "real_herdr_mixed_smoke.py"
     spec = importlib.util.spec_from_file_location("real_herdr_mixed_smoke", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("real Herdr smoke module is unavailable")

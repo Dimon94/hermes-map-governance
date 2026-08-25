@@ -42,7 +42,7 @@ approve、reject、request revision 操作。审批 request/decision 先由 GitH
 ## 安装
 
 ```bash
-hermes plugins install Dimon94/hermes-map-governance --enable
+hermes plugins install https://github.com/Dimon94/hermes-map-governance.git#plugin --enable
 hermes maps health
 hermes dashboard
 ```
@@ -52,8 +52,11 @@ Hermes Kanban task。插件数据位于当前请求 profile 的 Hermes 原生插
 （`<PROFILE_HOME>/plugin-data/<map-governance-native-namespace>/registry.db`）；
 更新或卸载插件不会把它误当作安装文件删除。
 
-本仓库是 standalone plugin，安装到
-`<HERMES_HOME>/plugins/map-governance/`，不要求也不会修改 Hermes core。
+本仓库是 standalone plugin。Hermes 通过 `#plugin` 只扫描和安装仓库内的
+`plugin/` package，再落到 `<HERMES_HOME>/plugins/map-governance/`。仓库根的
+Agent prompts、治理文档、测试、开发工具和 CI 不属于 plugin payload。Runtime code、
+manifest、dashboard、Skills 与 after-install guidance 只保留在 `plugin/`，不要求也不会
+修改 Hermes core。
 
 ## 显式 setup 与纯读 doctor
 
@@ -494,19 +497,33 @@ plugins:
 `HERMES_HOME`：
 
 ```bash
-HERMES_AGENT_ROOT=/path/to/hermes-agent python -m pytest
-node --check dashboard/dist/index.js
+HERMES_AGENT_ROOT=/path/to/hermes-agent python3 -m pytest -q
+uvx ruff@0.15.10 check plugin tests
+uvx ruff@0.15.10 format --check plugin tests
+uvx ty@0.0.21 check \
+  --python /path/to/hermes-agent/venv/bin/python \
+  --extra-search-path plugin \
+  --extra-search-path /path/to/hermes-agent \
+  plugin/map_governance plugin/dashboard
+python3 -m compileall -q plugin tests
+node --check plugin/dashboard/dist/index.js
+node --check tests/dashboard_shell_probe.mjs
+node --check tests/dashboard_live_probe.mjs
+bash -n tools/github-api.sh tools/github-api.test.sh
+bash tools/github-api.test.sh
+git diff --check
 ```
 
-测试会从一次性本地 Git repo 执行真实的安装、native/dashboard 发现、页面打开和
-卸载流程，不读取开发机现有 Hermes profile。
+测试会从一次性本地 Git repo 的 `#plugin` 子目录执行默认安全扫描、真实安装、
+native/dashboard/tool/Skill 发现、setup/doctor、canonical Map 打开、disable 和 remove，
+不读取开发机现有 Hermes profile。
 
 真实 Herdr mixed-worker smoke 不属于默认门禁，也不会被 pytest 发现。它必须由 operator
 显式 opt-in，并要求一个已经发现 `map-governance:pm`、`delivery-pipeline`、`herdr` 的隔离
 PM profile，以及绝对的 `implement/SKILL.md` 路径：
 
 ```bash
-PYTHONPATH=. python tests/real_herdr_mixed_smoke.py \
+PYTHONPATH=plugin python tests/real_herdr_mixed_smoke.py \
   --confirm-isolated-real-herdr \
   --pm-profile ISOLATED_PM_PROFILE \
   --implement-skill /absolute/path/to/implement/SKILL.md

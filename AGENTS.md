@@ -36,7 +36,7 @@ Worker authority 与 publisher authority 分离；local delivery 不授予 remot
 <forge>
 Issue、代码和 CI/CD 归 GitHub，项目坐标 Dimon94/hermes-map-governance。Issue 约定见 repo://docs/agents/issue-tracker.md。
 仓库治理自动化统一走 repo://tools/github-api.sh；认证与 API 操作见 repo://docs/agents/github-api-operations.md。
-产品运行时的 GitHub tracker seam 归 `map_governance/tracker.py`，不能让仓库自动化脚本成为产品依赖。
+产品运行时的 GitHub tracker seam 归 `plugin/map_governance/tracker.py`，不能让仓库自动化脚本成为产品依赖。
 </forge>
 
 <branching>

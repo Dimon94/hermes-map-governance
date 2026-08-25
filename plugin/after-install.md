@@ -1,5 +1,15 @@
 # Map Governance installed
 
+Public install identifier:
+
+```text
+https://github.com/Dimon94/hermes-map-governance.git#plugin
+```
+
+Hermes installs only this repository's `plugin/` package. Repository prompts,
+governance documents, development tools, tests, and CI remain outside the
+scanned runtime payload.
+
 If the plugin was installed without `--enable`, activate it first:
 
 ```bash

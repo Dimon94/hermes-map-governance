@@ -67,10 +67,21 @@ _Avoid_: 内存队列、物理 exactly-once 承诺、静默删除 terminal failu
 : `MapGovernanceApplication`。CLI、Dashboard、CEO Tool、PM Tool 与 lifecycle adapter 共用的治理应用入口。
 _Avoid_: 在 adapter 重复 policy 或直接写 canonical state。
 
+**Plugin Package**
+: 仓库内 `plugin/` 的唯一可安装 runtime home。公开安装标识符是 `https://github.com/Dimon94/hermes-map-governance.git#plugin`。Hermes 只扫描和安装该子目录。
+_Avoid_: 把仓库根当 payload、复制第二棵 runtime、用越界 symlink 连接仓库资料。
+
+## 已交付范围
+
+- GitHub Project/Map binding、唯一阶段标签、可重建 board/portfolio projection、stale read-only 与 live cursor stream。
+- Canonical CEO Session、CEO/PM Skill 与 named toolset、结构化决策、内容绑定的 Chairman Approval。
+- Durable Outbox、restart recovery、safe identity repair 与 tracker readback reconciliation。
+- 显式 setup 和纯读 doctor；配置保留在正常 plugin settings 与 profile-scoped storage。
+- Plugin-owned Herdr commissioning、PM Executive Report、decision round trip、Codex/Claude delivery lane routing 与本地 integration fan-in。
+- Acceptance evidence、worker/publisher authority separation、受批准的 remote publication 与最终 closeout。
+- `plugin/` 物理安装边界；仓库 prompts、governance docs、tests、development tools 与 CI 不进入 scanner payload。
+
 ## 待确认或待交付
 
-- Live board event stream、cursor/reconnect 与 tracker 不可达时的 stale read-only 细节。
-- Setup/doctor 对 Hermes、Herdr、Codex、Claude 和凭据分级的最终诊断合同。
-- 真实 Herdr PM commissioning、worker routing、pause/resume/cancel 与 restart repair。
-- Acceptance、publisher credential 隔离、remote publication 与最终 closeout 的生产流程。
-- 生产部署、版本兼容矩阵与发布渠道。
+- 生产部署、Hermes 版本兼容矩阵与公开发布渠道。
+- 真实 provider/credential 环境中的 commissioning 与 publication 运营证据；默认测试只使用隔离 fake，真实 Herdr mixed-worker smoke 仍需显式 opt-in。

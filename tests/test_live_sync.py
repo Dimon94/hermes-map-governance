@@ -19,7 +19,7 @@ from map_governance.events import (
 from map_governance.tracker import TrackerError, TrackerIssue, TrackerProject
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin"
 PROJECT_URL = "https://github.com/orgs/acme/projects/7"
 ISSUE_URL = "https://github.com/acme/atlas/issues/41"
 JOURNAL_NOW = datetime(2026, 8, 23, 8, 0, tzinfo=timezone.utc)

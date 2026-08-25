@@ -13,31 +13,87 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  HERMES_AGENT_REF: 9098f6777b93b7881216a9b7d8fb402899f62400
+
 jobs:
-  hygiene:
+  verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Diff hygiene
-        run: git diff --check
-      - name: Repository automation
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      - name: Prepare pinned Hermes runtime
+        shell: bash
         run: |
+          set -euo pipefail
+          HERMES_AGENT_ROOT="$RUNNER_TEMP/hermes-agent"
+          mkdir "$HERMES_AGENT_ROOT"
+          git -C "$HERMES_AGENT_ROOT" init --quiet
+          git -C "$HERMES_AGENT_ROOT" remote add origin \
+            https://github.com/NousResearch/hermes-agent.git
+          git -C "$HERMES_AGENT_ROOT" fetch --depth 1 origin "$HERMES_AGENT_REF"
+          git -C "$HERMES_AGENT_ROOT" checkout --detach FETCH_HEAD
+          test "$(git -C "$HERMES_AGENT_ROOT" rev-parse HEAD)" = "$HERMES_AGENT_REF"
+          UV_PROJECT_ENVIRONMENT="$HERMES_AGENT_ROOT/venv" \
+            uv sync --locked --project "$HERMES_AGENT_ROOT" --python 3.11 --extra dev
+          npm ci --prefix "$HERMES_AGENT_ROOT" --workspace web
+          npm run --prefix "$HERMES_AGENT_ROOT" --workspace web build
+          test -f "$HERMES_AGENT_ROOT/hermes_cli/web_dist/index.html"
+          echo "HERMES_AGENT_ROOT=$HERMES_AGENT_ROOT" >> "$GITHUB_ENV"
+
+      - name: Repository automation
+        shell: bash
+        run: |
+          set -euo pipefail
           bash -n tools/github-api.sh tools/github-api.test.sh
           bash tools/github-api.test.sh
-      - name: Python syntax
-        run: |
-          paths=()
-          for candidate in __init__.py map_governance dashboard tests; do
-            [[ -e "$candidate" ]] && paths+=("$candidate")
-          done
-          ((${#paths[@]} == 0)) || python3 -m compileall -q "${paths[@]}"
-      - name: Dashboard syntax
-        run: |
-          [[ ! -f dashboard/dist/index.js ]] || node --check dashboard/dist/index.js
-          [[ ! -f tests/dashboard_shell_probe.mjs ]] || node --check tests/dashboard_shell_probe.mjs
 
-# Full plugin integration tests require an explicit Hermes checkout and runtime
-# dependencies. Add that job when the repository owns a reproducible dependency
-# setup; the current local verification contract is documented in the System Map.
+      - name: Ruff lint and format
+        run: |
+          uvx ruff@0.15.10 check plugin tests
+          uvx ruff@0.15.10 format --check plugin tests
+
+      - name: Type and syntax gates
+        run: |
+          uvx ty@0.0.21 check \
+            --python "$HERMES_AGENT_ROOT/venv/bin/python" \
+            --extra-search-path plugin \
+            --extra-search-path "$HERMES_AGENT_ROOT" \
+            plugin/map_governance plugin/dashboard
+          "$HERMES_AGENT_ROOT/venv/bin/python" -m compileall -q plugin tests
+          node --check plugin/dashboard/dist/index.js
+          node --check tests/dashboard_shell_probe.mjs
+          node --check tests/dashboard_live_probe.mjs
+
+      - name: Dashboard live and stream probes
+        run: |
+          "$HERMES_AGENT_ROOT/venv/bin/python" -m pytest -q \
+            tests/test_dashboard_shell.py tests/test_dashboard_plugin.py
+
+      - name: Default-safe plugin lifecycle
+        run: |
+          "$HERMES_AGENT_ROOT/venv/bin/python" -m pytest -q \
+            tests/test_plugin_lifecycle.py
+
+      - name: Full pytest suite
+        env:
+          GH_TOKEN: ""
+        run: |
+          "$HERMES_AGENT_ROOT/venv/bin/python" -m pytest -q
+
+      - name: Diff hygiene
+        run: git diff --check

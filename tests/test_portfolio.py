@@ -25,7 +25,7 @@ from map_governance.tracker import (
 )
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin"
 ACME_PROJECT_URL = "https://github.com/orgs/acme/projects/7"
 OCTO_PROJECT_URL = "https://github.com/users/octocat/projects/3"
 PUBLISHER_AUTHORITY = "gh:github.com:portfolio-publisher"

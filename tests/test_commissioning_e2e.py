@@ -421,7 +421,7 @@ else:
     tracker = FakeCLITracker(bin_dir / "gh")
     prerequisites = StaticCommissioningPrerequisites(context)
     application = MapGovernanceApplication(
-        plugin_root=Path(__file__).resolve().parents[1],
+        plugin_root=Path(__file__).resolve().parents[1] / "plugin",
         storage_root=storage_root,
         tracker=tracker,
         profile_name="ceo",
@@ -454,7 +454,7 @@ else:
         startup_poll_seconds=0.01,
     )
     restarted_application = MapGovernanceApplication(
-        plugin_root=Path(__file__).resolve().parents[1],
+        plugin_root=Path(__file__).resolve().parents[1] / "plugin",
         storage_root=storage_root,
         tracker=tracker,
         profile_name="ceo",

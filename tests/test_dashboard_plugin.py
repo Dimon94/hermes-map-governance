@@ -18,7 +18,8 @@ from map_governance import (
 )
 from map_governance.tracker import TrackerError
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = REPOSITORY_ROOT / "plugin"
 
 
 def _load_dashboard_adapter():
@@ -312,7 +313,7 @@ def test_event_stream_contract_uses_hermes_isolated_dependencies(hermes_host_roo
         result = subprocess.run(
             [
                 str(runtime),
-                str(PLUGIN_ROOT / "tests" / "dashboard_stream_probe.py"),
+                str(REPOSITORY_ROOT / "tests" / "dashboard_stream_probe.py"),
                 str(PLUGIN_ROOT),
                 mode,
             ],

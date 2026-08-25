@@ -16,6 +16,7 @@ def main() -> int:
     hermes_home = Path(sys.argv[2])
     dashboard_probe = Path(sys.argv[3])
     hermes = Path(sys.executable).with_name("hermes")
+    ceo_profile = "default"
 
     installed = subprocess.run(
         [str(hermes), "plugins", "install", source_url, "--enable"],
@@ -26,6 +27,25 @@ def main() -> int:
     assert installed.returncode == 0, installed.stdout + installed.stderr
     install_root = hermes_home / "plugins" / "map-governance"
     assert install_root.is_dir()
+    assert (install_root / "plugin.yaml").is_file()
+    assert (install_root / "map_governance").is_dir()
+    assert (install_root / "dashboard").is_dir()
+    assert (install_root / "skills").is_dir()
+    for repository_only_path in (
+        ".github",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CONTEXT.md",
+        "README.md",
+        "docs",
+        "tests",
+        "tools",
+    ):
+        assert not (install_root / repository_only_path).exists()
+    install_metadata = json.loads(
+        (hermes_home / "plugins" / ".install-metadata.json").read_text(encoding="utf-8")
+    )
+    assert install_metadata["map-governance"]["source"] == source_url
 
     diagnostic = subprocess.run(
         [str(hermes), "maps", "health"],
@@ -58,6 +78,102 @@ def main() -> int:
                 if line.startswith("{")
             )
         )
+
+    external_skills = hermes_home / "external-skills"
+    delivery_skill = external_skills / "delivery-pipeline" / "SKILL.md"
+    implement_skill = external_skills / "implement" / "SKILL.md"
+    for skill in (delivery_skill, implement_skill):
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text("# isolated lifecycle owner Skill\n", encoding="utf-8")
+    repository = hermes_home / "project-repository"
+    repository.mkdir()
+    desired_file = hermes_home / "setup-desired.json"
+    desired_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profiles": {"ceo": "ceo", "pm": "pm", "publisher": "publisher"},
+                "skills": {
+                    "plugin": ["map-governance:ceo", "map-governance:pm"],
+                    "external": [
+                        {"id": "delivery-pipeline", "path": str(delivery_skill)},
+                        {"id": "implement", "path": str(implement_skill)},
+                    ],
+                },
+                "routing": {
+                    "policy": "codex",
+                    "default_worker": "codex",
+                    "unavailable_worker": "blocked",
+                },
+                "github": {
+                    "hostname": "github.com",
+                    "projects": [
+                        {
+                            "id": "PVT_acme_7",
+                            "url": "https://github.com/orgs/acme/projects/7",
+                            "owner": "acme",
+                            "owner_type": "organization",
+                            "number": 7,
+                            "required_capability": "write",
+                        }
+                    ],
+                    "repositories": [
+                        {
+                            "coordinate": "acme/atlas",
+                            "path": str(repository),
+                            "worker_write_required": True,
+                            "publication_required": False,
+                        }
+                    ],
+                },
+                "authorities": {
+                    "worker": {
+                        "kind": "local_git",
+                        "credential_ref": "local-git",
+                    },
+                    "publisher": {
+                        "kind": "none",
+                        "credential_ref": "none",
+                        "required": False,
+                    },
+                },
+                "herdr": {"executable": "herdr"},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    setup_plan = run_maps("setup", "plan", "--file", str(desired_file))
+    setup_plan_file = hermes_home / "setup-plan.json"
+    setup_plan_file.write_text(json.dumps(setup_plan), encoding="utf-8")
+    setup_applied = run_maps(
+        "setup",
+        "apply",
+        "--file",
+        str(setup_plan_file),
+        "--action",
+        "config.prerequisites",
+    )
+    assert setup_applied["readback"] == "confirmed"
+    doctor_result = subprocess.run(
+        [str(hermes), "maps", "doctor"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert doctor_result.returncode == 1, doctor_result.stdout + doctor_result.stderr
+    doctor = json.loads(
+        next(
+            line
+            for line in reversed(doctor_result.stdout.splitlines())
+            if line.startswith("{")
+        )
+    )
+    assert doctor["status"] == "fail"
+    doctor_checks = {check["id"]: check for check in doctor["checks"]}
+    assert doctor_checks["configuration"]["status"] == "pass"
+    assert doctor_checks["skills.plugin.ceo"]["status"] == "pass"
+    assert doctor_checks["skills.plugin.pm"]["status"] == "pass"
 
     project = run_maps(
         "project",
@@ -178,8 +294,40 @@ def main() -> int:
     assert maps_plugin["label"] == "Maps"
     assert maps_plugin["tab"]["path"] == "/maps"
 
+    opened = client.post(
+        f"/api/plugins/map-governance/maps/{first_card['id']}/session"
+        f"?profile={ceo_profile}",
+        headers=auth,
+    )
+    assert opened.status_code == 200, opened.text
+    canonical_session = opened.json()["ceo_session"]
+    assert canonical_session["state"] == "ready"
+    assert canonical_session["root_session_id"]
+    assert canonical_session["live_session_id"]
+    reopened = client.post(
+        f"/api/plugins/map-governance/maps/{first_card['id']}/session"
+        f"?profile={ceo_profile}",
+        headers=auth,
+    )
+    assert reopened.status_code == 200, reopened.text
+    assert (
+        reopened.json()["ceo_session"]["root_session_id"]
+        == (canonical_session["root_session_id"])
+    )
+    assert (
+        reopened.json()["ceo_session"]["live_session_id"]
+        == (canonical_session["live_session_id"])
+    )
+    detail = client.get(
+        f"/api/plugins/map-governance/maps/{first_card['id']}?profile={ceo_profile}",
+        headers=auth,
+    )
+    assert detail.status_code == 200, detail.text
+    projected_session = detail.json()["ceo_session"]
+    assert projected_session["state"] == "ready"
+
     page = client.get("/maps")
-    assert page.status_code == 200
+    assert page.status_code == 200, page.text
     assert "text/html" in page.headers["content-type"]
     bundle = client.get("/dashboard-plugins/map-governance/dist/index.js")
     assert bundle.status_code == 200
@@ -197,13 +345,13 @@ def main() -> int:
     assert bundle_probe.returncode == 0, bundle_probe.stdout + bundle_probe.stderr
 
     health = client.get(
-        "/api/plugins/map-governance/health?profile=default",
+        f"/api/plugins/map-governance/health?profile={ceo_profile}",
         headers=auth,
     )
     assert health.status_code == 200, health.text
     assert health.json()["status"] == "ready"
     board = client.get(
-        "/api/plugins/map-governance/board?profile=default",
+        f"/api/plugins/map-governance/board?profile={ceo_profile}",
         headers=auth,
     )
     assert board.status_code == 200, board.text
@@ -212,7 +360,7 @@ def main() -> int:
     assert board.json()["maps"][0]["tracker"]["identity"] == "acme/atlas#41"
     portfolio = client.get(
         "/api/plugins/map-governance/portfolio"
-        "?profile=default&project_id=PVT_acme_7&stage=authorized",
+        f"?profile={ceo_profile}&project_id=PVT_acme_7&stage=authorized",
         headers=auth,
     )
     assert portfolio.status_code == 200, portfolio.text
@@ -222,6 +370,14 @@ def main() -> int:
 
     registry_database = Path(health.json()["components"]["storage"]["database"])
     assert registry_database.is_file()
+    disabled = subprocess.run(
+        [str(hermes), "plugins", "disable", "map-governance"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert disabled.returncode == 0, disabled.stdout + disabled.stderr
+    assert install_root.is_dir()
     removed = subprocess.run(
         [str(hermes), "plugins", "remove", "map-governance"],
         capture_output=True,
@@ -248,8 +404,13 @@ def main() -> int:
                 "map_bound": True,
                 "native_discovered": True,
                 "dashboard_discovered": True,
-                "opened": True,
+                "disabled": True,
+                "doctor_available": True,
+                "canonical_session_opened": True,
+                "payload_isolated": True,
                 "removed": True,
+                "setup_verified": True,
+                "source_recorded": True,
             },
             sort_keys=True,
         )

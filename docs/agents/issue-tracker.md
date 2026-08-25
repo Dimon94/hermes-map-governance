@@ -33,4 +33,4 @@ Canonical 阻断语义写在 Issue body：`Blocked by: #x #y`。GitHub 原生关
 ## 程序化访问
 
 仓库治理自动化统一走 repo://tools/github-api.sh。认证、endpoint、GraphQL 和写后验证见 repo://docs/agents/github-api-operations.md。
-产品运行时不能依赖该脚本；产品 GitHub 协议归 `map_governance/tracker.py`。
+产品运行时不能依赖该脚本；产品 GitHub 协议归 `plugin/map_governance/tracker.py`。

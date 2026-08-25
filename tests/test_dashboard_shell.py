@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = REPOSITORY_ROOT / "plugin"
 
 
 def test_maps_dashboard_renders_application_empty_state():
@@ -17,7 +18,7 @@ def test_maps_dashboard_renders_application_empty_state():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
         ],
         capture_output=True,
@@ -36,7 +37,7 @@ def test_maps_dashboard_groups_complete_cards_by_project():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "populated",
         ],
@@ -56,7 +57,7 @@ def test_maps_dashboard_portfolio_is_filterable_canonical_and_read_only():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "portfolio",
         ],
@@ -87,7 +88,7 @@ def test_maps_dashboard_reduces_live_stream_without_full_reload(mode, hermes_hos
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_live_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_live_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             mode,
             str(hermes_host_root),
@@ -108,7 +109,7 @@ def test_ready_map_opens_the_canonical_session_through_the_desktop_sdk():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "ready",
         ],
@@ -128,7 +129,7 @@ def test_authorized_map_explicitly_commissions_one_hermes_pm():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "commission",
         ],
@@ -148,7 +149,7 @@ def test_map_exposes_runtime_status_repair_evidence_and_resume_action():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "runtime-status",
         ],
@@ -168,7 +169,7 @@ def test_transient_session_hydration_uses_the_desktop_retry_contract():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "hydration-retry",
         ],
@@ -188,7 +189,7 @@ def test_failed_dashboard_transition_keeps_committed_stage_and_shows_error():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "transition-failure",
         ],
@@ -208,7 +209,7 @@ def test_map_detail_exposes_explicit_accessible_chairman_approval_actions():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "approval",
         ],
@@ -228,7 +229,7 @@ def test_map_card_and_detail_render_pm_executive_summary_without_lane_cards():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "pm-report",
         ],
@@ -248,7 +249,7 @@ def test_map_card_renders_terminal_outbox_reason_and_repair_command():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "outbox-terminal",
         ],
@@ -268,7 +269,7 @@ def test_dashboard_previews_and_applies_only_selected_safe_identity_repairs():
     result = subprocess.run(
         [
             node,
-            str(PLUGIN_ROOT / "tests" / "dashboard_shell_probe.mjs"),
+            str(REPOSITORY_ROOT / "tests" / "dashboard_shell_probe.mjs"),
             str(PLUGIN_ROOT / "dashboard" / "dist" / "index.js"),
             "identity-repair",
         ],

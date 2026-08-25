@@ -27,7 +27,7 @@ from map_governance.tracker import (
 )
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin"
 MAP_ID = "I_atlas_round_trip"
 ISSUE_URL = "https://github.com/acme/atlas/issues/51"
 PROJECT_URL = "https://github.com/orgs/acme/projects/7"

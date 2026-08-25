@@ -16,7 +16,7 @@ from map_governance.sessions import (
 from map_governance.tracker import TrackerIssue, TrackerProject
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin"
 ISSUE_URL = "https://github.com/acme/atlas/issues/41"
 PROJECT_URL = "https://github.com/orgs/acme/projects/7"
 

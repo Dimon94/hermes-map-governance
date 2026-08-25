@@ -7,4 +7,5 @@ license = { file = "LICENSE" }
 
 [tool.pytest.ini_options]
 addopts = "-q"
+pythonpath = ["plugin"]
 testpaths = ["tests"]

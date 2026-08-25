@@ -23,7 +23,7 @@ from map_governance.sessions import (
 from map_governance.tracker import TrackerIssue, TrackerProject
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin"
 MAP_ID = "I_atlas_41"
 PROFILE = "ceo"
 ISSUE_URL = "https://github.com/acme/atlas/issues/41"
