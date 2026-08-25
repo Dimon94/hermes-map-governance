@@ -27,6 +27,8 @@ from .approvals import (
 )
 from .stages import (
     ALLOWED_TRANSITIONS,
+    EXECUTIVE_STAGES,
+    PORTFOLIO_HEALTH_STATES,
     available_transitions,
     executive_stage,
     rejection_reason,
@@ -110,6 +112,7 @@ from .tracker import (
     TrackerIssue,
     TrackerPublicationRecord,
     TrackerProject,
+    ProjectTrackerRouter,
 )
 
 
@@ -366,6 +369,7 @@ class MapGovernanceApplication:
         plugin_root: Path,
         storage_root: Path,
         tracker: TrackerAdapter | None = None,
+        tracker_for_project: Callable[[str], TrackerAdapter] | None = None,
         session_runner: CEOSessionRunner | None = None,
         profile_name: str | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -384,7 +388,19 @@ class MapGovernanceApplication:
     ) -> None:
         self._plugin_root = plugin_root.resolve()
         self._storage = PluginStorage(storage_root, shared_gid=storage_group_id)
-        self._tracker = tracker or GitHubTrackerAdapter()
+        default_tracker = tracker or GitHubTrackerAdapter()
+        self._project_tracker_router = (
+            ProjectTrackerRouter(
+                tracker_for_project=tracker_for_project,
+                project_url_for_resource=self._project_url_for_tracker_resource,
+            )
+            if tracker_for_project is not None
+            else None
+        )
+        self._tracker: TrackerAdapter = cast(
+            TrackerAdapter,
+            self._project_tracker_router or default_tracker,
+        )
         self._session_runner = session_runner
         self._profile_name = profile_name
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -464,6 +480,24 @@ class MapGovernanceApplication:
             crash_injector=outbox_crash_injector,
         )
 
+    def _project_url_for_tracker_resource(self, resource_url: str) -> str | None:
+        project = self._storage.project_binding_for_url(resource_url)
+        if project is not None:
+            return str(project["project_url"])
+        map_binding = self._storage.map_binding_for_issue_url(resource_url)
+        if map_binding is None:
+            return None
+        project = self._storage.project_binding(str(map_binding["project_id"]))
+        return str(project["project_url"]) if project is not None else None
+
+    @contextmanager
+    def _project_tracker_scope(self, project_url: str) -> Iterator[None]:
+        if self._project_tracker_router is None:
+            yield
+            return
+        with self._project_tracker_router.for_project(project_url):
+            yield
+
     def health(self) -> dict[str, Any]:
         """Return readiness for the application and its owned storage."""
         storage = self._storage.check_readiness()
@@ -542,6 +576,201 @@ class MapGovernanceApplication:
                     "Bind an existing GitHub Map Issue to start a governance board."
                 ),
             },
+        }
+
+    def portfolio(
+        self,
+        *,
+        project_id: str | None = None,
+        stage: str | None = None,
+        approval_need: bool | None = None,
+        health: str | None = None,
+        stale: bool | None = None,
+    ) -> dict[str, Any]:
+        """Derive one read-only cross-project view from current board projections."""
+        if stage is not None and stage not in EXECUTIVE_STAGES:
+            raise ValueError(f"Unsupported portfolio stage filter: {stage}")
+        if health is not None and health not in PORTFOLIO_HEALTH_STATES:
+            raise ValueError(f"Unsupported portfolio health filter: {health}")
+
+        project_rows, map_rows = self._storage.board_rows()
+        project_by_id = {
+            row["project_id"]: self._project_projection(row) for row in project_rows
+        }
+        if project_id is not None and project_id not in project_by_id:
+            raise MapBindingError(f"CEO project is not configured: {project_id}")
+
+        selected_projects = [
+            project
+            for current_id, project in project_by_id.items()
+            if project_id is None or current_id == project_id
+            if stale is None or (project["authority"]["state"] != "healthy") is stale
+        ]
+        groups = {
+            project["id"]: {
+                "id": project["id"],
+                "title": project["title"],
+                "tracker": project["tracker"],
+                "authority": project["authority"],
+                "stale": project["authority"]["state"] != "healthy",
+                "items": [],
+            }
+            for project in selected_projects
+        }
+
+        items = []
+        for row in map_rows:
+            group = groups.get(row["project_id"])
+            if group is None:
+                continue
+            project = project_by_id[row["project_id"]]
+            card = self._card_with_summary(
+                row,
+                project_url=project["tracker"]["url"],
+                persist_approval_expiry=False,
+            )
+            item = self._portfolio_item(card=card, project=project)
+            if stage is not None and item["stage"] != stage:
+                continue
+            if approval_need is not None and item["approval_need"] is not approval_need:
+                continue
+            if health is not None and item["health"]["state"] != health:
+                continue
+            group["items"].append(item)
+            items.append(item)
+
+        if stage is not None or approval_need is not None or health is not None:
+            groups = {
+                current_id: group
+                for current_id, group in groups.items()
+                if group["items"]
+            }
+
+        for group in groups.values():
+            group["summary"] = self._portfolio_summary(group["items"])
+        summary = self._portfolio_summary(items)
+        summary = {
+            "project_count": len(groups),
+            "stale_project_count": sum(group["stale"] for group in groups.values()),
+            **summary,
+        }
+        return {
+            "projects": list(groups.values()),
+            "items": items,
+            "summary": summary,
+            "filters": {
+                "project_id": project_id,
+                "stage": stage,
+                "approval_need": approval_need,
+                "health": health,
+                "stale": stale,
+            },
+            "filter_options": {
+                "projects": [
+                    {"id": project["id"], "title": project["title"]}
+                    for project in project_by_id.values()
+                ],
+                "stages": sorted(EXECUTIVE_STAGES),
+                "health": sorted(PORTFOLIO_HEALTH_STATES),
+            },
+            "read_only": True,
+            "capabilities": {
+                "open_map_detail": True,
+                "open_ceo_session": True,
+                "mutations": [],
+            },
+            "empty_state": {
+                "title": "No Maps match these portfolio filters",
+                "description": "Change or clear filters to view current Map projections.",
+            },
+        }
+
+    @staticmethod
+    def _portfolio_item(
+        *,
+        card: dict[str, Any],
+        project: dict[str, Any],
+    ) -> dict[str, Any]:
+        delivery = card["delivery_summary"]
+        badges = {badge["type"] for badge in delivery.get("badges", [])}
+        blocking_decision = card["stage"] == "decision" or bool(
+            badges & {"blocking_question", "whole_map_blocker"}
+        )
+        health_signals = []
+        if blocking_decision:
+            health_state = "blocked"
+            health_signals.append("blocking_decision")
+        elif (
+            delivery.get("latest", {}).get("type") == "failure"
+            or badges & {"localized_blocker", "terminal_failure"}
+            or card["external_effects"]["state"] in {"retrying", "needs_repair"}
+        ):
+            health_state = "needs_attention"
+            if delivery.get("latest", {}).get("type") == "failure":
+                health_signals.append("terminal_failure")
+            if "localized_blocker" in badges:
+                health_signals.append("localized_blocker")
+            if card["external_effects"]["state"] in {"retrying", "needs_repair"}:
+                health_signals.append("external_effects")
+        else:
+            health_state = "healthy"
+        pending_approvals = int(card["approval_summary"]["pending_count"])
+        acceptance_ready = card["stage"] == "acceptance"
+        terminal_outcome = (
+            card["stage"] if card["stage"] in {"done", "cancelled"} else None
+        )
+        stale = project["authority"]["state"] != "healthy"
+        return {
+            "map_id": card["id"],
+            "project": card["project"],
+            "tracker": card["tracker"],
+            "title": card["title"],
+            "stage": card["stage"],
+            "approval_need": (
+                card["stage"] == "awaiting-approval" or pending_approvals > 0
+            ),
+            "pending_approval_count": pending_approvals,
+            "blocking_decision": blocking_decision,
+            "acceptance_ready": acceptance_ready,
+            "terminal_outcome": terminal_outcome,
+            "health": {"state": health_state, "signals": health_signals},
+            "stale": stale,
+            "last_synchronized_at": card["last_synchronized_at"],
+            "ceo_session": card["ceo_session"],
+            "decision_summary": card["decision_summary"],
+            "delivery_summary": delivery,
+            "navigation": {
+                "map_detail": {"map_id": card["id"]},
+                "ceo_session": {"map_id": card["id"]},
+            },
+        }
+
+    @staticmethod
+    def _portfolio_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+        stage_counts: dict[str, int] = {}
+        health_counts: dict[str, int] = {}
+        for item in items:
+            stage_counts[item["stage"]] = stage_counts.get(item["stage"], 0) + 1
+            health_state = item["health"]["state"]
+            health_counts[health_state] = health_counts.get(health_state, 0) + 1
+        terminal_done = stage_counts.get("done", 0)
+        terminal_cancelled = stage_counts.get("cancelled", 0)
+        return {
+            "map_count": len(items),
+            "stage_counts": dict(sorted(stage_counts.items())),
+            "awaiting_approvals": {
+                "map_count": sum(item["approval_need"] for item in items),
+                "request_count": sum(item["pending_approval_count"] for item in items),
+            },
+            "blocking_decisions": sum(item["blocking_decision"] for item in items),
+            "stale_maps": sum(item["stale"] for item in items),
+            "acceptance_readiness": sum(item["acceptance_ready"] for item in items),
+            "terminal_outcomes": {
+                "done": terminal_done,
+                "cancelled": terminal_cancelled,
+                "total": terminal_done + terminal_cancelled,
+            },
+            "health_counts": dict(sorted(health_counts.items())),
         }
 
     def recover_restart(self, *, outbox_limit: int = 100) -> dict[str, Any]:
@@ -1109,9 +1338,13 @@ class MapGovernanceApplication:
         project = self._storage.project_binding(str(binding["project_id"]))
         if project is None:
             raise ValueError("runtime_map_binding_missing")
-        issue = self._tracker.get_issue(str(binding["issue_url"]))
+        project_id = str(binding["project_id"])
+        issue = self._tracker_read(
+            project_id=project_id,
+            operation=lambda: self._tracker.get_issue(str(binding["issue_url"])),
+        )
         context = prerequisites.commissioning_context(
-            project_id=str(binding["project_id"]),
+            project_id=project_id,
             repository=issue.repository,
         )
         expected = {
@@ -1540,7 +1773,11 @@ class MapGovernanceApplication:
     ) -> Any:
         """Mark only the affected project stale when authority cannot be read."""
         try:
-            return operation()
+            project = self._storage.project_binding(project_id)
+            if project is None:
+                raise MapBindingError(f"CEO project is not configured: {project_id}")
+            with self._project_tracker_scope(str(project["project_url"])):
+                return operation()
         except TrackerError as error:
             self._mark_tracker_stale(project_id=project_id, reason=str(error))
             raise
@@ -6896,12 +7133,17 @@ class MapGovernanceApplication:
                     approval = {**approval, "status": "expired"}
         return approval
 
-    def _approval_collection(self, *, map_id: str) -> dict[str, Any]:
-        persist_expiry = True
-        try:
-            self._ensure_map_writable(map_id=map_id)
-        except StaleProjectionError:
-            persist_expiry = False
+    def _approval_collection(
+        self,
+        *,
+        map_id: str,
+        persist_expiry: bool = True,
+    ) -> dict[str, Any]:
+        if persist_expiry:
+            try:
+                self._ensure_map_writable(map_id=map_id)
+            except StaleProjectionError:
+                persist_expiry = False
         approvals = []
         for row in self._storage.approvals(map_id=map_id):
             current = self._current_approval(
@@ -7451,7 +7693,8 @@ class MapGovernanceApplication:
         if existing is not None:
             self._ensure_project_writable(project_id=str(existing["project_id"]))
         try:
-            project = self._tracker.get_project(project_url)
+            with self._project_tracker_scope(project_url):
+                project = self._tracker.get_project(project_url)
         except TrackerError as error:
             if existing is not None:
                 self._mark_tracker_stale(
@@ -7474,13 +7717,14 @@ class MapGovernanceApplication:
         self._ensure_project_writable(project_id=project_id)
         synchronized_at = self._synchronized_at()
         try:
-            issue = self._tracker.get_issue(issue_url)
-            decisions, reports, approvals, publications = (
-                self._authoritative_map_history(
-                    issue=issue,
-                    synchronized_at=synchronized_at,
+            with self._project_tracker_scope(str(project_binding["project_url"])):
+                issue = self._tracker.get_issue(issue_url)
+                decisions, reports, approvals, publications = (
+                    self._authoritative_map_history(
+                        issue=issue,
+                        synchronized_at=synchronized_at,
+                    )
                 )
-            )
         except TrackerError as error:
             self._mark_tracker_stale(project_id=project_id, reason=str(error))
             raise
@@ -7543,35 +7787,36 @@ class MapGovernanceApplication:
             changed_at=changed_at,
         )
         try:
-            project = self._tracker.get_project(str(binding["project_url"]))
-            if project.id != project_id:
-                raise MapBindingError("Configured GitHub Project identity changed")
-            synchronized_at = self._synchronized_at()
-            cards: list[dict[str, Any]] = []
-            decisions: dict[str, list[dict[str, Any]]] = {}
-            reports: dict[str, list[dict[str, Any]]] = {}
-            approvals: dict[str, list[dict[str, Any]]] = {}
-            publications: dict[str, list[dict[str, Any]]] = {}
-            for map_binding in self._storage.map_bindings(project_id):
-                issue = self._tracker.get_issue(str(map_binding["issue_url"]))
-                if issue.id != map_binding["map_id"]:
-                    raise MapBindingError("Bound GitHub Issue identity changed")
-                cards.append(
-                    self._stored_card(
-                        issue,
-                        project_id=project_id,
+            with self._project_tracker_scope(str(binding["project_url"])):
+                project = self._tracker.get_project(str(binding["project_url"]))
+                if project.id != project_id:
+                    raise MapBindingError("Configured GitHub Project identity changed")
+                synchronized_at = self._synchronized_at()
+                cards: list[dict[str, Any]] = []
+                decisions: dict[str, list[dict[str, Any]]] = {}
+                reports: dict[str, list[dict[str, Any]]] = {}
+                approvals: dict[str, list[dict[str, Any]]] = {}
+                publications: dict[str, list[dict[str, Any]]] = {}
+                for map_binding in self._storage.map_bindings(project_id):
+                    issue = self._tracker.get_issue(str(map_binding["issue_url"]))
+                    if issue.id != map_binding["map_id"]:
+                        raise MapBindingError("Bound GitHub Issue identity changed")
+                    cards.append(
+                        self._stored_card(
+                            issue,
+                            project_id=project_id,
+                            synchronized_at=synchronized_at,
+                        )
+                    )
+                    (
+                        decisions[issue.id],
+                        reports[issue.id],
+                        approvals[issue.id],
+                        publications[issue.id],
+                    ) = self._authoritative_map_history(
+                        issue=issue,
                         synchronized_at=synchronized_at,
                     )
-                )
-                (
-                    decisions[issue.id],
-                    reports[issue.id],
-                    approvals[issue.id],
-                    publications[issue.id],
-                ) = self._authoritative_map_history(
-                    issue=issue,
-                    synchronized_at=synchronized_at,
-                )
             self._storage.apply_project_reconcile(
                 project=self._stored_project(project),
                 cards=cards,
@@ -8759,10 +9004,14 @@ class MapGovernanceApplication:
         row: dict[str, Any],
         *,
         project_url: str,
+        persist_approval_expiry: bool = True,
     ) -> dict[str, Any]:
         card = self._card_projection(row, project_url=project_url)
         card["decision_summary"] = self._storage.decision_summary(map_id=card["id"])
-        approvals = self._approval_collection(map_id=card["id"])
+        approvals = self._approval_collection(
+            map_id=card["id"],
+            persist_expiry=persist_approval_expiry,
+        )
         card["approval_summary"] = {
             "count": approvals["count"],
             "pending_count": sum(

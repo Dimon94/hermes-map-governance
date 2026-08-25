@@ -9,7 +9,7 @@ import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .application import GovernanceRequestIdentity, MapGovernanceApplication
 from .coordinator import CoordinatorRuntime
@@ -32,6 +32,11 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ID = "map-governance"
 _PROFILE_APPLICATIONS: dict[tuple[str, str, str], MapGovernanceApplication] = {}
 _PROFILE_APPLICATIONS_LOCK = Lock()
+
+
+def _default_tracker_for_project(_project_url: str) -> TrackerAdapter:
+    """Create one ambient-auth prototype client for one project namespace."""
+    return GitHubTrackerAdapter()
 
 
 class ProfileResolutionError(ValueError):
@@ -192,8 +197,12 @@ def application_for_storage(
     coordinator_runtime: CoordinatorRuntime | None = None,
     publisher: PublisherBoundary | None = None,
     tracker: TrackerAdapter | None = None,
+    tracker_for_project: Callable[[str], TrackerAdapter] | None = None,
 ) -> MapGovernanceApplication:
     """Build the application for an explicitly selected storage directory."""
+    resolved_tracker_for_project = tracker_for_project
+    if tracker is None and resolved_tracker_for_project is None:
+        resolved_tracker_for_project = _default_tracker_for_project
     shared_gid = _require_configured_process_identity(
         storage_root, publisher_process=publisher is not None
     )
@@ -255,6 +264,7 @@ def application_for_storage(
         plugin_root=PLUGIN_ROOT,
         storage_root=storage_root,
         tracker=tracker,
+        tracker_for_project=resolved_tracker_for_project,
         session_runner=session_runner,
         profile_name=profile_name,
         authority_policy=AuthorityEnvelopePolicy.from_settings(authority_settings),

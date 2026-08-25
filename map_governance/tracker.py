@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Mapping, Protocol, Sequence, TypeVar
+from threading import Lock
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, TypeVar
 from urllib.parse import urlparse
 
 import yaml
@@ -233,6 +236,57 @@ class TrackerAdapter(Protocol):
         issue_id: str,
         registry: DeliveryLaneRegistry,
     ) -> TrackerDeliveryLaneRegistryRecord: ...
+
+
+class ProjectTrackerRouter:
+    """Route tracker calls through one cached client per configured project."""
+
+    def __init__(
+        self,
+        *,
+        tracker_for_project: Callable[[str], TrackerAdapter],
+        project_url_for_resource: Callable[[str], str | None],
+    ) -> None:
+        self._tracker_for_project = tracker_for_project
+        self._project_url_for_resource = project_url_for_resource
+        self._active_project_url: ContextVar[str | None] = ContextVar(
+            "map_governance_project_tracker_url",
+            default=None,
+        )
+        self._clients: dict[str, TrackerAdapter] = {}
+        self._clients_lock = Lock()
+
+    @contextmanager
+    def for_project(self, project_url: str) -> Iterator[None]:
+        token = self._active_project_url.set(project_url)
+        try:
+            yield
+        finally:
+            self._active_project_url.reset(token)
+
+    def _client(self, project_url: str) -> TrackerAdapter:
+        with self._clients_lock:
+            client = self._clients.get(project_url)
+            if client is None:
+                client = self._tracker_for_project(project_url)
+                self._clients[project_url] = client
+            return client
+
+    def __getattr__(self, name: str) -> Any:
+        def routed(resource_url: str, *args: Any, **kwargs: Any) -> Any:
+            project_url = self._active_project_url.get()
+            if project_url is None:
+                project_url = self._project_url_for_resource(resource_url)
+            if project_url is None and name == "get_project":
+                project_url = resource_url
+            if project_url is None:
+                raise TrackerError(
+                    "Tracker resource has no configured project authority"
+                )
+            operation = getattr(self._client(project_url), name)
+            return operation(resource_url, *args, **kwargs)
+
+        return routed
 
 
 class CommandRunner(Protocol):

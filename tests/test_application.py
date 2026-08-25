@@ -225,6 +225,10 @@ def test_capable_profile_composition_runs_full_restart_recovery_on_startup(
 
     assert isinstance(built, ApplicationProbe)
     assert [name for name, _arguments in calls] == ["init", "recover_restart"]
+    tracker_factory = calls[0][1]["tracker_for_project"]
+    first = tracker_factory("https://github.com/orgs/acme/projects/7")
+    second = tracker_factory("https://github.com/users/octocat/projects/3")
+    assert first is not second
 
 
 def test_board_exposes_a_useful_empty_projection_before_any_maps_are_bound(tmp_path):

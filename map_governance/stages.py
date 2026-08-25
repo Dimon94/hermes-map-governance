@@ -14,6 +14,9 @@ ACTIVE_STAGES = frozenset(
         "parked",
     }
 )
+TERMINAL_STAGES = frozenset({"done", "cancelled"})
+EXECUTIVE_STAGES = ACTIVE_STAGES | TERMINAL_STAGES
+PORTFOLIO_HEALTH_STATES = frozenset({"healthy", "needs_attention", "blocked"})
 
 ALLOWED_TRANSITIONS = {
     "discovery": frozenset({"awaiting-approval", "parked"}),

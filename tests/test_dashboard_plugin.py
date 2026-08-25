@@ -77,6 +77,60 @@ def test_rest_health_and_board_delegate_with_explicit_profile(
     assert requested_profiles == ["ceo", "ceo"]
 
 
+def test_rest_portfolio_delegates_read_only_filters_and_rejects_mutation(
+    monkeypatch,
+    hermes_host_root,
+):
+    adapter = _load_dashboard_adapter()
+    api = FastAPI()
+    api.include_router(adapter.router, prefix="/api/plugins/map-governance")
+    calls = []
+
+    class ApplicationProbe:
+        def portfolio(self, **arguments):
+            calls.append(arguments)
+            return {"operation": "portfolio", "read_only": True}
+
+    monkeypatch.setattr(
+        adapter,
+        "application_for_profile",
+        lambda profile: calls.append({"profile": profile}) or ApplicationProbe(),
+    )
+
+    async def exercise_routes():
+        transport = httpx.ASGITransport(app=api)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            read = await client.get(
+                "/api/plugins/map-governance/portfolio"
+                "?profile=ceo&project_id=PVT_acme_7&stage=decision"
+                "&approval_need=true&health=blocked&stale=false"
+            )
+            mutation = await client.post(
+                "/api/plugins/map-governance/portfolio?profile=ceo",
+                json={"requested_stage": "done"},
+            )
+        return read, mutation
+
+    read, mutation = asyncio.run(exercise_routes())
+
+    assert read.status_code == 200
+    assert read.json() == {"operation": "portfolio", "read_only": True}
+    assert mutation.status_code == 405
+    assert calls == [
+        {"profile": "ceo"},
+        {
+            "project_id": "PVT_acme_7",
+            "stage": "decision",
+            "approval_need": True,
+            "health": "blocked",
+            "stale": False,
+        },
+    ]
+
+
 def test_rest_setup_and_doctor_delegate_to_the_pure_prerequisite_seam(
     tmp_path, monkeypatch, hermes_host_root
 ):

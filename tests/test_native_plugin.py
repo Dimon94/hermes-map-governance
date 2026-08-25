@@ -350,6 +350,70 @@ def test_native_maps_commands_delegate_to_the_application(
     ]
 
 
+def test_native_portfolio_command_is_filterable_and_read_only(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    calls = []
+
+    class ApplicationProbe:
+        def portfolio(self, **arguments):
+            calls.append(arguments)
+            return {"operation": "portfolio", "read_only": True}
+
+    monkeypatch.setattr(
+        native,
+        "application_for_storage",
+        lambda _root: ApplicationProbe(),
+    )
+    registrations = []
+    context = SimpleNamespace(
+        state=SimpleNamespace(data_dir=tmp_path / "plugin-data"),
+        profile_name="ceo",
+        register_skill=lambda *args, **kwargs: None,
+        register_tool=lambda **kwargs: None,
+        register_hook=lambda *args, **kwargs: None,
+        register_cli_command=lambda **command: registrations.append(command),
+    )
+    native.register(context)
+    parser = ArgumentParser()
+    registrations[0]["setup_fn"](parser)
+
+    result = registrations[0]["handler_fn"](
+        parser.parse_args(
+            [
+                "portfolio",
+                "--project",
+                "PVT_acme_7",
+                "--stage",
+                "decision",
+                "--approval-need",
+                "yes",
+                "--health",
+                "blocked",
+                "--stale",
+                "no",
+            ]
+        )
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "operation": "portfolio",
+        "read_only": True,
+    }
+    assert calls == [
+        {
+            "project_id": "PVT_acme_7",
+            "stage": "decision",
+            "approval_need": True,
+            "health": "blocked",
+            "stale": False,
+        }
+    ]
+
+
 def test_native_recovery_and_identity_repair_are_profile_scoped_and_explicit(
     tmp_path, monkeypatch, capsys
 ):

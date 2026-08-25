@@ -86,6 +86,10 @@ def main() -> int:
     assert cli_board["maps"][0]["tracker"]["identity"] == "acme/atlas#41"
     assert cli_board["maps"][0]["stage"] == "authorized"
     assert cli_board["maps"][0]["ceo_session"] == {"state": "unbound"}
+    cli_portfolio = run_maps("portfolio", "--health", "healthy", "--stale", "no")
+    assert cli_portfolio["read_only"] is True
+    assert cli_portfolio["capabilities"]["mutations"] == []
+    assert [item["map_id"] for item in cli_portfolio["items"]] == ["I_atlas_41"]
 
     registry_database = Path(diagnostic_report["components"]["storage"]["database"])
     with sqlite3.connect(registry_database) as connection:
@@ -206,6 +210,14 @@ def main() -> int:
     assert len(board.json()["projects"]) == 1
     assert len(board.json()["maps"]) == 1
     assert board.json()["maps"][0]["tracker"]["identity"] == "acme/atlas#41"
+    portfolio = client.get(
+        "/api/plugins/map-governance/portfolio"
+        "?profile=default&project_id=PVT_acme_7&stage=authorized",
+        headers=auth,
+    )
+    assert portfolio.status_code == 200, portfolio.text
+    assert portfolio.json()["read_only"] is True
+    assert [item["map_id"] for item in portfolio.json()["items"]] == ["I_atlas_41"]
     assert not (hermes_home / "kanban.db").exists()
 
     registry_database = Path(health.json()["components"]["storage"]["database"])

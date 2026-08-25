@@ -33,6 +33,7 @@ from .runtime import (
     prerequisite_application_for_storage,
 )
 from .tracker import TrackerError
+from .stages import EXECUTIVE_STAGES, PORTFOLIO_HEALTH_STATES
 
 
 def _setup_maps_command(parser: ArgumentParser) -> None:
@@ -63,6 +64,30 @@ def _setup_maps_command(parser: ArgumentParser) -> None:
         help="Stable action ID to apply; repeat for each authorized action",
     )
     commands.add_parser("board", help="Read the current Maps board")
+    portfolio = commands.add_parser(
+        "portfolio", help="Read the cross-project portfolio without mutation controls"
+    )
+    portfolio.add_argument("--project", help="Show one configured Project")
+    portfolio.add_argument(
+        "--stage",
+        choices=tuple(sorted(EXECUTIVE_STAGES)),
+        help="Show one executive stage",
+    )
+    portfolio.add_argument(
+        "--approval-need",
+        choices=("yes", "no"),
+        help="Filter Maps with or without pending approval",
+    )
+    portfolio.add_argument(
+        "--health",
+        choices=tuple(sorted(PORTFOLIO_HEALTH_STATES)),
+        help="Filter derived delivery health",
+    )
+    portfolio.add_argument(
+        "--stale",
+        choices=("yes", "no"),
+        help="Filter current or stale project projections",
+    )
     detail = commands.add_parser("detail", help="Read one Map detail projection")
     detail.add_argument("--map", required=True, help="Bound Map Issue node id")
     open_session = commands.add_parser(
@@ -378,6 +403,20 @@ def register(ctx) -> None:
             return 0
         if args.maps_command == "board":
             print(json.dumps(current_application.board(), sort_keys=True))
+            return 0
+        if args.maps_command == "portfolio":
+            report = current_application.portfolio(
+                project_id=args.project,
+                stage=args.stage,
+                approval_need=(
+                    args.approval_need == "yes"
+                    if args.approval_need is not None
+                    else None
+                ),
+                health=args.health,
+                stale=args.stale == "yes" if args.stale is not None else None,
+            )
+            print(json.dumps(report, sort_keys=True))
             return 0
         if args.maps_command == "detail":
             report = current_application.map_detail(map_id=args.map)

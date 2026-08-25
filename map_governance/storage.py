@@ -170,6 +170,19 @@ class PluginStorage:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def map_binding_for_issue_url(self, issue_url: str) -> dict[str, Any] | None:
+        """Resolve a tracker resource to its configured project namespace."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT map_id, project_id, issue_url
+                FROM map_bindings
+                WHERE issue_url = ?
+                """,
+                (issue_url,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def map_session_context(self, map_id: str) -> dict[str, Any] | None:
         """Return the bound Map fields needed to establish session content."""
         with self._connect() as connection:
@@ -2628,7 +2641,15 @@ class PluginStorage:
                 "DELETE FROM approval_ledger_events WHERE request_id = ?",
                 (request_id,),
             )
-            all_events = [*approval["events"], *local_events]
+            tracker_event_ids = {str(event["event_id"]) for event in approval["events"]}
+            all_events = [
+                *approval["events"],
+                *[
+                    event
+                    for event in local_events
+                    if str(event["event_id"]) not in tracker_event_ids
+                ],
+            ]
             connection.executemany(
                 """
                 INSERT INTO approval_ledger_events(

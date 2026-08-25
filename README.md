@@ -149,6 +149,13 @@ hermes maps bind \
   --issue https://github.com/OWNER/REPOSITORY/issues/ISSUE_NUMBER
 
 hermes maps board
+hermes maps portfolio
+hermes maps portfolio \
+  --project PROJECT_NODE_ID \
+  --stage decision \
+  --approval-need yes \
+  --health blocked \
+  --stale no
 hermes maps refresh --project PROJECT_NODE_ID
 
 # --from 必须是发起请求时卡片显示的 stage；并发变化会要求 refresh/retry。
@@ -188,6 +195,18 @@ hermes maps runtime status \
 
 重复执行同一条 bind 命令是幂等的。`refresh` 从 GitHub tracker truth 与最小 binding
 registry 重新生成缓存；删除 projection rows 不会丢失 Map 绑定。
+
+`portfolio` 只聚合当前可重建投影，按 configured project 汇总阶段、待审批、blocking
+decision、stale、acceptance readiness、terminal outcome 与 delivery health。它不创建 portfolio
+record，也不暴露 transition、bulk approval、PM runtime 或 implementation control。Portfolio
+条目的 detail 与 CEO session action 继续使用该 Map 的 canonical node id 和既有 board route；
+同名、同 Issue number 的跨 repository Map 不会合并。一个 project 的 tracker authority 失败
+只会把该 project 标为 stale，其他 project 仍保持可读且可独立治理。正常 Dashboard/native
+composition 会为每个 project 建立并缓存独立 tracker client；host 也可通过
+`tracker_for_project(project_url)` 注入 credential-scoped client。Map 绑定、PM delivery ticket、
+parent Spec、dependency 与 lane registry 读取都在该 project scope 内路由，未绑定 resource
+不会落到其他 project 的 client。默认 `gh` session 仍只是 prototype workflow enforcement，
+不是 production credential security boundary。
 
 开放 Map 的治理流程为：`discovery → awaiting-approval → authorized → delivery`；
 `delivery` 可进入 whole-Map blocker 的 `decision` 或 `acceptance`，两者可返回
@@ -460,6 +479,8 @@ plugins:
 - `MapGovernanceApplication` 是 REST、dashboard 和诊断入口共同调用的应用 seam。
 - `hermes maps health` 与 `/api/plugins/map-governance/health` 返回同一 readiness。
 - `/api/plugins/map-governance/board` 提供按 GitHub Project 分组的 board 投影；
+  `/api/plugins/map-governance/portfolio` 提供 server-authoritative 的跨项目只读汇总与 project、
+  stage、approval need、health、staleness filters；
   `/projects`、`/bindings`、`/refresh`、`/transitions`、approval decision、Map detail 与
   authenticated cancellation、canonical session open routes 是同一应用接口的薄适配器。
 - `/api/plugins/map-governance/events` 使用 Hermes 公共 WebSocket auth/upgrade contract，

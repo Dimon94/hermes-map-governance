@@ -149,6 +149,12 @@ class DeliveryTracker:
     def list_pm_reports(self, _url: str) -> list:
         return list(self.reports)
 
+    def list_approval_events(self, _url: str) -> list:
+        return []
+
+    def list_publication_records(self, _url: str) -> list:
+        return []
+
     def append_pm_report(
         self,
         url: str,
@@ -204,6 +210,24 @@ class DeliveryTracker:
             labels=("map", f"map-stage/{requested_stage}"),
         )
         return self.issue
+
+
+class ProjectScopedDeliveryTracker:
+    """Record and reject cross-project access at one credential boundary."""
+
+    def __init__(self, delegate: DeliveryTracker) -> None:
+        self.delegate = delegate
+        self.resource_urls: list[str] = []
+
+    def __getattr__(self, name):
+        operation = getattr(self.delegate, name)
+
+        def scoped(url, *args, **kwargs):
+            assert url == PROJECT_URL or url.startswith("https://github.com/acme/")
+            self.resource_urls.append(url)
+            return operation(url, *args, **kwargs)
+
+        return scoped
 
 
 class StaticDeliveryPrerequisites:
@@ -642,6 +666,60 @@ def _delivery_application(tmp_path, *, runtime, prerequisites=None):
         coordinator_id="coordinator-atlas",
     )
     return application, tracker, _lane(tmp_path)
+
+
+def test_project_scoped_tracker_keeps_pm_delivery_ticket_reads_and_runtime_live(
+    tmp_path,
+):
+    runtime = DeliveryRuntimeProbe()
+    tracker = DeliveryTracker()
+    scoped = ProjectScopedDeliveryTracker(tracker)
+    context = CommissioningContext(
+        project_id="PVT_acme_7",
+        project_url=PROJECT_URL,
+        repository="acme/atlas",
+        repository_path=str(tmp_path),
+        pm_profile="pm",
+        routing_policy="codex",
+        herdr_executable="herdr-test",
+        skills=("map-governance:pm", "delivery-pipeline", "herdr"),
+        supported_worker_kinds=("codex",),
+    )
+    application = MapGovernanceApplication(
+        plugin_root=PLUGIN_ROOT,
+        storage_root=tmp_path / "plugin-data",
+        tracker=tracker,
+        tracker_for_project=lambda project_url: (
+            scoped if project_url == PROJECT_URL else None
+        ),
+        profile_name="pm",
+        clock=lambda: datetime(2026, 8, 24, tzinfo=timezone.utc),
+        commissioning_prerequisites=StaticDeliveryPrerequisites(context),
+        coordinator_runtime=runtime,
+    )
+    project = application.configure_project(project_url=PROJECT_URL)
+    application.bind_map(project_id=project["id"], issue_url=ISSUE_URL)
+    application.assign_pm(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+    )
+    application.begin_pm_turn(
+        map_id=MAP_ID,
+        request_identity=PM_IDENTITY,
+        coordinator_id="coordinator-atlas",
+        turn_id="isolated-delivery-turn",
+    )
+
+    result = application.dispatch_pm_delivery_lane(
+        request_identity=PM_IDENTITY,
+        lane=_lane(tmp_path),
+    )
+
+    assert result["state"] == "dispatched"
+    assert TICKET_URL in scoped.resource_urls
+    assert SPEC_URL in scoped.resource_urls
+    assert scoped.resource_urls.count(PROJECT_URL) == 1
 
 
 def _mixed_delivery_application(

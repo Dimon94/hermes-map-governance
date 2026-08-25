@@ -279,6 +279,26 @@ async def board(profile: str = Query(min_length=1)):
     return snapshot() if callable(snapshot) else application.board()
 
 
+@router.get("/portfolio")
+async def portfolio(
+    profile: str = Query(min_length=1),
+    project_id: str | None = Query(default=None, min_length=1),
+    stage: str | None = Query(default=None, min_length=1),
+    approval_need: bool | None = Query(default=None),
+    health: str | None = Query(default=None, min_length=1),
+    stale: bool | None = Query(default=None),
+):
+    return _operation(
+        profile,
+        "portfolio",
+        project_id=project_id,
+        stage=stage,
+        approval_need=approval_need,
+        health=health,
+        stale=stale,
+    )
+
+
 @router.websocket("/events")
 async def stream_events(ws: WebSocket):
     """Catch up and tail the committed SQLite journal without an in-memory bus."""

@@ -397,6 +397,22 @@
     }
   }
 
+  function portfolioPath(profile, filters) {
+    const query = ["profile=" + encodeURIComponent(profile)];
+    [
+      ["project_id", filters.projectId],
+      ["stage", filters.stage],
+      ["approval_need", filters.approvalNeed],
+      ["health", filters.health],
+      ["stale", filters.stale],
+    ].forEach(function (entry) {
+      if (entry[1] !== "") {
+        query.push(entry[0] + "=" + encodeURIComponent(entry[1]));
+      }
+    });
+    return "/api/plugins/map-governance/portfolio?" + query.join("&");
+  }
+
   const STAGE_TRANSITIONS = {
     discovery: ["awaiting-approval", "parked"],
     "awaiting-approval": ["authorized", "discovery", "parked"],
@@ -699,8 +715,226 @@
     return board;
   }
 
+  function portfolioCounts(label, counts) {
+    const entries = Object.entries(counts || {});
+    return React.createElement(
+      "p",
+      { className: "text-xs text-muted-foreground" },
+      label + " · " + (entries.length
+        ? entries.map(function (entry) { return entry[0] + ": " + entry[1]; }).join(" · ")
+        : "none"),
+    );
+  }
+
+  function renderPortfolioView(state, filters, actions) {
+    const portfolio = state.portfolio;
+    const filterDefinitions = [
+      ["portfolio-project-filter", "Project", "projectId", (portfolio && portfolio.filter_options.projects || []).map(function (item) { return [item.id, item.title]; })],
+      ["portfolio-stage-filter", "Executive stage", "stage", (portfolio && portfolio.filter_options.stages || []).map(function (item) { return [item, item]; })],
+      ["portfolio-approval-filter", "Approval need", "approvalNeed", [["true", "Needs approval"], ["false", "No approval needed"]]],
+      ["portfolio-health-filter", "Health", "health", (portfolio && portfolio.filter_options.health || []).map(function (item) { return [item, readableBadge(item)]; })],
+      ["portfolio-stale-filter", "Staleness", "stale", [["false", "Current"], ["true", "Stale"]]],
+    ];
+    return React.createElement(
+      "main",
+      { className: "space-y-6 p-6", "aria-labelledby": "portfolio-title" },
+      React.createElement(
+        "header",
+        { className: "flex flex-wrap items-center justify-between gap-3" },
+        React.createElement(
+          "div",
+          null,
+          React.createElement("h1", { id: "portfolio-title", className: "text-xl font-semibold" }, "Portfolio"),
+          React.createElement(
+            "p",
+            { className: "text-sm text-muted-foreground" },
+            "Read-only current projections across configured CEO projects.",
+          ),
+        ),
+        React.createElement(
+          "div",
+          { className: "flex gap-2" },
+          React.createElement(Button, { type: "button", variant: "outline", onClick: actions.backToBoards }, "Project boards"),
+          React.createElement(Button, { type: "button", onClick: actions.refresh }, "Refresh portfolio"),
+        ),
+      ),
+      React.createElement(
+        "section",
+        { className: "grid gap-3 rounded-md border p-4 md:grid-cols-5", "aria-label": "Portfolio filters" },
+        filterDefinitions.map(function (definition) {
+          return React.createElement(
+            "label",
+            { key: definition[0], htmlFor: definition[0], className: "space-y-1 text-sm" },
+            React.createElement("span", { className: "block font-medium" }, definition[1]),
+            React.createElement(
+              "select",
+              {
+                id: definition[0],
+                className: "w-full rounded-md border bg-background p-2",
+                value: filters[definition[2]],
+                onChange: function (event) { actions.changeFilter(definition[2], event.target.value); },
+              },
+              React.createElement("option", { value: "" }, "All"),
+              definition[3].map(function (option) {
+                return React.createElement("option", { key: option[0], value: option[0] }, option[1]);
+              }),
+            ),
+          );
+        }),
+        React.createElement(
+          "div",
+          { className: "md:col-span-5" },
+          React.createElement(Button, { type: "button", onClick: actions.applyFilters }, "Apply filters"),
+        ),
+      ),
+      state.status === "loading" || state.status === "idle"
+        ? React.createElement("p", { role: "status" }, "Loading portfolio…")
+        : state.status === "error"
+          ? React.createElement("p", { role: "alert", className: "text-sm text-destructive" }, state.message)
+          : React.createElement(
+              React.Fragment,
+              null,
+              React.createElement(
+                "section",
+                { className: "rounded-md border p-4", "aria-label": "Portfolio summary" },
+                React.createElement(
+                  "p",
+                  { className: "font-medium" },
+                  portfolio.summary.project_count + " projects · "
+                    + portfolio.summary.map_count + " Maps · "
+                    + portfolio.summary.stale_project_count + " stale project"
+                    + (portfolio.summary.stale_project_count === 1 ? "" : "s"),
+                ),
+                portfolioCounts("Stage counts", portfolio.summary.stage_counts),
+                portfolioCounts("Health counts", portfolio.summary.health_counts),
+                React.createElement(
+                  "p",
+                  { className: "text-xs text-muted-foreground" },
+                  "Terminal outcomes · done: " + portfolio.summary.terminal_outcomes.done
+                    + " · cancelled: " + portfolio.summary.terminal_outcomes.cancelled,
+                ),
+              ),
+              portfolio.items.length === 0
+                ? React.createElement("p", { role: "status", className: "rounded-md border p-4" }, portfolio.empty_state.title)
+                : null,
+              portfolio.projects.map(function (project) {
+                const summary = project.summary;
+                return React.createElement(
+                  "section",
+                  { key: project.id, className: "space-y-3", "aria-labelledby": "portfolio-project-" + project.id },
+                  React.createElement(
+                    "div",
+                    { className: "space-y-1" },
+                    React.createElement(
+                      "div",
+                      { className: "flex flex-wrap items-baseline justify-between gap-2" },
+                      React.createElement("h2", { id: "portfolio-project-" + project.id, className: "text-base font-semibold" }, project.title),
+                      React.createElement(
+                        "p",
+                        { className: "text-sm text-muted-foreground" },
+                        summary.map_count + " Maps · "
+                          + summary.awaiting_approvals.request_count + " pending approval"
+                          + (summary.awaiting_approvals.request_count === 1 ? "" : "s")
+                          + " · " + summary.blocking_decisions + " blocking decision"
+                          + (summary.blocking_decisions === 1 ? "" : "s")
+                          + " · " + summary.acceptance_readiness + " acceptance ready",
+                      ),
+                    ),
+                    portfolioCounts("Stage counts", summary.stage_counts),
+                    portfolioCounts("Health counts", summary.health_counts),
+                    React.createElement(
+                      "p",
+                      { className: "text-xs text-muted-foreground" },
+                      "Terminal outcomes · done: " + summary.terminal_outcomes.done
+                        + " · cancelled: " + summary.terminal_outcomes.cancelled,
+                    ),
+                  ),
+                  project.stale
+                    ? React.createElement(
+                        "p",
+                        { role: "alert", className: "rounded-md border p-3 text-sm text-destructive" },
+                        "Read-only stale project · Last authority success: "
+                          + project.authority.last_success_at + " · " + project.authority.reason,
+                      )
+                    : null,
+                  React.createElement(
+                    "div",
+                    { className: "grid gap-3 md:grid-cols-2 xl:grid-cols-3" },
+                    project.items.map(function (item) {
+                      return React.createElement(
+                        Card,
+                        { key: item.project.id + ":" + item.map_id },
+                        React.createElement(
+                          CardHeader,
+                          null,
+                          React.createElement(CardTitle, null, item.title),
+                          React.createElement("p", { className: "text-xs text-muted-foreground" }, item.tracker.identity),
+                        ),
+                        React.createElement(
+                          CardContent,
+                          { className: "space-y-2 text-sm" },
+                          React.createElement("p", null, "Executive stage: " + item.stage),
+                          React.createElement("p", null, "Health: " + readableBadge(item.health.state)),
+                          item.approval_need
+                            ? React.createElement(
+                                "p",
+                                null,
+                                item.pending_approval_count
+                                  ? item.pending_approval_count + " pending approvals"
+                                  : "Approval required · no pending packet",
+                              )
+                            : React.createElement("p", null, "No approval needed"),
+                          item.blocking_decision ? React.createElement("p", { role: "status" }, "Whole-Map blocking decision") : null,
+                          item.acceptance_ready ? React.createElement("p", { role: "status" }, "Acceptance ready") : null,
+                          item.terminal_outcome ? React.createElement("p", null, "Terminal outcome: " + item.terminal_outcome) : null,
+                          item.stale
+                            ? React.createElement(Badge, { variant: "destructive" }, "Stale data")
+                            : React.createElement(Badge, { variant: "outline" }, "Current data"),
+                          React.createElement(
+                            "div",
+                            { className: "flex flex-wrap gap-2", "aria-label": "Canonical Map actions" },
+                            React.createElement(
+                              Button,
+                              {
+                                type: "button",
+                                variant: "outline",
+                                "aria-label": "View canonical Map detail " + item.map_id,
+                                onClick: function () { actions.openDetail(item.navigation.map_detail.map_id); },
+                              },
+                              "View Map detail",
+                            ),
+                            React.createElement(
+                              Button,
+                              {
+                                type: "button",
+                                disabled: item.ceo_session.state === "repair_required",
+                                "aria-label": "Open canonical CEO session " + item.map_id,
+                                onClick: function () { actions.openSession(item.navigation.ceo_session.map_id); },
+                              },
+                              "Open CEO session",
+                            ),
+                          ),
+                        ),
+                      );
+                    }),
+                  ),
+                );
+              }),
+            ),
+    );
+  }
+
   function MapsPage() {
     const [state, setState] = useState({ status: "loading" });
+    const [viewMode, setViewMode] = useState("board");
+    const [portfolioState, setPortfolioState] = useState({ status: "idle" });
+    const [portfolioFilters, setPortfolioFilters] = useState({
+      projectId: "",
+      stage: "",
+      approvalNeed: "",
+      health: "",
+      stale: "",
+    });
     const [transitionState, setTransitionState] = useState({ status: "idle" });
     const [sessionState, setSessionState] = useState({ status: "idle" });
     const [commissionState, setCommissionState] = useState({ status: "idle" });
@@ -832,6 +1066,32 @@
         },
       );
     }, []);
+
+    const loadPortfolio = useCallback(function (filters) {
+      const selected = filters || portfolioFilters;
+      setPortfolioState({ status: "loading" });
+      return requestProfile().then(function (profile) {
+        return fetchJSON(portfolioPath(profile, selected));
+      }).then(
+        function (portfolio) {
+          setPortfolioState({ status: "ready", portfolio: portfolio });
+          return portfolio;
+        },
+        function (error) {
+          setPortfolioState({
+            status: "error",
+            message: error && error.message
+              ? error.message
+              : "Unable to load the portfolio",
+          });
+        },
+      );
+    }, [portfolioFilters]);
+
+    const showPortfolio = useCallback(function () {
+      setViewMode("portfolio");
+      loadPortfolio(portfolioFilters);
+    }, [loadPortfolio, portfolioFilters]);
 
     const refresh = useCallback(function () {
       setState({ status: "loading" });
@@ -1423,6 +1683,25 @@
       );
     }
 
+    if (viewMode === "portfolio") {
+      return renderPortfolioView(portfolioState, portfolioFilters, {
+        backToBoards: function () { setViewMode("board"); },
+        refresh: function () { loadPortfolio(portfolioFilters); },
+        applyFilters: function () { loadPortfolio(portfolioFilters); },
+        changeFilter: function (name, value) {
+          setPortfolioFilters(function (current) {
+            const next = Object.assign({}, current);
+            next[name] = value;
+            return next;
+          });
+        },
+        openDetail: function (mapId) {
+          loadMapDetail(mapId);
+          setViewMode("board");
+        },
+        openSession: openCEOSession,
+      });
+    }
     if (state.board.maps.length === 0) {
       return React.createElement(
         "section",
@@ -1459,6 +1738,11 @@
                 Button,
                 { type: "button", onClick: refresh },
                 "Refresh from GitHub",
+              ),
+              React.createElement(
+                Button,
+                { type: "button", variant: "outline", onClick: showPortfolio },
+                "Portfolio",
               ),
               React.createElement(
                 Button,
@@ -1505,6 +1789,7 @@
         React.createElement(
           "div",
           { className: "flex gap-2" },
+          React.createElement(Button, { type: "button", variant: "outline", onClick: showPortfolio }, "Portfolio"),
           React.createElement(Button, { type: "button", onClick: setupActions.open }, "Setup"),
           React.createElement(Button, { type: "button", onClick: runDoctor }, "Doctor"),
           React.createElement(Button, { type: "button", onClick: repairActions.preview }, "Repair"),

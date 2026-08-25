@@ -37,6 +37,127 @@ function useState(initialValue) {
 function fetchJSON(path, options) {
   requestedPaths.push(path);
   requestedOptions.push(options || {});
+  if (path.includes("/portfolio?profile=")) {
+    const acme = {
+      map_id: "I_acme_41",
+      project: { id: "PVT_acme_7", url: "https://github.com/orgs/acme/projects/7" },
+      tracker: {
+        provider: "github",
+        id: "I_acme_41",
+        identity: "acme/atlas#41",
+        url: "https://github.com/acme/atlas/issues/41",
+      },
+      title: "Colliding launch title",
+      stage: "awaiting-approval",
+      approval_need: true,
+      pending_approval_count: 2,
+      blocking_decision: false,
+      acceptance_ready: false,
+      terminal_outcome: null,
+      health: { state: "healthy", signals: [] },
+      stale: false,
+      last_synchronized_at: "2026-08-25T02:00:00Z",
+      ceo_session: { state: "ready" },
+      navigation: {
+        map_detail: { map_id: "I_acme_41" },
+        ceo_session: { map_id: "I_acme_41" },
+      },
+    };
+    const octocat = {
+      map_id: "I_octocat_41",
+      project: { id: "PVT_octocat_3", url: "https://github.com/users/octocat/projects/3" },
+      tracker: {
+        provider: "github",
+        id: "I_octocat_41",
+        identity: "octocat/atlas#41",
+        url: "https://github.com/octocat/atlas/issues/41",
+      },
+      title: "Colliding launch title",
+      stage: "decision",
+      approval_need: false,
+      pending_approval_count: 0,
+      blocking_decision: true,
+      acceptance_ready: false,
+      terminal_outcome: null,
+      health: { state: "blocked", signals: ["blocking_decision"] },
+      stale: true,
+      last_synchronized_at: "2026-08-25T01:45:00Z",
+      ceo_session: { state: "unbound" },
+      navigation: {
+        map_detail: { map_id: "I_octocat_41" },
+        ceo_session: { map_id: "I_octocat_41" },
+      },
+    };
+    return Promise.resolve({
+      projects: [
+        {
+          id: "PVT_acme_7",
+          title: "Acme portfolio",
+          tracker: { owner: "acme", number: 7, url: "https://github.com/orgs/acme/projects/7" },
+          authority: { state: "healthy", reason: null, last_success_at: "2026-08-25T02:00:00Z" },
+          stale: false,
+          items: [acme],
+          summary: {
+            map_count: 1,
+            stage_counts: { "awaiting-approval": 1 },
+            awaiting_approvals: { map_count: 1, request_count: 2 },
+            blocking_decisions: 0,
+            stale_maps: 0,
+            acceptance_readiness: 0,
+            terminal_outcomes: { done: 0, cancelled: 0, total: 0 },
+            health_counts: { healthy: 1 },
+          },
+        },
+        {
+          id: "PVT_octocat_3",
+          title: "Octocat portfolio",
+          tracker: { owner: "octocat", number: 3, url: "https://github.com/users/octocat/projects/3" },
+          authority: {
+            state: "stale",
+            reason: "Tracker authority authentication failed",
+            last_success_at: "2026-08-25T01:45:00Z",
+          },
+          stale: true,
+          items: [octocat],
+          summary: {
+            map_count: 1,
+            stage_counts: { decision: 1 },
+            awaiting_approvals: { map_count: 0, request_count: 0 },
+            blocking_decisions: 1,
+            stale_maps: 1,
+            acceptance_readiness: 0,
+            terminal_outcomes: { done: 0, cancelled: 0, total: 0 },
+            health_counts: { blocked: 1 },
+          },
+        },
+      ],
+      items: [acme, octocat],
+      summary: {
+        project_count: 2,
+        map_count: 2,
+        stale_project_count: 1,
+        stage_counts: { "awaiting-approval": 1, decision: 1 },
+        awaiting_approvals: { map_count: 1, request_count: 2 },
+        blocking_decisions: 1,
+        stale_maps: 1,
+        acceptance_readiness: 0,
+        terminal_outcomes: { done: 0, cancelled: 0, total: 0 },
+        health_counts: { healthy: 1, blocked: 1 },
+      },
+      filters: {},
+      filter_options: {
+        projects: [
+          { id: "PVT_acme_7", title: "Acme portfolio" },
+          { id: "PVT_octocat_3", title: "Octocat portfolio" },
+        ],
+        stages: ["awaiting-approval", "decision"],
+        health: ["healthy", "needs_attention", "blocked"],
+      },
+      read_only: true,
+      capabilities: { open_map_detail: true, open_ceo_session: true, mutations: [] },
+      empty_state: { title: "No Maps match these portfolio filters" },
+    });
+  }
   if (path.includes("/repair/preview?profile=")) {
     return Promise.resolve({
       plan_id: "identity-repair:preview-1",
@@ -86,6 +207,17 @@ function fetchJSON(path, options) {
         root_session_id: "canonical-root",
         live_session_id: "canonical-tip",
         last_activity_at: "2026-08-23T09:05:00Z",
+      },
+    });
+  }
+  if (path.includes("/maps/I_acme_41/session?profile=")) {
+    return Promise.resolve({
+      map_id: "I_acme_41",
+      ceo_session: {
+        state: "ready",
+        root_session_id: "canonical-acme-root",
+        live_session_id: "canonical-acme-tip",
+        last_activity_at: "2026-08-25T02:05:00Z",
       },
     });
   }
@@ -204,6 +336,17 @@ function fetchJSON(path, options) {
           acknowledged_at: "2026-08-23T10:04:00Z",
         },
       ] : [],
+    });
+  }
+  if (path.includes("/maps/I_acme_41?profile=")) {
+    return Promise.resolve({
+      id: "I_acme_41",
+      title: "Colliding launch title",
+      recent_decisions: [],
+      approvals: { count: 0, items: [] },
+      pm_reports: [],
+      decision_acknowledgments: [],
+      delivery_summary: { state: "not_reported" },
     });
   }
   if (path.includes("/refresh?profile=")) {
@@ -467,7 +610,105 @@ assert.deepEqual(requestedPaths, [
   "/api/plugins/map-governance/board?profile=worker",
   "/api/plugins/map-governance/health?profile=worker",
 ]);
-if (mode !== "empty") {
+if (mode === "portfolio") {
+  const portfolioButton = findNode(
+    readyTree,
+    (node) => node.type === "Button" && /^Portfolio$/.test(textContent(node)),
+  );
+  assert.ok(portfolioButton, "Maps page exposes the read-only Portfolio view");
+  portfolioButton.props.onClick();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  hookIndex = 0;
+  const portfolioTree = registeredPage();
+  const portfolioText = textContent(portfolioTree);
+  assert.match(portfolioText, /Portfolio/);
+  assert.match(portfolioText, /2 projects.*2 Maps.*1 stale project/s);
+  assert.match(portfolioText, /Acme portfolio.*awaiting-approval.*2 pending approvals/s);
+  assert.match(portfolioText, /Stage counts.*awaiting-approval: 1/s);
+  assert.match(portfolioText, /Health counts.*healthy: 1/s);
+  assert.match(portfolioText, /Terminal outcomes.*done: 0.*cancelled: 0/s);
+  assert.match(portfolioText, /Octocat portfolio.*Read-only stale project.*Tracker authority authentication failed/s);
+  assert.match(portfolioText, /acme\/atlas#41/);
+  assert.match(portfolioText, /octocat\/atlas#41/);
+  assert.match(portfolioText, /blocked.*blocking decision/s);
+  assert.doesNotMatch(
+    portfolioText,
+    /Move to|Approve|Reject|Request revision|Commission Hermes PM|Check PM runtime|drag|bulk|worker lane|worktree/i,
+  );
+  assert.equal(
+    requestedPaths[2],
+    "/api/plugins/map-governance/portfolio?profile=worker",
+  );
+
+  const projectFilter = findNode(
+    portfolioTree,
+    (node) => node.type === "select" && node.props.id === "portfolio-project-filter",
+  );
+  const stageFilter = findNode(
+    portfolioTree,
+    (node) => node.type === "select" && node.props.id === "portfolio-stage-filter",
+  );
+  const approvalFilter = findNode(
+    portfolioTree,
+    (node) => node.type === "select" && node.props.id === "portfolio-approval-filter",
+  );
+  const healthFilter = findNode(
+    portfolioTree,
+    (node) => node.type === "select" && node.props.id === "portfolio-health-filter",
+  );
+  const staleFilter = findNode(
+    portfolioTree,
+    (node) => node.type === "select" && node.props.id === "portfolio-stale-filter",
+  );
+  projectFilter.props.onChange({ target: { value: "PVT_acme_7" } });
+  stageFilter.props.onChange({ target: { value: "decision" } });
+  approvalFilter.props.onChange({ target: { value: "true" } });
+  healthFilter.props.onChange({ target: { value: "blocked" } });
+  staleFilter.props.onChange({ target: { value: "false" } });
+  hookIndex = 0;
+  const changedFilterTree = registeredPage();
+  const applyFilters = findNode(
+    changedFilterTree,
+    (node) => node.type === "Button" && /Apply filters/.test(textContent(node)),
+  );
+  applyFilters.props.onClick();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    requestedPaths[3],
+    "/api/plugins/map-governance/portfolio?profile=worker"
+      + "&project_id=PVT_acme_7&stage=decision&approval_need=true"
+      + "&health=blocked&stale=false",
+  );
+
+  const detailButton = findNode(
+    portfolioTree,
+    (node) => node.type === "Button"
+      && node.props["aria-label"] === "View canonical Map detail I_acme_41",
+  );
+  const sessionButton = findNode(
+    portfolioTree,
+    (node) => node.type === "Button"
+      && node.props["aria-label"] === "Open canonical CEO session I_acme_41",
+  );
+  assert.ok(detailButton && sessionButton);
+  detailButton.props.onClick();
+  sessionButton.props.onClick();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(requestedPaths.includes(
+    "/api/plugins/map-governance/maps/I_acme_41?profile=worker",
+  ));
+  const sessionIndex = requestedPaths.findIndex(
+    (path) => path.includes("/maps/I_acme_41/session?profile="),
+  );
+  assert.notEqual(sessionIndex, -1);
+  assert.equal(requestedOptions[sessionIndex].method, "POST");
+  assert.equal(openedSessions.at(-1).sessionId, "canonical-acme-tip");
+  process.stdout.write("dashboard portfolio ready\n");
+  process.exit(0);
+} else if (mode !== "empty") {
   assert.match(renderedText, /Acme CEO portfolio/);
   assert.match(renderedText, /Map the Atlas launch/);
   assert.match(renderedText, /acme\/atlas#41/);
