@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,71 @@ def _fake_executable(path: Path, body: str) -> Path:
     path.write_text(body, encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def _assert_fake_herdr_state_reads_are_atomic(
+    executable: Path,
+    root: Path,
+) -> None:
+    root.mkdir()
+    ready_reader, ready_writer = os.pipe()
+    release_reader, release_writer = os.pipe()
+    env = os.environ.copy()
+    env["MAP_GOVERNANCE_FAKE_HERDR_STATE"] = str(root / "state.json")
+    env["MAP_GOVERNANCE_FAKE_HERDR_LOG"] = str(root / "calls.jsonl")
+    env["MAP_GOVERNANCE_FAKE_HERDR_READY_FD"] = str(ready_writer)
+    env["MAP_GOVERNANCE_FAKE_HERDR_RELEASE_FD"] = str(release_reader)
+    server = None
+    parent_fds = {ready_reader, ready_writer, release_reader, release_writer}
+    try:
+        server = subprocess.Popen(
+            [str(executable), "--session", "race", "server"],
+            env=env,
+            pass_fds=(ready_writer, release_reader),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        os.close(ready_writer)
+        parent_fds.remove(ready_writer)
+        os.close(release_reader)
+        parent_fds.remove(release_reader)
+        readable, _, _ = select.select([ready_reader], [], [], 5)
+        assert readable, "fake Herdr did not reach the state-write barrier"
+        assert os.read(ready_reader, 1) == b"1"
+        listed = subprocess.run(
+            [str(executable), "session", "list", "--json"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert listed.returncode == 0, listed.stdout + listed.stderr
+        assert json.loads(listed.stdout)["sessions"] == []
+        os.write(release_writer, b"1")
+        server_stdout, server_stderr = server.communicate(timeout=5)
+        assert server.returncode == 0, server_stdout + server_stderr
+        listed = subprocess.run(
+            [str(executable), "session", "list", "--json"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert listed.returncode == 0, listed.stdout + listed.stderr
+        assert [
+            session["name"] for session in json.loads(listed.stdout)["sessions"]
+        ] == ["race"]
+    finally:
+        for descriptor in parent_fds:
+            os.close(descriptor)
+        if server is not None and server.poll() is None:
+            server.terminate()
+            try:
+                server.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.communicate(timeout=5)
 
 
 class StaticCommissioningPrerequisites:
@@ -271,7 +337,15 @@ except FileNotFoundError:
     state = {"sessions": {}, "workspace_creates": 0, "agent_starts": 0, "prompts": []}
 
 def save():
-    state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    payload = json.dumps(state, sort_keys=True)
+    temporary = state_path.with_name(f".{state_path.name}.{os.getpid()}.tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    ready_fd = os.environ.get("MAP_GOVERNANCE_FAKE_HERDR_READY_FD")
+    release_fd = os.environ.get("MAP_GOVERNANCE_FAKE_HERDR_RELEASE_FD")
+    if ready_fd is not None and release_fd is not None:
+        os.write(int(ready_fd), b"1")
+        assert os.read(int(release_fd), 1) == b"1"
+    os.replace(temporary, state_path)
 
 if args == ["session", "list", "--json"]:
     print(json.dumps({"sessions": [
@@ -393,6 +467,7 @@ else:
     raise SystemExit(2)
 """,
     )
+    _assert_fake_herdr_state_reads_are_atomic(herdr, tmp_path / "herdr-races")
     project_url = "https://github.test/orgs/acme/projects/1"
     issue_url = "https://github.test/acme/test/issues/1"
     repository = tmp_path / "repository"
